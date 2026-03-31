@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "icinst"
+version = "0.1.0"
+description = ""
+requires-python = ">=3.10"
+dependencies = [
+    "pyslang",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
