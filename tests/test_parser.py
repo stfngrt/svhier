@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from icinst.parser import parse_files
+from icinst.parser import compute_filelist, parse_files
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 
@@ -16,11 +16,14 @@ def test_simple_single_module():
         "files": [
             {
                 "file_name": path,
+                "pkgs": [],
                 "defs": [
-                    {"mod_name": "Simple", "insts": []},
+                    {"mod_name": "Simple", "pkg_imports": [], "insts": []},
                 ],
             }
-        ]
+        ],
+        "diagnostics": [],
+        "has_errors": False,
     }
 
 
@@ -213,3 +216,120 @@ def test_cross_file_sub_instances_from_sub_file():
     assert sub_defs["SubWithChild"]["insts"] == [
         {"mod_name": "Sub", "inst_name": "u_sub"}
     ]
+
+
+# --- pkg_imports field tests ---
+
+def test_pkg_imports_populated():
+    """ALU and Adder both import MathPkg — pkg_imports must list it."""
+    result = parse_files([str(VERILOG_DIR / "pkg_import.sv")])
+    defs = _defs_by_name(result)
+    assert defs["ALU"]["pkg_imports"] == ["MathPkg"]
+    assert defs["Adder"]["pkg_imports"] == ["MathPkg"]
+
+
+def test_pkg_imports_empty_for_plain_modules():
+    """Modules that import nothing must have an empty pkg_imports list."""
+    result = parse_files([str(VERILOG_DIR / "test.sv")])
+    defs = _defs_by_name(result)
+    for mod in ("A", "B", "C", "D"):
+        assert defs[mod]["pkg_imports"] == []
+
+
+# --- pkgs field tests ---
+
+def test_pkgs_lists_packages_defined_in_file():
+    """pkg_import.sv defines MathPkg — it must appear in the file's pkgs list."""
+    result = parse_files([str(VERILOG_DIR / "pkg_import.sv")])
+    assert "MathPkg" in result["files"][0]["pkgs"]
+
+
+def test_pkgs_empty_for_files_without_packages():
+    """Files that define no packages must have pkgs: []."""
+    result = parse_files([str(VERILOG_DIR / "test.sv")])
+    assert result["files"][0]["pkgs"] == []
+
+
+# --- compute_filelist tests ---
+
+def test_filelist_pkg_file_before_consumer():
+    """pkg_import.sv must precede itself in a single-file list (trivially),
+    and when combined with a consumer it must come first."""
+    pkg_path = str(VERILOG_DIR / "pkg_import.sv")
+    result = parse_files([pkg_path])
+    order = compute_filelist(result)
+    assert order == [pkg_path]
+
+
+def test_filelist_cross_file_order():
+    """cross_file_sub.sv defines Sub; cross_file_top.sv depends on it —
+    sub must precede top in the filelist."""
+    sub_path = str(VERILOG_DIR / "cross_file_sub.sv")
+    top_path = str(VERILOG_DIR / "cross_file_top.sv")
+    result = parse_files([sub_path, top_path])
+    order = compute_filelist(result)
+    assert order.index(sub_path) < order.index(top_path)
+
+
+def test_filelist_contains_all_files():
+    """compute_filelist must return every input file exactly once."""
+    sub_path = str(VERILOG_DIR / "cross_file_sub.sv")
+    top_path = str(VERILOG_DIR / "cross_file_top.sv")
+    result = parse_files([sub_path, top_path])
+    order = compute_filelist(result)
+    assert sorted(order) == sorted([sub_path, top_path])
+
+
+def test_filelist_independent_files_all_present():
+    """Files with no mutual dependencies must all appear in the filelist."""
+    files = [
+        str(VERILOG_DIR / "simple.sv"),
+        str(VERILOG_DIR / "test.sv"),
+    ]
+    result = parse_files(files)
+    order = compute_filelist(result)
+    assert set(order) == set(files)
+
+
+# --- diagnostics / broken file tests ---
+
+def test_valid_file_has_no_errors():
+    """A well-formed file must produce no diagnostics and has_errors=False."""
+    result = parse_files([str(VERILOG_DIR / "simple.sv")])
+    assert result["has_errors"] is False
+    assert result["diagnostics"] == []
+
+
+def test_broken_file_has_errors():
+    """A file with syntax errors must set has_errors=True."""
+    result = parse_files([str(VERILOG_DIR / "broken.sv")])
+    assert result["has_errors"] is True
+
+
+def test_broken_file_has_diagnostics():
+    """Syntax errors must appear in the diagnostics list with severity 'error'."""
+    result = parse_files([str(VERILOG_DIR / "broken.sv")])
+    assert len(result["diagnostics"]) > 0
+    assert any(d["severity"] == "error" for d in result["diagnostics"])
+
+
+def test_broken_file_diagnostic_has_file():
+    """Each diagnostic must reference the broken source file."""
+    result = parse_files([str(VERILOG_DIR / "broken.sv")])
+    error_diags = [d for d in result["diagnostics"] if d["severity"] == "error"]
+    assert all("broken.sv" in d["file"] for d in error_diags)
+
+
+def test_broken_file_returns_valid_structure():
+    """Even with errors, parse_files returns a structurally valid result dict."""
+    result = parse_files([str(VERILOG_DIR / "broken.sv")])
+    assert "files" in result
+    assert isinstance(result["files"], list)
+    assert isinstance(result["diagnostics"], list)
+
+
+def test_broken_pkg_ref_has_errors():
+    """A module referencing a nonexistent package must produce errors."""
+    result = parse_files([str(VERILOG_DIR / "broken_pkg.sv")])
+    assert result["has_errors"] is True
+    assert len(result["diagnostics"]) > 0

@@ -1,32 +1,38 @@
+"""Command-line interface for icinst: parse SV hierarchies and emit YAML."""
+
 import argparse
 import sys
+from io import StringIO
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
-from icinst.parser import parse_files
+from icinst.parser import compute_filelist, parse_files
+
+# Rich consoles: stderr for all diagnostics so stdout stays clean for data
+_err = Console(stderr=True)
 
 
-def _to_commented(obj):
-    """Recursively convert plain dicts/lists to ruamel commented types.
+def _prepare_for_yaml(hierarchy: dict) -> dict:
+    """Return a copy of *hierarchy* with internal-only keys removed.
 
-    Empty lists are kept as flow-style (inline []) so they render as
-    `insts: []` rather than a bare `insts:` (which would be null).
+    Strips the ``pkgs`` key from each file entry (bookkeeping only) and
+    omits ``pkg_imports`` from module defs when the list is empty.
     """
-    if isinstance(obj, dict):
-        cm = CommentedMap(
-            {k: _to_commented(v) for k, v in obj.items()}
-        )
-        return cm
-    if isinstance(obj, list):
-        if not obj:
-            cs = CommentedSeq()
-            cs.fa.set_flow_style()
-            return cs
-        cs = CommentedSeq(_to_commented(item) for item in obj)
-        return cs
-    return obj
+    files = []
+    for entry in hierarchy["files"]:
+        defs = []
+        for d in entry["defs"]:
+            def_out = {k: v for k, v in d.items() if not (k == "pkg_imports" and not v)}
+            defs.append(def_out)
+        file_out = {k: v for k, v in entry.items() if k != "pkgs"}
+        file_out["defs"] = defs
+        files.append(file_out)
+    return {"files": files}
 
 
 def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
@@ -40,8 +46,7 @@ def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
             pattern = "**/*.sv" if recursive else "*.sv"
             result.extend(sorted(p.glob(pattern)))
         else:
-            print(f"warning: {raw!r} is not a file or directory, skipping", file=sys.stderr)
-    # deduplicate while preserving order
+            _err.print(f"[yellow]warning:[/yellow] {raw!r} is not a file or directory, skipping")
     seen: set[Path] = set()
     unique: list[str] = []
     for p in result:
@@ -52,7 +57,78 @@ def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
     return unique
 
 
+def _print_summary(hierarchy: dict) -> None:
+    """Print a Rich table summarising the parsed hierarchy to stderr."""
+    files = hierarchy["files"]
+    total_mods = sum(len(f["defs"]) for f in files)
+    total_insts = sum(len(d["insts"]) for f in files for d in f["defs"])
+    total_pkgs = sum(len(f["pkgs"]) for f in files)
+
+    table = Table(title="Hierarchy summary", show_header=True, header_style="bold cyan")
+    table.add_column("File", style="dim")
+    table.add_column("Modules", justify="right")
+    table.add_column("Packages", justify="right")
+    table.add_column("Total instances", justify="right")
+
+    for entry in files:
+        n_mods = len(entry["defs"])
+        n_pkgs = len(entry["pkgs"])
+        n_insts = sum(len(d["insts"]) for d in entry["defs"])
+        table.add_row(Path(entry["file_name"]).name, str(n_mods), str(n_pkgs), str(n_insts))
+
+    table.add_section()
+    table.add_row("[bold]Total[/bold]", f"[bold]{total_mods}[/bold]",
+                  f"[bold]{total_pkgs}[/bold]", f"[bold]{total_insts}[/bold]")
+    _err.print(table)
+
+
+def _print_diagnostics(hierarchy: dict) -> None:
+    """Print any pyslang diagnostics to stderr using Rich formatting."""
+    diags = hierarchy.get("diagnostics", [])
+    if not diags:
+        return
+    for d in diags:
+        if d["severity"] == "error":
+            tag = "[bold red]error[/bold red]"
+        else:
+            tag = "[bold yellow]warning[/bold yellow]"
+        location = f"[dim]{d['file']}[/dim]: " if d["file"] else ""
+        _err.print(f"{tag}: {location}{d['message']}")
+
+
+def _make_yaml() -> YAML:
+    """Return a configured ruamel.yaml instance."""
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.best_sequence_indent = 2
+    return yaml
+
+
+def _write_to(content: str, dest: str, label: str) -> None:
+    """Write *content* to *dest* (``-`` means stdout); confirm to stderr."""
+    if dest == "-":
+        sys.stdout.write(content)
+    else:
+        Path(dest).write_text(content, encoding="utf-8")
+        _err.print(f"[green]✓[/green] {label} written to [bold]{dest}[/bold]")
+
+
+def _write_yaml(hierarchy: dict, dest: str) -> None:
+    """Serialise *hierarchy* as YAML and send it to *dest*."""
+    buf = StringIO()
+    _make_yaml().dump(_prepare_for_yaml(hierarchy), buf)
+    _write_to(buf.getvalue(), dest, "YAML hierarchy")
+
+
+def _write_filelist(ordered: list[str], dest: str) -> None:
+    """Write a dependency-ordered filelist to *dest*."""
+    content = "// Generated by icinst — files in compilation order\n"
+    content += "\n".join(ordered) + "\n"
+    _write_to(content, dest, f"filelist ({len(ordered)} files)")
+
+
 def main():
+    """Entry point: parse arguments, run elaboration, emit YAML and optional filelist."""
     parser = argparse.ArgumentParser(
         prog="icinst",
         description="Parse SystemVerilog files and emit a module hierarchy as YAML.",
@@ -69,18 +145,58 @@ def main():
         default=False,
         help="Recurse into subdirectories when a directory is given.",
     )
+    parser.add_argument(
+        "--yaml",
+        nargs="?",
+        const="-",
+        metavar="FILE",
+        default=None,
+        help="Write YAML hierarchy to FILE, or to stdout when FILE is omitted.",
+    )
+    parser.add_argument(
+        "--filelist",
+        nargs="?",
+        const="-",
+        metavar="FILE",
+        default=None,
+        help="Write dependency-ordered filelist to FILE, or to stdout when FILE is omitted.",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        default=False,
+        help="Suppress the summary table printed to stderr.",
+    )
     args = parser.parse_args()
 
     sv_files = collect_sv_files(args.paths, args.recursive)
     if not sv_files:
-        print("error: no .sv files found", file=sys.stderr)
+        _err.print("[red]error:[/red] no .sv files found")
         sys.exit(1)
 
-    hierarchy = parse_files(sv_files)
-    data = _to_commented(hierarchy)
+    _err.print(Panel(
+        f"Parsing [bold cyan]{len(sv_files)}[/bold cyan] file(s)…",
+        border_style="dim",
+        padding=(0, 1),
+    ))
 
-    yaml = YAML()
-    yaml.default_flow_style = False
-    yaml.best_sequence_indent = 2
-    yaml.best_map_flow_style = False
-    yaml.dump(data, sys.stdout)
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  console=_err, transient=True) as progress:
+        task = progress.add_task("Running slang elaboration…", total=None)
+        hierarchy = parse_files(sv_files)
+        progress.update(task, completed=True)
+
+    _print_diagnostics(hierarchy)
+
+    if not args.no_summary:
+        _print_summary(hierarchy)
+
+    if args.yaml is not None:
+        _write_yaml(hierarchy, args.yaml)
+
+    if args.filelist is not None:
+        ordered = compute_filelist(hierarchy)
+        _write_filelist(ordered, args.filelist)
+
+    if hierarchy["has_errors"]:
+        sys.exit(1)
