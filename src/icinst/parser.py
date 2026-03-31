@@ -31,7 +31,7 @@ def parse_files(file_paths: list[str]) -> dict:
         if name not in body_map:
             body_map[name] = inst.body
             for child in inst.body:
-                if child.kind == pyslang.SymbolKind.Instance:
+                if child.kind == pyslang.SymbolKind.Instance and child.isModule:
                     collect_bodies(child)
 
     for top_inst in compilation.getRoot().topInstances:
@@ -46,7 +46,7 @@ def parse_files(file_paths: list[str]) -> dict:
             insts = []
             if defn.name in body_map:
                 for child in body_map[defn.name]:
-                    if child.kind == pyslang.SymbolKind.Instance:
+                    if child.kind == pyslang.SymbolKind.Instance and child.isModule:
                         insts.append({
                             "mod_name": child.definition.name,
                             "inst_name": child.name,
