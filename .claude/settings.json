@@ -1,4 +1,11 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(2)",
+      "Bash(uv add:*)",
+      "Bash(find /Users/stefan/Developer/icinst/.claude -type f -name *.md -o -name *.txt)"
+    ]
+  },
   "enabledPlugins": {
     "pyright-lsp@claude-plugins-official": true
   }
