@@ -9,7 +9,11 @@ description = ""
 requires-python = ">=3.10"
 dependencies = [
     "pyslang",
+    "ruamel.yaml",
 ]
+
+[project.scripts]
+icinst = "icinst.cli:main"
 
 [project.optional-dependencies]
 dev = [
