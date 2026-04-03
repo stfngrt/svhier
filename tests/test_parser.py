@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from icinst.parser import compute_filelist, parse_files
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
@@ -333,3 +335,133 @@ def test_broken_pkg_ref_has_errors():
     result = parse_files([str(VERILOG_DIR / "broken_pkg.sv")])
     assert result["has_errors"] is True
     assert len(result["diagnostics"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# UVM-style fixtures  (verilog/uvm/)
+# ---------------------------------------------------------------------------
+
+UVM_DIR = VERILOG_DIR / "uvm"
+_UVM_FILES = [
+    str(UVM_DIR / "uvm_pkg.sv"),
+    str(UVM_DIR / "apb_if.sv"),
+    str(UVM_DIR / "apb_agent.sv"),
+    str(UVM_DIR / "tb_top.sv"),
+]
+
+
+@pytest.fixture(scope="module")
+def uvm_result():
+    """Parse all four UVM fixture files once and share the result."""
+    return parse_files(_UVM_FILES)
+
+
+def test_uvm_no_errors(uvm_result):
+    """All UVM fixture files must compile without errors."""
+    assert uvm_result["has_errors"] is False
+    assert uvm_result["diagnostics"] == []
+
+
+def test_uvm_package_defined(uvm_result):
+    """uvm_pkg.sv defines the uvm_pkg package."""
+    pkg_file = uvm_result["files"][0]
+    assert "uvm_pkg" in pkg_file["pkgs"]
+
+
+def test_uvm_package_has_no_module_defs(uvm_result):
+    """uvm_pkg.sv contains only a package — no module definitions."""
+    pkg_file = uvm_result["files"][0]
+    assert pkg_file["defs"] == []
+
+
+def test_apb_interface_excluded_from_defs(uvm_result):
+    """apb_if is an interface — must not appear in any file's defs."""
+    all_mod_names = [
+        d["mod_name"]
+        for fi in uvm_result["files"]
+        for d in fi["defs"]
+    ]
+    assert "apb_if" not in all_mod_names
+
+
+def test_apb_agent_file_defs(uvm_result):
+    """apb_agent.sv defines exactly apb_agent, apb_driver, apb_monitor."""
+    agent_file = uvm_result["files"][2]
+    names = {d["mod_name"] for d in agent_file["defs"]}
+    assert names == {"apb_agent", "apb_driver", "apb_monitor"}
+
+
+def test_apb_modules_import_uvm_pkg(uvm_result):
+    """apb_agent, apb_driver and apb_monitor all import uvm_pkg."""
+    defs = {d["mod_name"]: d for d in uvm_result["files"][2]["defs"]}
+    for mod in ("apb_agent", "apb_driver", "apb_monitor"):
+        assert "uvm_pkg" in defs[mod]["pkg_imports"], f"{mod} missing uvm_pkg import"
+
+
+def test_apb_agent_instances(uvm_result):
+    """apb_agent instantiates exactly u_drv (apb_driver) and u_mon (apb_monitor)."""
+    defs = {d["mod_name"]: d for d in uvm_result["files"][2]["defs"]}
+    assert defs["apb_agent"]["insts"] == [
+        {"mod_name": "apb_driver",  "inst_name": "u_drv"},
+        {"mod_name": "apb_monitor", "inst_name": "u_mon"},
+    ]
+
+
+def test_apb_driver_monitor_are_leaves(uvm_result):
+    """apb_driver and apb_monitor have no module instances."""
+    defs = {d["mod_name"]: d for d in uvm_result["files"][2]["defs"]}
+    assert defs["apb_driver"]["insts"] == []
+    assert defs["apb_monitor"]["insts"] == []
+
+
+def test_tb_top_file_defs(uvm_result):
+    """tb_top.sv defines dut and tb_top."""
+    tb_file = uvm_result["files"][3]
+    names = {d["mod_name"] for d in tb_file["defs"]}
+    assert names == {"dut", "tb_top"}
+
+
+def test_tb_top_instances(uvm_result):
+    """tb_top instantiates u_dut (dut) and u_agent (apb_agent).
+    The interface instance u_if must be absent — it is not a module."""
+    defs = {d["mod_name"]: d for d in uvm_result["files"][3]["defs"]}
+    assert defs["tb_top"]["insts"] == [
+        {"mod_name": "dut",       "inst_name": "u_dut"},
+        {"mod_name": "apb_agent", "inst_name": "u_agent"},
+    ]
+
+
+def test_tb_top_no_interface_instance(uvm_result):
+    """No interface instance name should appear in tb_top's insts."""
+    defs = {d["mod_name"]: d for d in uvm_result["files"][3]["defs"]}
+    inst_names = [i["inst_name"] for i in defs["tb_top"]["insts"]]
+    assert "u_if" not in inst_names
+
+
+def test_uvm_defs_isolated_to_files(uvm_result):
+    """Module definitions must not bleed across file boundaries."""
+    agent_names = {d["mod_name"] for d in uvm_result["files"][2]["defs"]}
+    tb_names    = {d["mod_name"] for d in uvm_result["files"][3]["defs"]}
+    assert agent_names.isdisjoint(tb_names)
+
+
+def test_uvm_filelist_pkg_before_agent(uvm_result):
+    """uvm_pkg.sv must precede apb_agent.sv (agent imports the package)."""
+    order = compute_filelist(uvm_result)
+    pkg_path   = str(UVM_DIR / "uvm_pkg.sv")
+    agent_path = str(UVM_DIR / "apb_agent.sv")
+    assert order.index(pkg_path) < order.index(agent_path)
+
+
+def test_uvm_filelist_agent_before_tb(uvm_result):
+    """apb_agent.sv must precede tb_top.sv (tb_top instantiates apb_agent)."""
+    order = compute_filelist(uvm_result)
+    agent_path = str(UVM_DIR / "apb_agent.sv")
+    tb_path    = str(UVM_DIR / "tb_top.sv")
+    assert order.index(agent_path) < order.index(tb_path)
+
+
+def test_uvm_filelist_complete(uvm_result):
+    """compute_filelist returns all four UVM files."""
+    order = compute_filelist(uvm_result)
+    assert set(order) == set(_UVM_FILES)
