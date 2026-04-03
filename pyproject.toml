@@ -23,6 +23,11 @@ dev = [
     "pytest-cov",
     "pytest-mypy"
 ]
+docs = [
+    "sphinx",
+    "myst-parser",
+    "furo"
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

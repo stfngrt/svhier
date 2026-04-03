@@ -36,7 +36,13 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
 
 
 def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
-    """Expand a mix of .sv/.v files and directories into a sorted file list."""
+    """Expand a mix of ``.sv``/``.v`` files and directories into a deduplicated file list.
+
+    Directories are searched for ``*.sv`` and ``*.v`` files; when *recursive* is
+    ``True`` the search descends into subdirectories (``**/``).  Duplicate paths
+    (by resolved canonical path) are silently dropped.  Paths that are neither a
+    file nor a directory emit a warning to stderr and are skipped.
+    """
     result: list[Path] = []
     for raw in paths:
         p = Path(raw)
@@ -59,7 +65,10 @@ def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
 
 
 def collect_inc_dirs(paths: list[str], recursive: bool) -> list[str]:
-    """Return directories that contain .svh/.vh header files under *paths*.
+    """Return directories that contain ``.svh``/``.vh`` header files under *paths*.
+
+    The result is written as ``+incdir+<dir>`` lines at the top of the generated
+    filelist, which is the format expected by VCS, Questa, and Xcelium.
 
     For directory inputs the search respects the *recursive* flag.
     For explicit file inputs the parent directory is checked for headers.
@@ -167,7 +176,17 @@ def _write_filelist(ordered: list[str], inc_dirs: list[str], dest: str) -> None:
 
 
 def main():
-    """Entry point: parse arguments, run elaboration, emit YAML and optional filelist."""
+    """Entry point: parse arguments, run slang elaboration, emit YAML and optional filelist.
+
+    Both ``--yaml [FILE]`` and ``--filelist [FILE]`` use ``nargs="?"`` with
+    ``const="-"``, so the bare flag prints to stdout while ``--yaml path.yaml``
+    writes to a file.  All Rich diagnostics (spinner, summary table, warnings)
+    go to stderr so stdout stays clean for piped data.
+
+    ``--no-summary`` suppresses the per-file summary table.
+
+    Exits with code 1 if pyslang reports any error-level diagnostics.
+    """
     parser = argparse.ArgumentParser(
         prog="icinst",
         description="Parse SystemVerilog files and emit a module hierarchy as YAML.",
