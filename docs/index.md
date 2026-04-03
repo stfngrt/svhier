@@ -6,5 +6,6 @@ and output a module/instance hierarchy.
 ```{toctree}
 :maxdepth: 2
 
+usage
 architecture
 ```

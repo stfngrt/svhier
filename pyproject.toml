@@ -26,7 +26,8 @@ dev = [
 docs = [
     "sphinx",
     "myst-parser",
-    "furo"
+    "furo",
+    "sphinx-argparse",
 ]
 
 [tool.pytest.ini_options]
