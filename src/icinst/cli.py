@@ -175,18 +175,8 @@ def _write_filelist(ordered: list[str], inc_dirs: list[str], dest: str) -> None:
     _write_to("\n".join(lines), dest, f"filelist ({len(ordered)} files)")
 
 
-def main():
-    """Entry point: parse arguments, run slang elaboration, emit YAML and optional filelist.
-
-    Both ``--yaml [FILE]`` and ``--filelist [FILE]`` use ``nargs="?"`` with
-    ``const="-"``, so the bare flag prints to stdout while ``--yaml path.yaml``
-    writes to a file.  All Rich diagnostics (spinner, summary table, warnings)
-    go to stderr so stdout stays clean for piped data.
-
-    ``--no-summary`` suppresses the per-file summary table.
-
-    Exits with code 1 if pyslang reports any error-level diagnostics.
-    """
+def _build_parser() -> argparse.ArgumentParser:
+    """Return the argument parser for the ``icinst`` CLI."""
     parser = argparse.ArgumentParser(
         prog="icinst",
         description="Parse SystemVerilog files and emit a module hierarchy as YAML.",
@@ -225,7 +215,17 @@ def main():
         default=False,
         help="Suppress the summary table printed to stderr.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    """Entry point: parse arguments, run slang elaboration, emit YAML and optional filelist.
+
+    All Rich diagnostics (spinner, summary table, warnings) go to stderr so
+    stdout stays clean for piped data.  Exits with code 1 if pyslang reports
+    any error-level diagnostics.
+    """
+    args = _build_parser().parse_args()
 
     sv_files = collect_sv_files(args.paths, args.recursive)
     inc_dirs = collect_inc_dirs(args.paths, args.recursive)
