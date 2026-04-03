@@ -1,6 +1,6 @@
-# icinst
+# svhier
 
-[![CI](https://github.com/stfngrt/icinst/actions/workflows/ci.yml/badge.svg)](https://github.com/stfngrt/icinst/actions/workflows/ci.yml)
+[![CI](https://github.com/stfngrt/svhier/actions/workflows/ci.yml/badge.svg)](https://github.com/stfngrt/svhier/actions/workflows/ci.yml)
 
 Parse SystemVerilog files and extract the module/instance hierarchy as YAML or a dependency-ordered filelist, powered by the [slang](https://github.com/MikePopoloski/slang) elaborator.
 
@@ -11,8 +11,8 @@ Parse SystemVerilog files and extract the module/instance hierarchy as YAML or a
 ## Quick start
 
 ```bash
-pip install icinst
-icinst -r rtl/ --yaml hierarchy.yaml --filelist compile.f
+pip install svhier
+svhier -r rtl/ --yaml hierarchy.yaml --filelist compile.f
 ```
 
 ```yaml

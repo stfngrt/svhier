@@ -15,11 +15,11 @@ uv run pytest tests/ -v
 uv run pytest tests/test_parser.py::test_module_with_instances -v
 
 # Lint
-uv run pylint src/icinst/
+uv run pylint src/svhier/
 
 # Run the CLI
-uv run icinst verilog/test.sv --yaml
-uv run icinst -r verilog/ --yaml out.yaml --filelist out.f
+uv run svhier verilog/test.sv --yaml
+uv run svhier -r verilog/ --yaml out.yaml --filelist out.f
 ```
 
 ## Architecture

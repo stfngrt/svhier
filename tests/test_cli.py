@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from icinst.cli import collect_inc_dirs, collect_sv_files, _write_filelist
+from svhier.cli import collect_inc_dirs, collect_sv_files, _write_filelist
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 INCLUDE_DIR = VERILOG_DIR / "include"

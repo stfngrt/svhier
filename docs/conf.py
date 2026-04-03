@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # sphinx-argparse renders clean text instead of raw escape sequences.
 os.environ["NO_COLOR"] = "1"
 
-project = "icinst"
+project = "svhier"
 author = ""
 extensions = [
     "myst_parser",
