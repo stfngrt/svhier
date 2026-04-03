@@ -1,5 +1,8 @@
 # icinst
 
+[![CI](https://github.com/stfngrt/icinst/actions/workflows/ci.yml/badge.svg)](https://github.com/stfngrt/icinst/actions/workflows/ci.yml)
+[![pylint](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/stfngrt/YOUR_GIST_ID/raw/pylint.json)](https://github.com/stfngrt/icinst/actions/workflows/ci.yml)
+
 Parse SystemVerilog files and extract the module/instance hierarchy as YAML or a dependency-ordered filelist, powered by the [slang](https://github.com/MikePopoloski/slang) elaborator.
 
 - Cross-file instantiation and package imports resolve correctly
