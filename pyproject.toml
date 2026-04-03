@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "icinst"
+name = "svhier"
 version = "0.1.0"
 description = ""
 requires-python = ">=3.10"
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-icinst = "icinst.cli:main"
+svhier = "svhier.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -34,7 +34,7 @@ docs = [
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/icinst"]
+packages = ["src/svhier"]
 
 [tool.pylint.typecheck]
 # pyslang exposes its API via a compiled extension; suppress false no-member errors

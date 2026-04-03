@@ -164,7 +164,7 @@ def parse_files(file_paths: list[str]) -> dict:
 
         * ``file_name`` — original caller string (not resolved).
         * ``pkgs`` — package names defined in this file (internal bookkeeping,
-          stripped from YAML output by :func:`icinst.cli._prepare_for_yaml`).
+          stripped from YAML output by :func:`svhier.cli._prepare_for_yaml`).
         * ``defs`` — list of module definitions, each with ``mod_name``,
           ``pkg_imports`` (omitted from YAML when empty), and ``insts``
           (list of ``{"mod_name": str, "inst_name": str}``).

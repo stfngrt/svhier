@@ -1,6 +1,6 @@
 # Architecture
 
-icinst parses SystemVerilog files using the `pyslang` C++ extension (slang elaborator)
+svhier parses SystemVerilog files using the `pyslang` C++ extension (slang elaborator)
 and outputs a module/instance hierarchy as YAML.
 
 ## Parser
@@ -9,12 +9,12 @@ and outputs a module/instance hierarchy as YAML.
 .. autosummary::
    :nosignatures:
 
-   icinst.parser.parse_files
-   icinst.parser.compute_filelist
+   svhier.parser.parse_files
+   svhier.parser.compute_filelist
 ```
 
 ```{eval-rst}
-.. autofunction:: icinst.parser.parse_files
+.. autofunction:: svhier.parser.parse_files
 ```
 
 :::{note}
@@ -23,7 +23,7 @@ and will appear in the output with an empty `insts` list.
 :::
 
 ```{eval-rst}
-.. autofunction:: icinst.parser.compute_filelist
+.. autofunction:: svhier.parser.compute_filelist
 ```
 
 :::{tip}
@@ -37,21 +37,21 @@ back to the original input order rather than raising an error.
 .. autosummary::
    :nosignatures:
 
-   icinst.cli.collect_sv_files
-   icinst.cli.collect_inc_dirs
-   icinst.cli.main
+   svhier.cli.collect_sv_files
+   svhier.cli.collect_inc_dirs
+   svhier.cli.main
 ```
 
 ```{eval-rst}
-.. autofunction:: icinst.cli.collect_sv_files
+.. autofunction:: svhier.cli.collect_sv_files
 ```
 
 ```{eval-rst}
-.. autofunction:: icinst.cli.collect_inc_dirs
+.. autofunction:: svhier.cli.collect_inc_dirs
 ```
 
 ```{eval-rst}
-.. autofunction:: icinst.cli.main
+.. autofunction:: svhier.cli.main
 ```
 
 ## Filtering rules

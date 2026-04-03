@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from icinst.parser import compute_filelist, parse_files
+from svhier.parser import compute_filelist, parse_files
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 
