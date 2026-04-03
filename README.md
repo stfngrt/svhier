@@ -29,4 +29,8 @@ files:
 
 ## Documentation
 
-Full usage, CLI reference, and architecture notes are in the [docs](docs/).
+Full usage, CLI reference, and architecture notes are in the [docs](https://stfngrt.github.io/svhier/).
+
+## Acknowledgements
+
+Inspired by [svinst](https://github.com/sgherbst/svinst) by Steven Herbst, which provides similar module/instance extraction for SystemVerilog.
