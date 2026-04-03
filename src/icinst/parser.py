@@ -1,4 +1,18 @@
-"""Parse SystemVerilog files with pyslang and extract the module/instance hierarchy."""
+"""Parse SystemVerilog files with pyslang and extract the module/instance hierarchy.
+
+Elaboration works in two phases:
+
+1. **Syntax phase** — all files are loaded into a shared ``SourceManager`` and added to a
+   single ``Compilation``, so cross-file module instantiation and package imports resolve
+   correctly.
+2. **Elaboration phase** — ``compilation.getRoot().topInstances`` seeds a depth-first walk
+   (:func:`_walk_instances`) that builds two maps keyed by module name: ``body_map``
+   (``InstanceBodySymbol``, used to enumerate child instances) and ``mod_pkg_imports``
+   (list of imported package names).
+
+Modules that are defined but never instantiated are unreachable via ``topInstances``
+and appear in the output with an empty ``insts`` list.
+"""
 
 from pathlib import Path
 
@@ -17,7 +31,10 @@ def _collect_file_defs(
     sm: pyslang.SourceManager,
     file_paths: list[str],
 ) -> dict[str, list]:
-    """Return a map from resolved canonical path to ordered Module DefinitionSymbols."""
+    """Return a map from resolved canonical path to ordered Module ``DefinitionSymbol`` s.
+
+    Only ``DefinitionKind.Module`` entries are kept — packages and interfaces are excluded.
+    """
     file_defs: dict[str, list] = {str(Path(p).resolve()): [] for p in file_paths}
     for defn in compilation.getDefinitions():
         if defn.definitionKind != pyslang.DefinitionKind.Module:
@@ -67,7 +84,11 @@ def _walk_instances(
 ) -> None:
     """Depth-first walk of the elaborated instance tree.
 
-    Populates body_map and mod_pkg_imports for every reachable module.
+    Populates *body_map* and *mod_pkg_imports* for every reachable module.
+    The ``name in body_map`` guard prevents revisiting modules that appear in
+    multiple instantiation sites.  Interface instances are skipped via the
+    ``child.isModule`` guard (they share ``SymbolKind.Instance`` with module
+    instances but have ``isModule == False``).
     """
     name = inst.definition.name
     if name in body_map:
@@ -128,11 +149,30 @@ def _build_def_entry(
 # ---------------------------------------------------------------------------
 
 def parse_files(file_paths: list[str]) -> dict:
-    """Parse a list of SystemVerilog files and return the module hierarchy.
+    """Parse a list of SystemVerilog files and return the module/instance hierarchy.
 
-    Returns a dict with a ``files`` key containing one entry per input file.
-    Each entry lists the module definitions found in that file together with
-    their child instances and package imports.
+    All files share a single ``SourceManager`` so cross-file instantiation resolves
+    correctly.  See the module docstring for the two-phase elaboration model.
+
+    Returns a dict with the following top-level keys:
+
+    ``files``
+        One entry per input file, each containing:
+
+        * ``file_name`` — original caller string (not resolved).
+        * ``pkgs`` — package names defined in this file (internal bookkeeping,
+          stripped from YAML output by :func:`icinst.cli._prepare_for_yaml`).
+        * ``defs`` — list of module definitions, each with ``mod_name``,
+          ``pkg_imports`` (omitted from YAML when empty), and ``insts``
+          (list of ``{"mod_name": str, "inst_name": str}``).
+
+    ``diagnostics``
+        List of ``{"severity": str, "file": str, "message": str}`` dicts from
+        pyslang's ``DiagnosticEngine`` (internal; stripped from YAML output).
+
+    ``has_errors``
+        ``True`` if any error-level diagnostic was issued.  The CLI exits with
+        code 1 when this is set.
     """
     sm = pyslang.SourceManager()
     trees = [(p, pyslang.SyntaxTree.fromFile(p, sm)) for p in file_paths]
@@ -169,9 +209,18 @@ def parse_files(file_paths: list[str]) -> dict:
 def compute_filelist(result: dict) -> list[str]:
     """Return file paths in topological dependency order (dependencies first).
 
-    A file depends on another if any of its modules instantiates a module
-    defined there, or imports a package defined there.
-    Falls back to the original order if a dependency cycle is detected.
+    Builds a ``networkx.DiGraph`` where an edge ``A → B`` means file A must be
+    compiled before file B.  Edges come from two sources:
+
+    * **Module instantiation** — a file that instantiates a module depends on the
+      file that defines it.
+    * **Package imports** — a file that imports a package depends on the file that
+      defines it.
+
+    ``nx.topological_sort`` produces the compilation order.  If the graph contains
+    a cycle the original input order is returned unchanged.
+
+    *result* is the dict returned by :func:`parse_files`.
     """
     files = result["files"]
 
