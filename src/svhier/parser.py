@@ -20,9 +20,23 @@ and appear in the output with an empty ``insts`` list.
 from pathlib import Path
 
 import networkx as nx
-import pyslang
+from pyslang import (
+    Bag,
+    Compilation,
+    CompilationOptions,
+    DefinitionKind,
+    DefinitionSymbol,
+    DiagnosticEngine,
+    InstanceBodySymbol,
+    InstanceSymbol,
+    SourceManager,
+    SymbolKind,
+    SyntaxTree,
+    TextDiagnosticClient,
+    TimeScale,
+)
 
-_IMPORT_KINDS = (pyslang.SymbolKind.WildcardImport, pyslang.SymbolKind.ExplicitImport)
+_IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 
 
 # ---------------------------------------------------------------------------
@@ -30,8 +44,8 @@ _IMPORT_KINDS = (pyslang.SymbolKind.WildcardImport, pyslang.SymbolKind.ExplicitI
 # ---------------------------------------------------------------------------
 
 def _collect_file_defs(
-    compilation: pyslang.Compilation,
-    sm: pyslang.SourceManager,
+    compilation: Compilation,
+    sm: SourceManager,
     file_paths: list[str],
 ) -> dict[str, list]:
     """Return a map from resolved canonical path to ordered Module ``DefinitionSymbol`` s.
@@ -40,7 +54,7 @@ def _collect_file_defs(
     """
     file_defs: dict[str, list] = {str(Path(p).resolve()): [] for p in file_paths}
     for defn in compilation.getDefinitions():
-        if defn.definitionKind != pyslang.DefinitionKind.Module:
+        if defn.definitionKind != DefinitionKind.Module:
             continue
         canonical = str(Path(sm.getFileName(defn.location)).resolve())
         if canonical in file_defs:
@@ -49,15 +63,15 @@ def _collect_file_defs(
 
 
 def _collect_pkg_maps(
-    compilation: pyslang.Compilation,
-    sm: pyslang.SourceManager,
+    compilation: Compilation,
+    sm: SourceManager,
     file_paths: list[str],
 ) -> dict[str, list[str]]:
     """Return file_pkgs: resolved file path -> list of package names defined there."""
     pkg_to_file: dict[str, str] = {}
     for cu in compilation.getRoot().compilationUnits:
         for child in cu:
-            if child.kind == pyslang.SymbolKind.Package:
+            if child.kind == SymbolKind.Package:
                 canonical = str(Path(sm.getFileName(child.location)).resolve())
                 pkg_to_file[child.name] = canonical
 
@@ -69,7 +83,7 @@ def _collect_pkg_maps(
     return file_pkgs
 
 
-def _collect_imports(body: pyslang.InstanceBodySymbol) -> list[str]:
+def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     """Return deduplicated package names imported by an instance body."""
     imports: list[str] = []
     for child in body:
@@ -81,8 +95,8 @@ def _collect_imports(body: pyslang.InstanceBodySymbol) -> list[str]:
 
 
 def _walk_instances(
-    inst: pyslang.InstanceSymbol,
-    body_map: dict[str, pyslang.InstanceBodySymbol],
+    inst: InstanceSymbol,
+    body_map: dict[str, InstanceBodySymbol],
     mod_pkg_imports: dict[str, list[str]],
 ) -> None:
     """Depth-first walk of the elaborated instance tree.
@@ -99,13 +113,13 @@ def _walk_instances(
     body_map[name] = inst.body
     mod_pkg_imports[name] = _collect_imports(inst.body)
     for child in inst.body:
-        if child.kind == pyslang.SymbolKind.Instance and child.isModule:
+        if child.kind == SymbolKind.Instance and child.isModule:
             _walk_instances(child, body_map, mod_pkg_imports)
 
 
 def _collect_diagnostics(
-    compilation: pyslang.Compilation,
-    sm: pyslang.SourceManager,
+    compilation: Compilation,
+    sm: SourceManager,
 ) -> tuple[list[dict], bool]:
     """Issue all compilation diagnostics through a DiagnosticEngine.
 
@@ -113,8 +127,8 @@ def _collect_diagnostics(
     with keys ``severity``, ``file``, and ``message``, and has_errors is True
     if any error-level diagnostic was issued.
     """
-    engine = pyslang.DiagnosticEngine(sm)
-    client = pyslang.TextDiagnosticClient()
+    engine = DiagnosticEngine(sm)
+    client = TextDiagnosticClient()
     engine.addClient(client)
 
     diag_list: list[dict] = []
@@ -123,22 +137,22 @@ def _collect_diagnostics(
         diag_list.append({
             "severity": "error" if diag.isError() else "warning",
             "file": sm.getFileName(diag.location) if diag.location else "",
-            "message": str(diag.code).removeprefix("DiagCode(").removesuffix(")"),
+            "message": engine.formatMessage(diag),
         })
 
     return diag_list, engine.numErrors > 0
 
 
 def _build_def_entry(
-    defn: pyslang.DefinitionSymbol,
-    body_map: dict[str, pyslang.InstanceBodySymbol],
+    defn: DefinitionSymbol,
+    body_map: dict[str, InstanceBodySymbol],
     mod_pkg_imports: dict[str, list[str]],
 ) -> dict:
     """Build the output dict for a single module definition."""
     insts = []
     if defn.name in body_map:
         for child in body_map[defn.name]:
-            if child.kind == pyslang.SymbolKind.Instance and child.isModule:
+            if child.kind == SymbolKind.Instance and child.isModule:
                 insts.append({"mod_name": child.definition.name, "inst_name": child.name})
     return {
         "mod_name": defn.name,
@@ -177,17 +191,19 @@ def parse_files(file_paths: list[str]) -> dict:
         ``True`` if any error-level diagnostic was issued.  The CLI exits with
         code 1 when this is set.
     """
-    sm = pyslang.SourceManager()
-    trees = [(p, pyslang.SyntaxTree.fromFile(p, sm)) for p in file_paths]
+    sm = SourceManager()
+    trees = [(p, SyntaxTree.fromFile(p, sm)) for p in file_paths]
 
-    compilation = pyslang.Compilation()
+    bag = Bag([CompilationOptions()])
+    bag.compilationOptions.defaultTimeScale = TimeScale.fromString("1ns/1ns")
+    compilation = Compilation(bag)
     for _, tree in trees:
         compilation.addSyntaxTree(tree)
 
     file_defs = _collect_file_defs(compilation, sm, file_paths)
     file_pkgs = _collect_pkg_maps(compilation, sm, file_paths)
 
-    body_map: dict[str, pyslang.InstanceBodySymbol] = {}
+    body_map: dict[str, InstanceBodySymbol] = {}
     mod_pkg_imports: dict[str, list[str]] = {}
     for top_inst in compilation.getRoot().topInstances:
         _walk_instances(top_inst, body_map, mod_pkg_imports)

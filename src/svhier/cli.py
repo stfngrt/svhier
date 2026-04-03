@@ -126,7 +126,7 @@ def _print_summary(hierarchy: dict) -> None:
     _err.print(table)
 
 
-def _print_diagnostics(hierarchy: dict) -> None:
+def _print_diagnostics(hierarchy: dict, *, warnings: bool = False) -> None:
     """Print any pyslang diagnostics to stderr using Rich formatting."""
     diags = hierarchy.get("diagnostics", [])
     if not diags:
@@ -134,8 +134,10 @@ def _print_diagnostics(hierarchy: dict) -> None:
     for d in diags:
         if d["severity"] == "error":
             tag = "[bold red]error[/bold red]"
-        else:
+        elif warnings:
             tag = "[bold yellow]warning[/bold yellow]"
+        else:
+            continue
         location = f"[dim]{d['file']}[/dim]: " if d["file"] else ""
         _err.print(f"{tag}: {location}{d['message']}")
 
@@ -218,6 +220,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Suppress the summary table printed to stderr.",
     )
+    parser.add_argument(
+        "-W", "--warnings",
+        action="store_true",
+        default=False,
+        help="Also print slang warning diagnostics to stderr.",
+    )
     return parser
 
 
@@ -248,7 +256,7 @@ def main():
         hierarchy = parse_files(sv_files)
         progress.update(task, completed=True)
 
-    _print_diagnostics(hierarchy)
+    _print_diagnostics(hierarchy, warnings=args.warnings)
 
     if not args.no_summary:
         _print_summary(hierarchy)
