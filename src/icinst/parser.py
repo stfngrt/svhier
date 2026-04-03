@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Stefan Engert
+
 """Parse SystemVerilog files with pyslang and extract the module/instance hierarchy.
 
 Elaboration works in two phases:

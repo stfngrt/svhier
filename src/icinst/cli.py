@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Stefan Engert
+
 """Command-line interface for icinst: parse SV hierarchies and emit YAML."""
 
 import argparse
