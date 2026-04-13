@@ -38,7 +38,11 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
     return {"files": files}
 
 
-def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
+def _is_ignored(p: Path, ignore: set[str]) -> bool:
+    return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
+
+
+def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
     """Expand a mix of ``.sv``/``.v`` files and directories into a deduplicated file list.
 
     Directories are searched for ``*.sv`` and ``*.v`` files; when *recursive* is
@@ -46,15 +50,17 @@ def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
     (by resolved canonical path) are silently dropped.  Paths that are neither a
     file nor a directory emit a warning to stderr and are skipped.
     """
+    ign = ignore or set()
     result: list[Path] = []
     for raw in paths:
         p = Path(raw)
         if p.is_file():
-            result.append(p)
+            if not _is_ignored(p, ign):
+                result.append(p)
         elif p.is_dir():
             prefix = "**/" if recursive else ""
             for ext in ("*.sv", "*.v"):
-                result.extend(sorted(p.glob(f"{prefix}{ext}")))
+                result.extend(f for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ign))
         else:
             _err.print(f"[yellow]warning:[/yellow] {raw!r} is not a file or directory, skipping")
     seen: set[Path] = set()
@@ -67,7 +73,7 @@ def collect_sv_files(paths: list[str], recursive: bool) -> list[str]:
     return unique
 
 
-def collect_inc_dirs(paths: list[str], recursive: bool) -> list[str]:
+def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
     """Return directories that contain ``.svh``/``.vh`` header files under *paths*.
 
     The result is written as ``+incdir+<dir>`` lines at the top of the generated
@@ -77,6 +83,7 @@ def collect_inc_dirs(paths: list[str], recursive: bool) -> list[str]:
     For explicit file inputs the parent directory is checked for headers.
     Directories are returned in discovery order, deduplicated.
     """
+    ign = ignore or set()
     seen: set[Path] = set()
     result: list[str] = []
 
@@ -92,10 +99,11 @@ def collect_inc_dirs(paths: list[str], recursive: bool) -> list[str]:
             prefix = "**/" if recursive else ""
             for ext in ("*.svh", "*.vh"):
                 for hdr in sorted(p.glob(f"{prefix}{ext}")):
-                    _add(hdr.parent)
+                    if not _is_ignored(hdr, ign):
+                        _add(hdr.parent)
         elif p.is_file():
             parent = p.parent
-            if any(parent.glob("*.svh")) or any(parent.glob("*.vh")):
+            if not _is_ignored(p, ign) and (any(parent.glob("*.svh")) or any(parent.glob("*.vh"))):
                 _add(parent)
 
     return result
@@ -226,6 +234,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Also print slang warning diagnostics to stderr.",
     )
+    parser.add_argument(
+        "-x", "--ignore",
+        action="append",
+        metavar="NAME",
+        default=None,
+        dest="ignore",
+        help="Ignore files or directories whose name matches NAME. Repeatable.",
+    )
     return parser
 
 
@@ -238,8 +254,9 @@ def main():
     """
     args = _build_parser().parse_args()
 
-    sv_files = collect_sv_files(args.paths, args.recursive)
-    inc_dirs = collect_inc_dirs(args.paths, args.recursive)
+    ignore = {n.lower() for n in args.ignore} if args.ignore else set()
+    sv_files = collect_sv_files(args.paths, args.recursive, ignore)
+    inc_dirs = collect_inc_dirs(args.paths, args.recursive, ignore)
     if not sv_files:
         _err.print("[red]error:[/red] no .sv/.v files found")
         sys.exit(1)
