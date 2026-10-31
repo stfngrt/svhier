@@ -163,6 +163,16 @@ def _build_def_entry(
     }
 
 
+def _build_compilation(file_paths: list[str], sm: SourceManager) -> Compilation:
+    """Parse *file_paths* into syntax trees sharing *sm* and add them to a new ``Compilation``."""
+    bag = Bag([CompilationOptions()])
+    bag.compilationOptions.defaultTimeScale = TimeScale.fromString("1ns/1ns")
+    compilation = Compilation(bag)
+    for path in file_paths:
+        compilation.addSyntaxTree(SyntaxTree.fromFile(path, sm))
+    return compilation
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -194,13 +204,7 @@ def parse_files(file_paths: list[str]) -> dict:
         code 1 when this is set.
     """
     sm = SourceManager()
-    trees = [(p, SyntaxTree.fromFile(p, sm)) for p in file_paths]
-
-    bag = Bag([CompilationOptions()])
-    bag.compilationOptions.defaultTimeScale = TimeScale.fromString("1ns/1ns")
-    compilation = Compilation(bag)
-    for _, tree in trees:
-        compilation.addSyntaxTree(tree)
+    compilation = _build_compilation(file_paths, sm)
 
     file_defs = _collect_file_defs(compilation, sm, file_paths)
     file_pkgs = _collect_pkg_maps(compilation, sm, file_paths)

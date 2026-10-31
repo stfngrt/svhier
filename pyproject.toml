@@ -39,6 +39,13 @@ testpaths = ["tests"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/svhier"]
 
+[tool.pylint.main]
+# pyslang is a compiled extension; let pylint load it to see its members.
+# pyslang.ast / pyslang.syntax are registered in sys.modules at import time and
+# have no file on disk, so pylint cannot resolve them statically.
+extension-pkg-allow-list = ["pyslang"]
+ignored-modules = ["pyslang.ast", "pyslang.syntax"]
+
 [tool.pylint.typecheck]
 # pyslang exposes its API via a compiled extension; suppress false no-member errors
 generated-members = ["pyslang.*"]
