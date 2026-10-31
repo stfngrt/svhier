@@ -20,12 +20,18 @@ def test_simple_single_module():
                 "file_name": path,
                 "pkgs": [],
                 "ifaces": [],
+                "shadowed": [],
                 "refs": [],
                 "defs": [
                     {"mod_name": "Simple", "pkg_imports": [], "insts": []},
                 ],
             }
         ],
+        "duplicates": [],
+        "tops": [],
+        "needed": None,
+        "defines": [],
+        "inc_dirs": [],
         "diagnostics": [],
         "has_errors": False,
     }
@@ -596,3 +602,121 @@ def test_file_refs_list_referenced_packages_and_interfaces():
     assert files["b_pkg.sv"]["refs"] == ["a_pkg"]
     assert files["a_pkg.sv"]["refs"] == []
     assert files["bus_if.sv"]["ifaces"] == ["bus_if"]
+
+
+# ---------------------------------------------------------------------------
+# Parameterizations (#2 item 7)
+# ---------------------------------------------------------------------------
+
+PARAM_WALK = [str(VERILOG_DIR / "param_walk" / "param_walk.sv")]
+
+
+def test_each_parameterization_is_walked():
+    """pw_mid takes a different generate branch per parameter value; both children are listed."""
+    assert _insts(parse_files(PARAM_WALK), "pw_mid") == [("pw_leaf_a", "g_a.u_a"), ("pw_leaf_b", "g_b.u_b")]
+
+
+def test_module_reached_only_through_second_parameterization_is_walked():
+    assert _insts(parse_files(PARAM_WALK), "pw_leaf_b") == [("pw_deep", "u_deep")]
+
+
+def test_parameterized_parent_lists_every_instance():
+    assert [n for _, n in _insts(parse_files(PARAM_WALK), "pw_top")] == ["u_m1", "u_m2", "u_m3"]
+
+
+# ---------------------------------------------------------------------------
+# Duplicate definitions (#2 item 6)
+# ---------------------------------------------------------------------------
+
+DUP_DIR = VERILOG_DIR / "dup_defs"
+DUP_A, DUP_B, DUP_TOP = (str(DUP_DIR / n) for n in ("dup_a.sv", "dup_b.sv", "dup_top.sv"))
+
+
+def _file_defs(result, file_name):
+    entry = next(f for f in result["files"] if f["file_name"] == file_name)
+    return {d["mod_name"]: d for d in entry["defs"]}
+
+
+def test_duplicate_module_reported():
+    result = parse_files([DUP_A, DUP_B, DUP_TOP])
+    assert result["duplicates"] == [{"name": "dup_mod", "kind": "module", "files": [DUP_A, DUP_B], "used": DUP_B}]
+
+
+def test_duplicate_module_children_only_on_used_copy():
+    result = parse_files([DUP_A, DUP_B, DUP_TOP])
+    assert _file_defs(result, DUP_B)["dup_mod"]["insts"] == [{"mod_name": "dup_leaf_b", "inst_name": "u_b"}]
+    assert _file_defs(result, DUP_A)["dup_mod"]["insts"] == []
+
+
+def test_duplicate_module_used_copy_follows_slang():
+    result = parse_files([DUP_B, DUP_A, DUP_TOP])
+    assert result["duplicates"][0]["used"] == DUP_A
+    assert _file_defs(result, DUP_A)["dup_mod"]["insts"] == [{"mod_name": "dup_leaf_a", "inst_name": "u_a"}]
+
+
+def test_filelist_orders_against_used_duplicate():
+    order = compute_filelist(parse_files([DUP_TOP, DUP_B, DUP_A]))
+    assert order.index(DUP_A) < order.index(DUP_TOP)
+
+
+def test_duplicate_package_reported_and_ordered():
+    cfg_a, cfg_b, user = (str(DUP_DIR / n) for n in ("cfg_a.sv", "cfg_b.sv", "cfg_user.sv"))
+    result = parse_files([user, cfg_a, cfg_b])
+    assert result["duplicates"] == [{"name": "dup_cfg", "kind": "package", "files": [cfg_a, cfg_b], "used": cfg_a}]
+    order = compute_filelist(result)
+    assert order.index(cfg_a) < order.index(user)
+
+
+def test_no_duplicates_key_is_empty():
+    assert parse_files(PARAM_WALK)["duplicates"] == []
+
+
+# ---------------------------------------------------------------------------
+# Command files, defines, tops (#2 item 8)
+# ---------------------------------------------------------------------------
+
+CF_DIR = VERILOG_DIR / "cmdfile"
+
+
+@pytest.fixture
+def cf_env(monkeypatch):
+    monkeypatch.setenv("SVHIER_CF_DIR", str(CF_DIR))
+
+
+def _names(result):
+    return [Path(f["file_name"]).name for f in result["files"]]
+
+
+def test_command_file_with_env_var_and_nested_F(cf_env):  # pylint: disable=redefined-outer-name,unused-argument
+    result = parse_files([], command_files=[("-f", str(CF_DIR / "cmd.f"))])
+    assert result["has_errors"] is False
+    assert sorted(_names(result)) == ["cf_leaf.sv", "cf_tb.sv", "cf_top.sv"]
+
+
+def test_command_file_define_and_incdir_applied(cf_env):  # pylint: disable=redefined-outer-name,unused-argument
+    result = parse_files([], command_files=[("-f", str(CF_DIR / "cmd.f"))])
+    assert _insts(result, "cf_top") == [("cf_leaf", "u_leaf")]
+    assert result["defines"] == ["CF_EN"]
+    assert [Path(d).resolve() for d in result["inc_dirs"]] == [(CF_DIR / "inc").resolve()]
+
+
+def test_defines_argument(cf_env):  # pylint: disable=redefined-outer-name,unused-argument
+    cmd = [("-f", str(CF_DIR / "nodefine.f"))]
+    assert _insts(parse_files([], command_files=cmd), "cf_top") == []
+    assert _insts(parse_files([], defines=["CF_EN"], command_files=cmd), "cf_top") == [("cf_leaf", "u_leaf")]
+
+
+def test_tops_restrict_elaboration_and_filelist(cf_env):  # pylint: disable=redefined-outer-name,unused-argument
+    result = parse_files([], tops=["cf_top"], command_files=[("-f", str(CF_DIR / "cmd.f"))])
+    assert _insts(result, "cf_tb") == []
+    assert [Path(f).name for f in compute_filelist(result)] == ["cf_leaf.sv", "cf_top.sv"]
+
+
+def test_explicit_files_keep_caller_names():
+    path = str(VERILOG_DIR / "simple.sv")
+    assert [f["file_name"] for f in parse_files([path])["files"]] == [path]
+
+
+def test_bad_command_file_raises():
+    with pytest.raises(ValueError):
+        parse_files([], command_files=[("-f", str(CF_DIR / "does_not_exist.f"))])

@@ -150,3 +150,67 @@ def test_yaml_strips_internal_ref_keys():
     from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
     out = _prepare_for_yaml(parse_files([str(VERILOG_DIR / "pkg_refs" / "bus_if.sv")]))
     assert set(out["files"][0]) == {"file_name", "defs"}
+
+
+# ---------------------------------------------------------------------------
+# -f / -D / -I / --top and duplicate warnings (#2 items 6 and 8)
+# ---------------------------------------------------------------------------
+
+CF_DIR = VERILOG_DIR / "cmdfile"
+
+
+def test_main_command_file_filelist(monkeypatch, capsys):
+    monkeypatch.setenv("SVHIER_CF_DIR", str(CF_DIR))
+    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "cmd.f"), "--no-summary", "--filelist"])
+    main()
+    lines = capsys.readouterr().out.splitlines()
+    incdirs = [Path(ln.removeprefix("+incdir+")).resolve() for ln in lines if ln.startswith("+incdir+")]
+    assert (CF_DIR / "inc").resolve() in incdirs
+    assert "+define+CF_EN" in lines
+    srcs = [Path(ln).name for ln in lines if ln.endswith(".sv")]
+    assert srcs.index("cf_leaf.sv") < srcs.index("cf_top.sv") < srcs.index("cf_tb.sv")
+
+
+def test_main_top_define_incdir(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", [
+        "svhier", "-r", str(CF_DIR / "rtl"), "-I", str(CF_DIR / "inc"), "-D", "CF_EN",
+        "--top", "cf_top", "--no-summary", "--filelist",
+    ])
+    main()
+    srcs = [Path(ln).name for ln in capsys.readouterr().out.splitlines() if ln.endswith(".sv")]
+    assert srcs == ["cf_leaf.sv", "cf_top.sv"]
+
+
+def test_main_requires_input(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["svhier", "--no-summary"])
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code != 0
+    else:
+        raise AssertionError("expected SystemExit")
+
+
+def test_main_bad_command_file_exits(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "nope.f"), "--no-summary"])
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("expected SystemExit")
+
+
+def test_main_warns_about_duplicates(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "dup_defs"), "--no-summary"])
+    main()
+    err = capsys.readouterr().err
+    assert "dup_mod" in err and "dup_cfg" in err
+
+
+def test_yaml_strips_shadowed_key():
+    from svhier.cli import _prepare_for_yaml  # pylint: disable=import-outside-toplevel
+    from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
+    dup = VERILOG_DIR / "dup_defs"
+    out = _prepare_for_yaml(parse_files([str(dup / "dup_a.sv"), str(dup / "dup_b.sv")]))
+    assert all(set(f) == {"file_name", "defs"} for f in out["files"])

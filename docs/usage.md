@@ -26,6 +26,21 @@ Parse an entire directory recursively and write both outputs to files:
 svhier -r rtl/ --yaml hierarchy.yaml --filelist compile.f
 ```
 
+Use a project filelist instead of scanning directories, and pick the top module:
+
+```bash
+export CVA6_REPO_DIR=$PWD/cva6 HPDCACHE_DIR=$PWD/cva6/core/cache_subsystem/hpdcache TARGET_CFG=cv64a6_imafdc_sv39
+svhier -f $CVA6_REPO_DIR/core/Flist.cva6 --top cva6 --yaml hier.yaml --filelist cva6.f
+```
+
+Command files may use `+incdir+`, `+define+`, nested `-f`/`-F` and `${VAR}`
+environment variables.  `-F FILE` resolves the paths inside FILE relative to FILE;
+`-f` resolves them relative to the working directory.  `-I DIR` and `-D NAME[=VALUE]`
+add include directories and macros, and can be combined with paths and command files.
+
+`--top MODULE` (repeatable) elaborates only the given tops, which keeps testbenches and
+unused variants out of the hierarchy, and limits the filelist to the files the tops need.
+
 ## Command-line reference
 
 ```{eval-rst}
@@ -93,8 +108,15 @@ rtl/mux2.sv
 rtl/alu.sv
 ```
 
-`+incdir+` lines are emitted for any directory that contains `.svh`/`.vh`
-header files.  The format is compatible with VCS, Questa, and Xcelium.
+`+incdir+` lines are emitted for `-I` directories, for any directory that contains
+`.svh`/`.vh` header files, and for every directory an `` `include`` was actually
+resolved from.  `+define+` lines repeat the macros given by `-D` or command files.
+The format is compatible with VCS, Questa, and Xcelium.
+
+:::{note}
+If a module, interface or package name is defined in more than one file, svhier
+prints a warning naming the copy slang uses; dependencies resolve to that copy.
+:::
 
 :::{tip}
 If a dependency cycle is detected, svhier falls back to the original input
