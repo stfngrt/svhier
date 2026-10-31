@@ -548,3 +548,49 @@ def test_include_resolved_with_inc_dirs():
     result = parse_files([INC_USER], inc_dirs=[str(NESTED_INC / "vendor" / "include")])
     assert result["diagnostics"] == []
     assert result["has_errors"] is False
+
+
+# ---------------------------------------------------------------------------
+# Package / interface references for filelist ordering (issue #2, item 5)
+# ---------------------------------------------------------------------------
+
+PKG_REFS = VERILOG_DIR / "pkg_refs"
+# Deliberately listed users-first so input order alone would be wrong.
+PKG_REFS_FILES = [str(PKG_REFS / n) for n in ("scoped_user.sv", "if_inst_user.sv", "b_pkg.sv", "bus_if.sv", "a_pkg.sv")]
+
+
+def _order():
+    ordered = compute_filelist(parse_files(PKG_REFS_FILES))
+    return {Path(f).name: i for i, f in enumerate(ordered)}
+
+
+def test_pkg_refs_parse_without_errors():
+    assert parse_files(PKG_REFS_FILES)["has_errors"] is False
+
+
+def test_filelist_scoped_pkg_ref_without_import():
+    pos = _order()
+    assert pos["b_pkg.sv"] < pos["scoped_user.sv"]
+
+
+def test_filelist_package_depends_on_package():
+    pos = _order()
+    assert pos["a_pkg.sv"] < pos["b_pkg.sv"]
+
+
+def test_filelist_interface_port_before_user():
+    pos = _order()
+    assert pos["bus_if.sv"] < pos["scoped_user.sv"]
+
+
+def test_filelist_interface_instance_before_user():
+    pos = _order()
+    assert pos["bus_if.sv"] < pos["if_inst_user.sv"]
+
+
+def test_file_refs_list_referenced_packages_and_interfaces():
+    files = {Path(f["file_name"]).name: f for f in parse_files(PKG_REFS_FILES)["files"]}
+    assert files["scoped_user.sv"]["refs"] == ["b_pkg", "bus_if"]
+    assert files["b_pkg.sv"]["refs"] == ["a_pkg"]
+    assert files["a_pkg.sv"]["refs"] == []
+    assert files["bus_if.sv"]["ifaces"] == ["bus_if"]
