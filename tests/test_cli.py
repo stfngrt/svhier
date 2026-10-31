@@ -143,3 +143,10 @@ def test_main_passes_inc_dirs_to_parser(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["svhier", "-r", str(NESTED_INC), "--no-summary", "--yaml"])
     main()
     assert "inc_user" in capsys.readouterr().out
+
+
+def test_yaml_strips_internal_ref_keys():
+    from svhier.cli import _prepare_for_yaml  # pylint: disable=import-outside-toplevel
+    from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
+    out = _prepare_for_yaml(parse_files([str(VERILOG_DIR / "pkg_refs" / "bus_if.sv")]))
+    assert set(out["files"][0]) == {"file_name", "defs"}
