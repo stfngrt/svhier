@@ -1,2 +1,5 @@
 *.pyc
 docs/_build/
+
+# third-party test repos (cloned locally, not yet submodules)
+external/

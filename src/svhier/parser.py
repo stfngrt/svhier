@@ -9,14 +9,16 @@ Elaboration works in two phases:
    single ``Compilation``, so cross-file module instantiation and package imports resolve
    correctly.
 2. **Elaboration phase** — ``compilation.getRoot().topInstances`` seeds a depth-first walk
-   (:func:`_walk_instances`) that builds two maps keyed by module name: ``body_map``
-   (``InstanceBodySymbol``, used to enumerate child instances) and ``mod_pkg_imports``
-   (list of imported package names).
+   (:func:`_walk_instances`) that builds two maps keyed by module name: ``inst_map``
+   (first elaborated ``InstanceSymbol``, used to enumerate child instances, including
+   those inside generate blocks and instance arrays) and ``mod_pkg_imports`` (list of
+   imported package names).
 
 Modules that are defined but never instantiated are unreachable via ``topInstances``
 and appear in the output with an empty ``insts`` list.
 """
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import networkx as nx
@@ -27,6 +29,7 @@ from pyslang import (
     TextDiagnosticClient,
     TimeScale,
 )
+from pyslang.parsing import PreprocessorOptions
 from pyslang.ast import (
     Compilation,
     CompilationOptions,
@@ -39,6 +42,8 @@ from pyslang.ast import (
 from pyslang.syntax import SyntaxTree
 
 _IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
+# Scopes that can hold module instances without being a module themselves.
+_CONTAINER_KINDS = (SymbolKind.GenerateBlock, SymbolKind.GenerateBlockArray, SymbolKind.InstanceArray)
 
 
 # ---------------------------------------------------------------------------
@@ -96,27 +101,42 @@ def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     return imports
 
 
+def _iter_module_instances(scope) -> Iterator[InstanceSymbol]:
+    """Yield every module instance elaborated directly under *scope*.
+
+    Descends into generate blocks, generate-for arrays and instance arrays, but not
+    into the bodies of the instances it yields.  Generate branches that were not
+    taken (``isUninstantiated``) are skipped.  Interface instances are skipped via
+    the ``isModule`` guard (they share ``SymbolKind.Instance`` with module instances).
+    """
+    for child in scope:
+        if child.kind == SymbolKind.Instance:
+            if child.isModule:
+                yield child
+        elif child.kind in _CONTAINER_KINDS:
+            if child.kind == SymbolKind.GenerateBlock and child.isUninstantiated:
+                continue
+            yield from _iter_module_instances(child)
+
+
 def _walk_instances(
     inst: InstanceSymbol,
-    body_map: dict[str, InstanceBodySymbol],
+    inst_map: dict[str, InstanceSymbol],
     mod_pkg_imports: dict[str, list[str]],
 ) -> None:
     """Depth-first walk of the elaborated instance tree.
 
-    Populates *body_map* and *mod_pkg_imports* for every reachable module.
-    The ``name in body_map`` guard prevents revisiting modules that appear in
-    multiple instantiation sites.  Interface instances are skipped via the
-    ``child.isModule`` guard (they share ``SymbolKind.Instance`` with module
-    instances but have ``isModule == False``).
+    Populates *inst_map* (first elaborated instance per module name) and
+    *mod_pkg_imports* for every reachable module.  The ``name in inst_map`` guard
+    prevents revisiting modules that appear in multiple instantiation sites.
     """
     name = inst.definition.name
-    if name in body_map:
+    if name in inst_map:
         return
-    body_map[name] = inst.body
+    inst_map[name] = inst
     mod_pkg_imports[name] = _collect_imports(inst.body)
-    for child in inst.body:
-        if child.kind == SymbolKind.Instance and child.isModule:
-            _walk_instances(child, body_map, mod_pkg_imports)
+    for child in _iter_module_instances(inst.body):
+        _walk_instances(child, inst_map, mod_pkg_imports)
 
 
 def _collect_diagnostics(
@@ -147,15 +167,23 @@ def _collect_diagnostics(
 
 def _build_def_entry(
     defn: DefinitionSymbol,
-    body_map: dict[str, InstanceBodySymbol],
+    inst_map: dict[str, InstanceSymbol],
     mod_pkg_imports: dict[str, list[str]],
 ) -> dict:
-    """Build the output dict for a single module definition."""
+    """Build the output dict for a single module definition.
+
+    ``inst_name`` is the child's hierarchical path relative to the parent module,
+    so instances inside generate blocks or instance arrays get names like
+    ``g_loop[0].u_core`` or ``u_arr[1]``.
+    """
     insts = []
-    if defn.name in body_map:
-        for child in body_map[defn.name]:
-            if child.kind == SymbolKind.Instance and child.isModule:
-                insts.append({"mod_name": child.definition.name, "inst_name": child.name})
+    parent = inst_map.get(defn.name)
+    if parent is not None:
+        prefix = parent.hierarchicalPath + "."
+        for child in _iter_module_instances(parent.body):
+            path = child.hierarchicalPath
+            inst_name = path[len(prefix):] if path.startswith(prefix) else child.name
+            insts.append({"mod_name": child.definition.name, "inst_name": inst_name})
     return {
         "mod_name": defn.name,
         "pkg_imports": mod_pkg_imports.get(defn.name, []),
@@ -163,13 +191,22 @@ def _build_def_entry(
     }
 
 
-def _build_compilation(file_paths: list[str], sm: SourceManager) -> Compilation:
-    """Parse *file_paths* into syntax trees sharing *sm* and add them to a new ``Compilation``."""
-    bag = Bag([CompilationOptions()])
+def _build_compilation(
+    file_paths: list[str],
+    sm: SourceManager,
+    inc_dirs: list[str] | None = None,
+) -> Compilation:
+    """Parse *file_paths* into syntax trees sharing *sm* and add them to a new ``Compilation``.
+
+    *inc_dirs* are passed to the preprocessor as additional `` `include`` search paths.
+    """
+    pp_opts = PreprocessorOptions()
+    pp_opts.additionalIncludePaths = list(inc_dirs or [])
+    bag = Bag([pp_opts, CompilationOptions()])
     bag.compilationOptions.defaultTimeScale = TimeScale.fromString("1ns/1ns")
     compilation = Compilation(bag)
     for path in file_paths:
-        compilation.addSyntaxTree(SyntaxTree.fromFile(path, sm))
+        compilation.addSyntaxTree(SyntaxTree.fromFile(path, sm, bag))
     return compilation
 
 
@@ -177,11 +214,12 @@ def _build_compilation(file_paths: list[str], sm: SourceManager) -> Compilation:
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_files(file_paths: list[str]) -> dict:
+def parse_files(file_paths: list[str], inc_dirs: list[str] | None = None) -> dict:
     """Parse a list of SystemVerilog files and return the module/instance hierarchy.
 
     All files share a single ``SourceManager`` so cross-file instantiation resolves
     correctly.  See the module docstring for the two-phase elaboration model.
+    *inc_dirs* are searched for `` `include`` files.
 
     Returns a dict with the following top-level keys:
 
@@ -204,21 +242,21 @@ def parse_files(file_paths: list[str]) -> dict:
         code 1 when this is set.
     """
     sm = SourceManager()
-    compilation = _build_compilation(file_paths, sm)
+    compilation = _build_compilation(file_paths, sm, inc_dirs)
 
     file_defs = _collect_file_defs(compilation, sm, file_paths)
     file_pkgs = _collect_pkg_maps(compilation, sm, file_paths)
 
-    body_map: dict[str, InstanceBodySymbol] = {}
+    inst_map: dict[str, InstanceSymbol] = {}
     mod_pkg_imports: dict[str, list[str]] = {}
     for top_inst in compilation.getRoot().topInstances:
-        _walk_instances(top_inst, body_map, mod_pkg_imports)
+        _walk_instances(top_inst, inst_map, mod_pkg_imports)
 
     files_list = []
     for path in file_paths:
         canonical = str(Path(path).resolve())
         defs_list = [
-            _build_def_entry(defn, body_map, mod_pkg_imports)
+            _build_def_entry(defn, inst_map, mod_pkg_imports)
             for defn in file_defs.get(canonical, [])
         ]
         files_list.append({

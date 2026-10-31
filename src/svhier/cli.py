@@ -4,6 +4,7 @@
 """Command-line interface for svhier: parse SV hierarchies and emit YAML."""
 
 import argparse
+import re
 import sys
 from io import StringIO
 from pathlib import Path
@@ -73,39 +74,76 @@ def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None 
     return unique
 
 
-def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
-    """Return directories that contain ``.svh``/``.vh`` header files under *paths*.
+_INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
 
-    The result is written as ``+incdir+<dir>`` lines at the top of the generated
-    filelist, which is the format expected by VCS, Questa, and Xcelium.
+
+def _glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
+    prefix = "**/" if recursive else ""
+    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ignore)]
+
+
+def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
+    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
+
+    For every include path with a directory component, each known header whose path
+    ends with that include path contributes the directory it must be resolved from,
+    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
+    """
+    by_name: dict[str, list[Path]] = {}
+    for hdr in headers:
+        by_name.setdefault(hdr.name, []).append(hdr)
+
+    bases: list[Path] = []
+    for src in sources:
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for inc in _INCLUDE_RE.findall(text):
+            parts = Path(inc).parts
+            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
+                continue
+            for hdr in by_name.get(parts[-1], []):
+                if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
+                    bases.append(hdr.parents[len(parts) - 1])
+    return bases
+
+
+def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
+    """Return include directories for the ``.svh``/``.vh`` header files under *paths*.
+
+    The result is passed to slang as `` `include`` search paths and written as
+    ``+incdir+<dir>`` lines at the top of the generated filelist, which is the
+    format expected by VCS, Questa, and Xcelium.
+
+    Every directory that contains a header is returned.  In addition, when a source
+    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
+    the directory that include path is relative to is returned too.
 
     For directory inputs the search respects the *recursive* flag.
     For explicit file inputs the parent directory is checked for headers.
     Directories are returned in discovery order, deduplicated.
     """
     ign = ignore or set()
-    seen: set[Path] = set()
-    result: list[str] = []
-
-    def _add(d: Path) -> None:
-        resolved = d.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            result.append(str(d))
+    headers: list[Path] = []
+    sources: list[Path] = []
 
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
-            prefix = "**/" if recursive else ""
-            for ext in ("*.svh", "*.vh"):
-                for hdr in sorted(p.glob(f"{prefix}{ext}")):
-                    if not _is_ignored(hdr, ign):
-                        _add(hdr.parent)
-        elif p.is_file():
-            parent = p.parent
-            if not _is_ignored(p, ign) and (any(parent.glob("*.svh")) or any(parent.glob("*.vh"))):
-                _add(parent)
+            headers.extend(_glob_files(p, recursive, ("*.svh", "*.vh"), ign))
+            sources.extend(_glob_files(p, recursive, ("*.sv", "*.v"), ign))
+        elif p.is_file() and not _is_ignored(p, ign):
+            sources.append(p)
+            headers.extend(_glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
 
+    seen: set[Path] = set()
+    result: list[str] = []
+    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
+        resolved = d.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(str(d))
     return result
 
 
@@ -270,7 +308,7 @@ def main():
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   console=_err, transient=True) as progress:
         task = progress.add_task("Running slang elaboration…", total=None)
-        hierarchy = parse_files(sv_files)
+        hierarchy = parse_files(sv_files, inc_dirs)
         progress.update(task, completed=True)
 
     _print_diagnostics(hierarchy, warnings=args.warnings)
