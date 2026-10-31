@@ -19,6 +19,8 @@ def test_simple_single_module():
             {
                 "file_name": path,
                 "pkgs": [],
+                "ifaces": [],
+                "refs": [],
                 "defs": [
                     {"mod_name": "Simple", "pkg_imports": [], "insts": []},
                 ],
