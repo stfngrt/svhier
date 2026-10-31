@@ -22,19 +22,21 @@ from pathlib import Path
 import networkx as nx
 from pyslang import (
     Bag,
+    DiagnosticEngine,
+    SourceManager,
+    TextDiagnosticClient,
+    TimeScale,
+)
+from pyslang.ast import (
     Compilation,
     CompilationOptions,
     DefinitionKind,
     DefinitionSymbol,
-    DiagnosticEngine,
     InstanceBodySymbol,
     InstanceSymbol,
-    SourceManager,
     SymbolKind,
-    SyntaxTree,
-    TextDiagnosticClient,
-    TimeScale,
 )
+from pyslang.syntax import SyntaxTree
 
 _IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 
