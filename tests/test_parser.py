@@ -20,12 +20,18 @@ def test_simple_single_module():
                 "file_name": path,
                 "pkgs": [],
                 "ifaces": [],
+                "shadowed": [],
                 "refs": [],
                 "defs": [
                     {"mod_name": "Simple", "pkg_imports": [], "insts": []},
                 ],
             }
         ],
+        "duplicates": [],
+        "tops": [],
+        "needed": None,
+        "defines": [],
+        "inc_dirs": [],
         "diagnostics": [],
         "has_errors": False,
     }

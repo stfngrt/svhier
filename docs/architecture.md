@@ -22,6 +22,27 @@ Modules that are defined but never instantiated are unreachable via `topInstance
 and will appear in the output with an empty `insts` list.
 :::
 
+### Inputs
+
+All inputs go through slang's `Driver`, so source files, `-f`/`-F` command files
+(with `+incdir+`, `+define+`, nested command files and `${VAR}` environment
+variables), `-I`, `-D` and `--top` behave exactly as in slang itself.
+
+### Parameterizations
+
+The walk visits every unique (definition, parameter values) pair once, not every
+module name once.  A module whose generate branches depend on its parameters
+therefore lists the children of every setting it is instantiated with, merged
+without repeats.
+
+### Duplicate definitions
+
+Definitions are keyed by `(name, file)`.  When a module, interface or package name
+is defined in more than one file, the result's `duplicates` list names every file
+and the copy slang actually uses (`used`).  The other copies are marked `shadowed`
+in their file entry: they are not elaborated (no `insts`) and `compute_filelist()`
+resolves the name to the used copy.  The CLI prints a warning per duplicate.
+
 ```{eval-rst}
 .. autofunction:: svhier.parser.compute_filelist
 ```
@@ -30,6 +51,10 @@ and will appear in the output with an empty `insts` list.
 If your design has genuine circular dependencies between files, the filelist falls
 back to the original input order rather than raising an error.
 :::
+
+When `--top` is given, slang's dependency trimming (`--depfile-trim`) decides which
+files the tops need (it follows module, interface, package and class references);
+`compute_filelist()` leaves the rest out and orders what remains.
 
 ## CLI
 
@@ -67,12 +92,13 @@ The following symbols are intentionally excluded from the output:
   `isUninstantiated == True` are not listed.  Instances inside taken generate
   blocks and instance arrays are listed with a path relative to the parent module
   (e.g. `g_loop[0].u_core`, `u_arr[1]`).
-- **`pkgs`, `ifaces`, `refs` keys** — internal bookkeeping stripped from YAML
+- **`pkgs`, `ifaces`, `refs`, `shadowed` keys** — internal bookkeeping stripped from YAML
   output by `_prepare_for_yaml()`.  `refs` lists the packages and interfaces a
   file references (imports, `pkg::name`, interface ports and instances), collected
   from the syntax tree; `compute_filelist()` uses it to order files.
-- **`diagnostics` key** — pyslang diagnostics are printed to stderr and stripped
-  from YAML output.
+- **`diagnostics`, `duplicates`, `tops`, `needed`, `defines`, `inc_dirs` keys** —
+  top-level bookkeeping, not part of the YAML output.  Diagnostics and duplicates are
+  printed to stderr; `defines` and `inc_dirs` go into the filelist.
 
 ## Development notes
 
