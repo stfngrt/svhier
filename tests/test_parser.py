@@ -465,3 +465,86 @@ def test_uvm_filelist_complete(uvm_result):
     """compute_filelist returns all four UVM files."""
     order = compute_filelist(uvm_result)
     assert set(order) == set(_UVM_FILES)
+
+
+# ---------------------------------------------------------------------------
+# Generate blocks and instance arrays (issue #2, items 1 & 2)
+# ---------------------------------------------------------------------------
+
+GENERATE_FILES = [str(VERILOG_DIR / "generate.sv"), str(VERILOG_DIR / "generate_leaf.sv")]
+
+
+def _all_defs(result):
+    return {d["mod_name"]: d for f in result["files"] for d in f["defs"]}
+
+
+def _insts(result, mod_name):
+    return [(i["mod_name"], i["inst_name"]) for i in _all_defs(result)[mod_name]["insts"]]
+
+
+def test_generate_for_loop_instances():
+    insts = _insts(parse_files(GENERATE_FILES), "gen_top")
+    assert ("gen_leaf", "g_loop[0].u_loop") in insts
+    assert ("gen_leaf", "g_loop[1].u_loop") in insts
+
+
+def test_generate_if_only_taken_branch():
+    insts = _insts(parse_files(GENERATE_FILES), "gen_top")
+    assert ("gen_leaf", "g_off.u_off") in insts
+    assert all(name != "g_on.u_on" for _, name in insts)
+
+
+def test_generate_unnamed_block():
+    insts = _insts(parse_files(GENERATE_FILES), "gen_top")
+    unnamed = [(m, n) for m, n in insts if n.endswith(".u_unnamed")]
+    assert len(unnamed) == 1
+    assert unnamed[0][0] == "gen_other"
+
+
+def test_generate_nested_blocks():
+    insts = _insts(parse_files(GENERATE_FILES), "gen_top")
+    assert ("gen_mid", "g_outer[0].g_nest.u_mid") in insts
+
+
+def test_module_only_reachable_through_generate_is_walked():
+    """gen_mid is only instantiated inside a generate block; its own children must be listed."""
+    assert _insts(parse_files(GENERATE_FILES), "gen_mid") == [("gen_leaf", "g_inner.u_deep")]
+
+
+def test_generate_has_no_errors():
+    assert parse_files(GENERATE_FILES)["has_errors"] is False
+
+
+def test_filelist_orders_dependency_used_only_in_generate():
+    result = parse_files(GENERATE_FILES)
+    assert compute_filelist(result) == [GENERATE_FILES[1], GENERATE_FILES[0]]
+
+
+def test_instance_array_1d():
+    insts = _insts(parse_files([str(VERILOG_DIR / "instance_array.sv")]), "arr_top")
+    assert ("arr_leaf", "u_arr[0]") in insts
+    assert ("arr_leaf", "u_arr[1]") in insts
+
+
+def test_instance_array_2d():
+    insts = _insts(parse_files([str(VERILOG_DIR / "instance_array.sv")]), "arr_top")
+    names = {n for m, n in insts if n.startswith("u_2d")}
+    assert names == {"u_2d[0][0]", "u_2d[0][1]", "u_2d[1][0]", "u_2d[1][1]"}
+
+
+# ---------------------------------------------------------------------------
+# Include paths (issue #2, item 3)
+# ---------------------------------------------------------------------------
+
+NESTED_INC = VERILOG_DIR / "nested_include"
+INC_USER = str(NESTED_INC / "rtl" / "inc_user.sv")
+
+
+def test_include_unresolved_without_inc_dirs():
+    assert parse_files([INC_USER])["has_errors"] is True
+
+
+def test_include_resolved_with_inc_dirs():
+    result = parse_files([INC_USER], inc_dirs=[str(NESTED_INC / "vendor" / "include")])
+    assert result["diagnostics"] == []
+    assert result["has_errors"] is False
