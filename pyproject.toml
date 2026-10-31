@@ -9,9 +9,9 @@ description = "SystemVerilog hierarchy explorer"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Stefan Engert" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "pyslang",
+    "pyslang>=12",
     "ruamel.yaml",
     "networkx",
     "rich>=14.3.3",
