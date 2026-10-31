@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from svhier.cli import collect_inc_dirs, collect_sv_files, _write_filelist
+from svhier.cli import collect_inc_dirs, collect_sv_files, _write_filelist, main
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 INCLUDE_DIR = VERILOG_DIR / "include"
@@ -118,3 +118,28 @@ def test_write_filelist_stdout(capsys):
     out = capsys.readouterr().out
     assert "+incdir+/inc" in out
     assert "a.sv" in out
+
+
+# ---------------------------------------------------------------------------
+# Include dirs for `include "sub/dir/file.svh"` (issue #2, item 4)
+# ---------------------------------------------------------------------------
+
+NESTED_INC = VERILOG_DIR / "nested_include"
+
+
+def test_collect_inc_dirs_adds_base_dir_for_subdir_include():
+    """`include "vendor/regs.svh"` needs vendor/include/, not just the header's own folder."""
+    result = [Path(d).resolve() for d in collect_inc_dirs([str(NESTED_INC)], recursive=True)]
+    assert (NESTED_INC / "vendor" / "include").resolve() in result
+
+
+def test_collect_inc_dirs_keeps_header_dir():
+    result = [Path(d).resolve() for d in collect_inc_dirs([str(NESTED_INC)], recursive=True)]
+    assert (NESTED_INC / "vendor" / "include" / "vendor").resolve() in result
+
+
+def test_main_passes_inc_dirs_to_parser(monkeypatch, capsys):
+    """End to end: a recursive run over nested_include/ must elaborate without errors."""
+    monkeypatch.setattr("sys.argv", ["svhier", "-r", str(NESTED_INC), "--no-summary", "--yaml"])
+    main()
+    assert "inc_user" in capsys.readouterr().out
