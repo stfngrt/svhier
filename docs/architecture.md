@@ -62,9 +62,15 @@ The following symbols are intentionally excluded from the output:
   `DefinitionKind.Module` only.
 - **Interface instances** — excluded inside module bodies via the `child.isModule`
   guard (interface instances share `SymbolKind.Instance` with module instances but
-  have `isModule == False`).
-- **`pkgs` key** — internal bookkeeping stripped from YAML output by
-  `_prepare_for_yaml()`.
+  have `isModule == False`).  They still count as filelist dependencies via `refs`.
+- **Untaken generate branches** — instances in generate blocks with
+  `isUninstantiated == True` are not listed.  Instances inside taken generate
+  blocks and instance arrays are listed with a path relative to the parent module
+  (e.g. `g_loop[0].u_core`, `u_arr[1]`).
+- **`pkgs`, `ifaces`, `refs` keys** — internal bookkeeping stripped from YAML
+  output by `_prepare_for_yaml()`.  `refs` lists the packages and interfaces a
+  file references (imports, `pkg::name`, interface ports and instances), collected
+  from the syntax tree; `compute_filelist()` uses it to order files.
 - **`diagnostics` key** — pyslang diagnostics are printed to stderr and stripped
   from YAML output.
 

@@ -20,11 +20,14 @@ from svhier.parser import compute_filelist, parse_files
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
 _err = Console(stderr=True)
 
+# Per-file keys returned by parse_files that are bookkeeping only, not YAML output.
+_INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs"}
+
 
 def _prepare_for_yaml(hierarchy: dict) -> dict:
     """Return a copy of *hierarchy* with internal-only keys removed.
 
-    Strips the ``pkgs`` key from each file entry (bookkeeping only) and
+    Strips the ``pkgs``, ``ifaces`` and ``refs`` keys from each file entry (bookkeeping only) and
     omits ``pkg_imports`` from module defs when the list is empty.
     """
     files = []
@@ -33,7 +36,7 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
         for d in entry["defs"]:
             def_out = {k: v for k, v in d.items() if not (k == "pkg_imports" and not v)}
             defs.append(def_out)
-        file_out = {k: v for k, v in entry.items() if k != "pkgs"}
+        file_out = {k: v for k, v in entry.items() if k not in _INTERNAL_FILE_KEYS}
         file_out["defs"] = defs
         files.append(file_out)
     return {"files": files}
