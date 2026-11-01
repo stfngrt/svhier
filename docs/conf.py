@@ -15,6 +15,7 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinxarg.ext",
+    "sphinx_design",
 ]
 
 myst_enable_extensions = [

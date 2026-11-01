@@ -13,8 +13,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+from rich.tree import Tree
 from ruamel.yaml import YAML
 
+from svhier.libsearch import LibraryIndex, resolve_missing
 from svhier.parser import compute_filelist, parse_files
 
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
@@ -175,10 +177,19 @@ def _print_summary(hierarchy: dict) -> None:
     _err.print(table)
 
 
-def _print_diagnostics(hierarchy: dict, *, warnings: bool = False) -> None:
-    """Print any pyslang diagnostics to stderr using Rich formatting."""
+def _print_diagnostics(hierarchy: dict, *, errors: bool = False, warnings: bool = False) -> None:
+    """Report pyslang diagnostics on stderr.
+
+    By default only a one-line count is printed.  With *errors* every error is
+    listed; with *warnings* every error and warning is listed.
+    """
     diags = hierarchy.get("diagnostics", [])
-    if not diags:
+    n_err = sum(1 for d in diags if d["severity"] == "error")
+    n_warn = len(diags) - n_err
+    if not errors and not warnings:
+        if n_err or n_warn:
+            parts = [f"{n} {name}{'s' if n != 1 else ''}" for n, name in ((n_err, "error"), (n_warn, "warning")) if n]
+            _err.print(f"[dim]slang reported {', '.join(parts)} (use -E to list errors, -W to also list warnings)[/dim]")
         return
     for d in diags:
         if d["severity"] == "error":
@@ -191,16 +202,106 @@ def _print_diagnostics(hierarchy: dict, *, warnings: bool = False) -> None:
         _err.print(f"{tag}: {location}{d['message']}")
 
 
+_MISSING_LABELS = {
+    "modules": "blackbox module",
+    "interfaces": "interface",
+    "packages": "package",
+    "includes": "include",
+    "macros": "macro",
+}
+
+
+def _print_missing(hierarchy: dict) -> None:
+    """Print a table of everything slang could not find to stderr.
+
+    Unknown modules are reported as blackboxes; packages, interfaces, include files
+    and macros that could not be found follow.  Nothing is printed when the design
+    is complete.
+    """
+    missing = hierarchy.get("missing", {})
+    if not any(missing.values()):
+        return
+    table = Table(title="Not found", show_header=True, header_style="bold cyan")
+    table.add_column("Kind", style="yellow")
+    table.add_column("Name", style="bold")
+    table.add_column("Referenced in", style="dim", overflow="fold")
+    for kind, label in _MISSING_LABELS.items():
+        for name, files in missing.get(kind, {}).items():
+            where = Path(files[0]).name if files else ""
+            if len(files) > 1:
+                where += f" (+{len(files) - 1} more)"
+            table.add_row(label, name, where)
+    _err.print(table)
+
+
 def _print_duplicates(hierarchy: dict) -> None:
-    """Warn about module, interface and package names defined in more than one file."""
-    for dup in hierarchy.get("duplicates", []):
-        others = ", ".join(f for f in dup["files"] if f != dup["used"])
-        _err.print(f"[bold yellow]warning[/bold yellow]: {dup['kind']} [bold]{dup['name']}[/bold] is defined in "
-                   f"{len(dup['files'])} files; using [dim]{dup['used']}[/dim], ignoring [dim]{others}[/dim]")
+    """Print a table of module, interface and package names defined in more than one file."""
+    duplicates = hierarchy.get("duplicates", [])
+    if not duplicates:
+        return
+    table = Table(title="Defined more than once", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Kind", style="yellow")
+    table.add_column("Used", style="green", overflow="fold")
+    table.add_column("Ignored", style="dim", overflow="fold")
+    for dup in duplicates:
+        ignored = [f for f in dup["files"] if f != dup["used"]]
+        shown = Path(ignored[0]).name if ignored else ""
+        if len(ignored) > 1:
+            shown += f" (+{len(ignored) - 1} more)"
+        table.add_row(dup["name"], dup["kind"], dup["used"], shown)
+    _err.print(table)
 
 
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def build_tree(hierarchy: dict, tops: list[str] | None = None) -> list[Tree]:
+    """Return one Rich ``Tree`` per top-level module of *hierarchy*.
+
+    When *tops* is omitted, the roots are all modules that no other module
+    instantiates.  Instances of modules without a definition are marked as
+    ``(blackbox)``; recursive instantiation is cut off and marked ``(cycle)``.
+    """
+    defs = {d["mod_name"]: d for f in hierarchy["files"] for d in f["defs"]}
+    if tops is None:
+        instantiated = {i["mod_name"] for d in defs.values() for i in d["insts"]}
+        tops = [name for name in defs if name not in instantiated]
+
+    def add_children(node: Tree, mod_name: str, path: tuple[str, ...]) -> None:
+        for inst in defs[mod_name]["insts"]:
+            child = inst["mod_name"]
+            label = f"{inst['inst_name']} [dim]({child})[/dim]"
+            if child not in defs:
+                node.add(f"{label} [yellow](blackbox)[/yellow]")
+            elif child in path:
+                node.add(f"{label} [red](cycle)[/red]")
+            else:
+                add_children(node.add(label), child, path + (child,))
+
+    trees = []
+    for top in tops:
+        if top not in defs:
+            _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
+            continue
+        tree = Tree(f"[bold]{top}[/bold]")
+        add_children(tree, top, (top,))
+        trees.append(tree)
+    return trees
+
+
+def _print_tree(hierarchy: dict, tops: list[str] | None) -> None:
+    """Print the instance tree(s) to stdout.
+
+    In a terminal, long lines wrap to the terminal width.  When piped, the width is
+    unbounded so no line is wrapped or cut off.
+    """
+    out = Console(highlight=False)
+    if not out.is_terminal:
+        out = Console(highlight=False, width=100_000)
+    for tree in build_tree(hierarchy, tops):
+        out.print(tree)
 
 
 def _make_yaml() -> YAML:
@@ -257,7 +358,8 @@ def _build_parser() -> argparse.ArgumentParser:
     """Return the argument parser for the ``svhier`` CLI."""
     parser = argparse.ArgumentParser(
         prog="svhier",
-        description="Parse SystemVerilog files and emit a module hierarchy as YAML.",
+        description="Show the module hierarchy of SystemVerilog sources, report what is missing, "
+                    "and write a dependency-ordered filelist or YAML.",
     )
     parser.add_argument(
         "paths",
@@ -293,15 +395,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Define a preprocessor macro. Repeatable.",
     )
     parser.add_argument(
-        "--top",
-        action="append",
-        metavar="MODULE",
-        default=[],
-        dest="tops",
-        help="Elaborate MODULE as a top module instead of finding tops automatically. "
-             "The filelist then only contains the files the tops need. Repeatable.",
-    )
-    parser.add_argument(
         "-r", "--recursive",
         action="store_true",
         default=False,
@@ -324,16 +417,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write dependency-ordered filelist to FILE, or to stdout when FILE is omitted.",
     )
     parser.add_argument(
-        "--no-summary",
+        "-t", "--tree",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Print the instance hierarchy as a tree to stdout. "
+             "On by default unless --yaml or --filelist writes to stdout.",
+    )
+    parser.add_argument(
+        "--top",
+        action="append",
+        metavar="MODULE",
+        default=[],
+        dest="tops",
+        help="Elaborate MODULE as a top module instead of finding tops automatically. Only its "
+             "hierarchy is shown, and the filelist only contains the files it needs. Repeatable.",
+    )
+    parser.add_argument(
+        "--summary",
         action="store_true",
         default=False,
-        help="Suppress the summary table printed to stderr.",
+        help="Print a per-file summary table to stderr.",
+    )
+    parser.add_argument(
+        "-E", "--errors",
+        action="store_true",
+        default=False,
+        help="Print slang error diagnostics to stderr (by default only a count is shown).",
     )
     parser.add_argument(
         "-W", "--warnings",
         action="store_true",
         default=False,
-        help="Also print slang warning diagnostics to stderr.",
+        help="Print slang error and warning diagnostics to stderr.",
     )
     parser.add_argument(
         "-x", "--ignore",
@@ -343,18 +458,87 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="ignore",
         help="Ignore files or directories whose name matches NAME. Repeatable.",
     )
+    parser.add_argument(
+        "-y", "--libdir",
+        action="append",
+        metavar="DIR",
+        default=None,
+        dest="libdirs",
+        help="Library directory, searched recursively. Only files defining otherwise missing "
+             "modules, interfaces or packages (and dirs of missing includes) are pulled in. Repeatable.",
+    )
     return parser
 
 
-def main():
-    """Entry point: parse arguments, run slang elaboration, emit YAML and optional filelist.
+# Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
+_MAX_LIB_ROUNDS = 20
 
-    All Rich diagnostics (spinner, summary table, warnings) go to stderr so
-    stdout stays clean for piped data.  Exits with code 1 if pyslang reports
-    any error-level diagnostics.
+
+def _add_pulled(
+    files: dict[str, tuple[Path, int]], incs: dict[str, Path],
+    sv_files: list[str], inc_dirs: list[str], pulled: list[tuple[str, Path, int]],
+) -> None:
+    """Extend *sv_files* / *inc_dirs* with one round of resolved library files and record them in *pulled*."""
+    for name, (path, others) in files.items():
+        if str(path) not in sv_files:
+            sv_files.append(str(path))
+        pulled.append((name, path, others))
+    for include, d in incs.items():
+        if str(d) not in inc_dirs:
+            inc_dirs.append(str(d))
+        pulled.append((include, d, 0))
+
+
+def _parse_with_libs(
+    sv_files: list[str], inc_dirs: list[str], index: LibraryIndex | None, options: dict,
+) -> tuple[dict, list[tuple[str, Path, int]]]:
+    """Parse, then keep pulling missing definitions from *index* until nothing new resolves.
+
+    *options* are passed to :func:`parse_files` as keyword arguments.  *sv_files* and
+    *inc_dirs* are extended in place.  Returns the hierarchy of the final parse (so
+    diagnostics, missing names and the exit code reflect the resolved design) and
+    ``(name, file, other candidates)`` for every library file pulled in.
+    Raises ``ValueError`` if slang rejects the inputs.
+    """
+    pulled: list[tuple[str, Path, int]] = []
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  console=_err, transient=True) as progress:
+        task = progress.add_task("Running slang elaboration…", total=None)
+        hierarchy = parse_files(sv_files, inc_dirs, **options)
+        for rnd in range(1, _MAX_LIB_ROUNDS + 1):
+            if index is None:
+                break
+            loaded = [f["file_name"] for f in hierarchy["files"]]
+            files, incs = resolve_missing(hierarchy["missing"], index, loaded, inc_dirs)
+            if not files and not incs:
+                break
+            _add_pulled(files, incs, sv_files, inc_dirs, pulled)
+            progress.update(task, description=f"Resolving from library dirs (round {rnd})…")
+            hierarchy = parse_files(sv_files, inc_dirs, **options)
+    return hierarchy, pulled
+
+
+def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
+    """Print which library files were pulled in for which missing name."""
+    if not pulled:
+        return
+    table = Table(title="Pulled in from -y", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("From", style="dim", overflow="fold")
+    for name, path, others in pulled:
+        table.add_row(name, str(path) + (f" [yellow](+{others} other candidate{'s' if others > 1 else ''})[/yellow]" if others else ""))
+    _err.print(table)
+
+
+def main():
+    """Entry point: parse arguments, run slang elaboration, emit tree, YAML and filelist.
+
+    All Rich diagnostics (spinner, tables, warnings) go to stderr so stdout stays
+    clean for piped data.  Exits with code 1 if pyslang reports any error-level
+    diagnostics.
     """
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     if not args.paths and not args.command_files:
         parser.error("give at least one PATH or -f/-F command file")
 
@@ -372,23 +556,28 @@ def main():
         padding=(0, 1),
     ))
 
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  console=_err, transient=True) as progress:
-        task = progress.add_task("Running slang elaboration…", total=None)
-        try:
-            hierarchy = parse_files(sv_files, inc_dirs, defines=args.defines, tops=args.tops,
-                                    command_files=args.command_files)
-        except ValueError as exc:
-            progress.stop()
-            _err.print(f"[red]error:[/red] {exc}")
-            sys.exit(1)
-        progress.update(task, completed=True)
+    index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
+    options = {"defines": args.defines, "tops": args.tops, "command_files": args.command_files}
+    try:
+        hierarchy, pulled = _parse_with_libs(sv_files, inc_dirs, index, options)
+    except ValueError as exc:
+        _err.print(f"[red]error:[/red] {exc}")
+        sys.exit(1)
 
-    _print_diagnostics(hierarchy, warnings=args.warnings)
-    _print_duplicates(hierarchy)
+    _print_diagnostics(hierarchy, errors=args.errors, warnings=args.warnings)
 
-    if not args.no_summary:
+    if args.summary:
         _print_summary(hierarchy)
+
+    _print_pulled(pulled)
+    _print_duplicates(hierarchy)
+    _print_missing(hierarchy)
+
+    show_tree = args.tree
+    if show_tree is None:
+        show_tree = "-" not in (args.yaml, args.filelist)
+    if show_tree:
+        _print_tree(hierarchy, args.tops or None)
 
     if args.yaml is not None:
         _write_yaml(hierarchy, args.yaml)

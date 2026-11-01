@@ -140,7 +140,7 @@ def test_collect_inc_dirs_keeps_header_dir():
 
 def test_main_passes_inc_dirs_to_parser(monkeypatch, capsys):
     """End to end: a recursive run over nested_include/ must elaborate without errors."""
-    monkeypatch.setattr("sys.argv", ["svhier", "-r", str(NESTED_INC), "--no-summary", "--yaml"])
+    monkeypatch.setattr("sys.argv", ["svhier", "-r", str(NESTED_INC), "--yaml"])
     main()
     assert "inc_user" in capsys.readouterr().out
 
@@ -161,7 +161,7 @@ CF_DIR = VERILOG_DIR / "cmdfile"
 
 def test_main_command_file_filelist(monkeypatch, capsys):
     monkeypatch.setenv("SVHIER_CF_DIR", str(CF_DIR))
-    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "cmd.f"), "--no-summary", "--filelist"])
+    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "cmd.f"), "--filelist"])
     main()
     lines = capsys.readouterr().out.splitlines()
     incdirs = [Path(ln.removeprefix("+incdir+")).resolve() for ln in lines if ln.startswith("+incdir+")]
@@ -174,7 +174,7 @@ def test_main_command_file_filelist(monkeypatch, capsys):
 def test_main_top_define_incdir(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", [
         "svhier", "-r", str(CF_DIR / "rtl"), "-I", str(CF_DIR / "inc"), "-D", "CF_EN",
-        "--top", "cf_top", "--no-summary", "--filelist",
+        "--top", "cf_top", "--filelist",
     ])
     main()
     srcs = [Path(ln).name for ln in capsys.readouterr().out.splitlines() if ln.endswith(".sv")]
@@ -182,7 +182,7 @@ def test_main_top_define_incdir(monkeypatch, capsys):
 
 
 def test_main_requires_input(monkeypatch):
-    monkeypatch.setattr("sys.argv", ["svhier", "--no-summary"])
+    monkeypatch.setattr("sys.argv", ["svhier"])
     try:
         main()
     except SystemExit as exc:
@@ -192,7 +192,7 @@ def test_main_requires_input(monkeypatch):
 
 
 def test_main_bad_command_file_exits(monkeypatch):
-    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "nope.f"), "--no-summary"])
+    monkeypatch.setattr("sys.argv", ["svhier", "-f", str(CF_DIR / "nope.f")])
     try:
         main()
     except SystemExit as exc:
@@ -202,7 +202,7 @@ def test_main_bad_command_file_exits(monkeypatch):
 
 
 def test_main_warns_about_duplicates(monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "dup_defs"), "--no-summary"])
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "dup_defs")])
     main()
     err = capsys.readouterr().err
     assert "dup_mod" in err and "dup_cfg" in err
@@ -214,3 +214,118 @@ def test_yaml_strips_shadowed_key():
     dup = VERILOG_DIR / "dup_defs"
     out = _prepare_for_yaml(parse_files([str(dup / "dup_a.sv"), str(dup / "dup_b.sv")]))
     assert all(set(f) == {"file_name", "defs"} for f in out["files"])
+
+
+# ---------------------------------------------------------------------------
+# --tree
+# ---------------------------------------------------------------------------
+
+def test_tree_prints_roots_and_instances(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv")])
+    main()
+    out = capsys.readouterr().out
+    assert "C\n" in out and "D\n" in out
+    assert "I0 (A)" in out and "I1 (Y)" in out
+    # A is instantiated by C, so it is not a root
+    assert not any(line == "A" for line in out.splitlines())
+
+
+def test_tree_top_selects_root(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), "--top", "D"])
+    main()
+    out = capsys.readouterr().out
+    assert "I0 (X)" in out
+    assert "(A)" not in out
+
+
+# ---------------------------------------------------------------------------
+# diagnostics
+# ---------------------------------------------------------------------------
+
+_DIAG_HIER = {"diagnostics": [
+    {"severity": "error", "file": "a.sv", "message": "boom"},
+    {"severity": "warning", "file": "b.sv", "message": "meh"},
+]}
+
+
+def test_diagnostics_default_prints_count_only(capsys):
+    from svhier.cli import _print_diagnostics  # pylint: disable=import-outside-toplevel
+    _print_diagnostics(_DIAG_HIER)
+    err = capsys.readouterr().err
+    assert "1 error, 1 warning" in err
+    assert "boom" not in err and "meh" not in err
+
+
+def test_diagnostics_errors_flag_lists_errors(capsys):
+    from svhier.cli import _print_diagnostics  # pylint: disable=import-outside-toplevel
+    _print_diagnostics(_DIAG_HIER, errors=True)
+    err = capsys.readouterr().err
+    assert "boom" in err and "meh" not in err
+
+
+def test_diagnostics_warnings_flag_lists_all(capsys):
+    from svhier.cli import _print_diagnostics  # pylint: disable=import-outside-toplevel
+    _print_diagnostics(_DIAG_HIER, warnings=True)
+    err = capsys.readouterr().err
+    assert "boom" in err and "meh" in err
+
+
+def test_missing_table_and_blackbox_in_tree(tmp_path, monkeypatch, capsys):
+    src = tmp_path / "top.sv"
+    src.write_text("module top;\n  bbox u_bb ();\nendmodule\n")
+    monkeypatch.setattr("sys.argv", ["svhier", str(src)])
+    try:
+        main()
+    except SystemExit:
+        pass
+    captured = capsys.readouterr()
+    assert "u_bb (bbox) (blackbox)" in captured.out
+    assert "Not found" in captured.err
+    assert "blackbox module" in captured.err and "bbox" in captured.err
+
+
+def test_tree_off_when_yaml_goes_to_stdout(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), "--yaml"])
+    main()
+    out = capsys.readouterr().out
+    assert out.startswith("files:")
+    assert "I0 (A)" not in out
+
+
+def test_no_tree_and_summary_flags(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), "--no-tree", "--summary"])
+    main()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Hierarchy summary" in captured.err
+
+
+def test_summary_off_by_default(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv")])
+    main()
+    assert "Hierarchy summary" not in capsys.readouterr().err
+
+
+def test_tree_does_not_truncate_long_names_when_piped(tmp_path, monkeypatch, capsys):
+    long_mod = "m_" + "x" * 120
+    src = tmp_path / "top.sv"
+    src.write_text(f"module {long_mod}; endmodule\nmodule top;\n  {long_mod} u_inst ();\nendmodule\n")
+    monkeypatch.setattr("sys.argv", ["svhier", str(src)])
+    main()
+    out = capsys.readouterr().out
+    assert f"u_inst ({long_mod})\n" in out
+    assert all(line == line.rstrip() for line in out.splitlines())
+
+
+def test_duplicates_table(tmp_path, monkeypatch, capsys):
+    a, b = tmp_path / "a.sv", tmp_path / "b.sv"
+    a.write_text("package cfg; endpackage\nmodule top; endmodule\n")
+    b.write_text("package cfg; endpackage\n")
+    monkeypatch.setattr("sys.argv", ["svhier", str(a), str(b), "--no-tree"])
+    try:
+        main()
+    except SystemExit:
+        pass
+    err = capsys.readouterr().err
+    assert "Defined more than once" in err
+    assert "cfg" in err and "b.sv" in err
