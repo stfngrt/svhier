@@ -31,6 +31,7 @@ docs = [
     "myst-parser",
     "furo",
     "sphinx-argparse",
+    "sphinx-design",
 ]
 
 [tool.pytest.ini_options]

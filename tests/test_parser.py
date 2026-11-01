@@ -34,6 +34,7 @@ def test_simple_single_module():
         "inc_dirs": [],
         "diagnostics": [],
         "has_errors": False,
+        "missing": {"modules": {}, "interfaces": {}, "packages": {}, "includes": {}, "macros": {}},
     }
 
 
@@ -720,3 +721,58 @@ def test_explicit_files_keep_caller_names():
 def test_bad_command_file_raises():
     with pytest.raises(ValueError):
         parse_files([], command_files=[("-f", str(CF_DIR / "does_not_exist.f"))])
+
+
+# ---------------------------------------------------------------------------
+# blackboxes and missing definitions
+# ---------------------------------------------------------------------------
+
+_MISSING_SV = """\
+`include "missing.svh"
+module top;
+  import nopkg::*;
+  bbox u_bb ();
+  sub u_sub ();
+  `UNDEF_MACRO
+endmodule
+module sub;
+  bbox u_bb2 ();
+endmodule
+"""
+
+
+def test_blackbox_instances_are_listed(tmp_path):
+    src = tmp_path / "top.sv"
+    src.write_text(_MISSING_SV)
+    result = parse_files([str(src)])
+    defs = {d["mod_name"]: d["insts"] for d in result["files"][0]["defs"]}
+    assert {"mod_name": "bbox", "inst_name": "u_bb"} in defs["top"]
+    assert {"mod_name": "bbox", "inst_name": "u_bb2"} in defs["sub"]
+
+
+def test_missing_reports_unresolved_names(tmp_path):
+    src = tmp_path / "top.sv"
+    src.write_text(_MISSING_SV)
+    missing = parse_files([str(src)])["missing"]
+    assert missing["modules"] == {"bbox": [str(src)]}
+    assert missing["packages"] == {"nopkg": [str(src)]}
+    assert missing["includes"] == {"missing.svh": [str(src)]}
+    assert missing["macros"] == {"UNDEF_MACRO": [str(src)]}
+
+
+# ---------------------------------------------------------------------------
+# --top
+# ---------------------------------------------------------------------------
+
+def test_tops_limit_elaboration(tmp_path):
+    src = tmp_path / "d.sv"
+    src.write_text(
+        "module leaf; endmodule\n"
+        "module top; leaf u_leaf (); endmodule\n"
+        "module broken #(parameter type T = logic); T x; initial x.field = 1; endmodule\n")
+    everything = parse_files([str(src)])
+    only_top = parse_files([str(src)], tops=["top"])
+    assert everything["has_errors"]
+    assert not only_top["has_errors"]
+    insts = {d["mod_name"]: d["insts"] for d in only_top["files"][0]["defs"]}
+    assert insts["top"] == [{"mod_name": "leaf", "inst_name": "u_leaf"}]

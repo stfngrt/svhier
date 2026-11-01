@@ -1,7 +1,16 @@
 # Architecture
 
 svhier parses SystemVerilog files using the `pyslang` C++ extension (slang elaborator)
-and outputs a module/instance hierarchy as YAML.
+and turns the elaborated design into an instance tree, a report of missing
+definitions, YAML and a dependency-ordered filelist.
+
+The code is split into three modules:
+
+| Module | Responsibility |
+|--------|----------------|
+| `svhier.parser` | Run slang, walk the elaborated hierarchy, collect missing names, order files |
+| `svhier.libsearch` | Index `-y` library directories and resolve missing names to files |
+| `svhier.cli` | Collect inputs, run the parse/resolve loop, render tree, tables and outputs |
 
 ## Parser
 
@@ -56,6 +65,18 @@ When `--top` is given, slang's dependency trimming (`--depfile-trim`) decides wh
 files the tops need (it follows module, interface, package and class references);
 `compute_filelist()` leaves the rest out and orders what remains.
 
+## Library search
+
+```{eval-rst}
+.. automodule:: svhier.libsearch
+   :members: LibraryIndex, resolve_missing
+```
+
+The CLI calls {func}`~svhier.libsearch.resolve_missing` after each parse and re-parses
+with the returned files and include dirs until nothing new resolves (at most 20
+rounds).  Candidate files are found with a regex over the source text, so the index
+is cheap to build; slang still does the real parse of whatever gets pulled in.
+
 ## CLI
 
 ```{eval-rst}
@@ -96,9 +117,23 @@ The following symbols are intentionally excluded from the output:
   output by `_prepare_for_yaml()`.  `refs` lists the packages and interfaces a
   file references (imports, `pkg::name`, interface ports and instances), collected
   from the syntax tree; `compute_filelist()` uses it to order files.
-- **`diagnostics`, `duplicates`, `tops`, `needed`, `defines`, `inc_dirs` keys** —
-  top-level bookkeeping, not part of the YAML output.  Diagnostics and duplicates are
-  printed to stderr; `defines` and `inc_dirs` go into the filelist.
+- **`diagnostics`, `tops`, `needed`, `defines`, `inc_dirs` keys** —
+  top-level bookkeeping, not part of the YAML output.  Diagnostics are summarised
+  (or listed with `-E`/`-W`) on stderr; `defines` and `inc_dirs` go into the filelist.
+- **`missing` key** — names slang could not resolve, built from the
+  `UnknownModule`, `UnknownInterface`, `UnknownPackage`, `UnknownClassOrPackage`,
+  `CouldNotOpenIncludeFile` and `UnknownDirective` diagnostics.  Printed as the
+  **Not found** table and stripped from YAML output.
+- **`duplicates` key** — names defined in more than one file, with the copy slang
+  uses.  Printed as the **Defined more than once** table and stripped from YAML
+  output; the filelist resolves dependencies to the used copy.
+
+## Blackboxes
+
+Instances of undefined modules are `UninstantiatedDef` symbols in slang, not
+`Instance` symbols.  `_iter_module_instances(..., blackboxes=True)` yields them
+when building `insts`, using `definitionName` as `mod_name`, but the hierarchy
+walk never descends into them.
 
 ## Development notes
 

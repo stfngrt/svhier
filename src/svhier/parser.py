@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import networkx as nx
-from pyslang import DiagnosticEngine, SourceManager, TextDiagnosticClient
+from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
     Compilation,
     DefinitionKind,
@@ -40,6 +40,18 @@ _IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 # Scopes that can hold module instances without being a module themselves.
 _CONTAINER_KINDS = (SymbolKind.GenerateBlock, SymbolKind.GenerateBlockArray, SymbolKind.InstanceArray)
 _COMMAND_FILE_FLAGS = ("-f", "-F")
+
+# Diagnostic codes that mean "something referenced was not found", mapped to the
+# category it is reported under.  The first diagnostic argument is the missing name.
+_MISSING_CODES = {
+    Diags.UnknownModule: "modules",
+    Diags.UnknownInterface: "interfaces",
+    Diags.UnknownPackage: "packages",
+    Diags.UnknownClassOrPackage: "packages",
+    Diags.CouldNotOpenIncludeFile: "includes",
+    Diags.UnknownDirective: "macros",
+}
+MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
 
 # (name, canonical file) — identifies one definition even when the name is reused.
 DefKey = tuple[str, str]
@@ -112,22 +124,28 @@ def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     return imports
 
 
-def _iter_module_instances(scope) -> Iterator[InstanceSymbol]:
+def _iter_module_instances(scope, *, blackboxes: bool = False) -> Iterator:
     """Yield every module instance elaborated directly under *scope*.
 
     Descends into generate blocks, generate-for arrays and instance arrays, but not
     into the bodies of the instances it yields.  Generate branches that were not
     taken (``isUninstantiated``) are skipped.  Interface instances are skipped via
     the ``isModule`` guard (they share ``SymbolKind.Instance`` with module instances).
+
+    With *blackboxes*, instances of modules that have no definition
+    (``UninstantiatedDef`` symbols) are yielded too.
     """
     for child in scope:
         if child.kind == SymbolKind.Instance:
             if child.isModule:
                 yield child
+        elif child.kind == SymbolKind.UninstantiatedDef:
+            if blackboxes:
+                yield child
         elif child.kind in _CONTAINER_KINDS:
             if child.kind == SymbolKind.GenerateBlock and child.isUninstantiated:
                 continue
-            yield from _iter_module_instances(child)
+            yield from _iter_module_instances(child, blackboxes=blackboxes)
 
 
 def _param_signature(body: InstanceBodySymbol) -> tuple[str, ...]:
@@ -179,6 +197,31 @@ def _walk_instances(tops, sm: SourceManager) -> _Walk:
     return walk
 
 
+def _collect_missing(compilation: Compilation, sm: SourceManager, name_of: dict[str, str]) -> dict[str, dict[str, list[str]]]:
+    """Return everything slang could not find, grouped by kind.
+
+    Maps each of :data:`MISSING_KINDS` to ``{name: [referencing files]}``; names and
+    files are kept in first-seen order and deduplicated.  *name_of* maps canonical
+    paths to the names files are reported under.  Unknown modules are the
+    blackboxes of the design (instantiated but never defined).
+    """
+    missing: dict[str, dict[str, list[str]]] = {kind: {} for kind in MISSING_KINDS}
+    for diag in compilation.getAllDiagnostics():
+        kind = _MISSING_CODES.get(diag.code)
+        if kind is None or not diag.args:
+            continue
+        name = str(diag.args[0])
+        if kind == "macros":
+            name = name.lstrip("`")
+        files = missing[kind].setdefault(name, [])
+        if diag.location:
+            canonical = _canon(sm, diag.location)
+            fname = name_of.get(canonical, canonical)
+            if fname not in files:
+                files.append(fname)
+    return missing
+
+
 def _collect_diagnostics(
     compilation: Compilation,
     sm: SourceManager,
@@ -218,12 +261,16 @@ def _build_def_entry(defn: DefinitionSymbol, walk: _Walk) -> dict:
     seen: set[tuple[str, str]] = set()
     for parent in walk.insts.get(key, []):
         prefix = parent.hierarchicalPath + "."
-        for child in _iter_module_instances(parent.body):
+        for child in _iter_module_instances(parent.body, blackboxes=True):
             path = child.hierarchicalPath
             inst_name = path[len(prefix):] if path.startswith(prefix) else child.name
-            if (child.definition.name, inst_name) not in seen:
-                seen.add((child.definition.name, inst_name))
-                insts.append({"mod_name": child.definition.name, "inst_name": inst_name})
+            if child.kind == SymbolKind.UninstantiatedDef:
+                mod_name = child.definitionName
+            else:
+                mod_name = child.definition.name
+            if (mod_name, inst_name) not in seen:
+                seen.add((mod_name, inst_name))
+                insts.append({"mod_name": mod_name, "inst_name": inst_name})
     return {"mod_name": defn.name, "pkg_imports": walk.imports.get(key, []), "insts": insts}
 
 
@@ -472,6 +519,11 @@ def parse_files(  # pylint: disable=too-many-arguments
     ``has_errors``
         ``True`` if any error-level diagnostic was issued.  The CLI exits with
         code 1 when this is set.
+
+    ``missing``
+        What slang could not find, as ``{kind: {name: [referencing files]}}``
+        for each kind in :data:`MISSING_KINDS` (see :func:`_collect_missing`).
+        Instances of missing modules (blackboxes) are still listed in ``insts``.
     """
     inputs = _Inputs(list(file_paths), list(inc_dirs or []), list(defines or []),
                      list(tops or []), list(command_files or []))
@@ -502,6 +554,7 @@ def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
         "inc_dirs": _include_dirs(driver.syntaxTrees, sm),
         "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
         "has_errors": has_errors or bool(load_errors),
+        "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
     }
 
 
