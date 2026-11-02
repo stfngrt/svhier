@@ -404,7 +404,10 @@ def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[
                     if found.resolve() not in have:
                         have.add(found.resolve())
                         routed[id(frontend)].append(str(found))
-    return [(f, routed[id(f)]) for f in usable if routed[id(f)] or f.extra_inputs()]
+    if not any(routed[id(f)] or f.extra_inputs() for f in usable):
+        return []
+    # A frontend with only -y still joins in, in case another language instantiates what it finds.
+    return [(f, routed[id(f)]) for f in usable if routed[id(f)] or f.extra_inputs() or f.has_library()]
 
 
 def main():

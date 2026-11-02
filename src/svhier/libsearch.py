@@ -62,6 +62,12 @@ class LibraryIndex:
         """Return the files defining *name*, best candidate first."""
         return sorted(self.defs.get(name, []), key=lambda p: self._rank(name, p))
 
+    def find_definition_any_case(self, name: str) -> list[Path]:
+        """Like :meth:`find_definition`, for names from case-insensitive languages."""
+        lowered = name.lower()
+        spellings = [n for n in self.defs if n.lower() == lowered]
+        return sorted((p for n in spellings for p in self.defs[n]), key=lambda p: self._rank(spellings[0], p))
+
     def find_include_dir(self, include: str) -> Path | None:
         """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if any header matches."""
         parts = Path(include).parts

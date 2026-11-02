@@ -70,21 +70,22 @@ def _design_units(path: str):
         unit = following
 
 
-def _collect_refs(root: int, refs: set[tuple[str, str]]) -> None:
+def _collect_refs(root: int, named: set[tuple[str, str]], components: set[tuple[str, str]]) -> None:
     """Add every ``prefix.name`` below *root*.  Without analysis, it may not be a library.
 
     A component declaration counts as ``work.name``: GHDL binds a component by default to the
     entity of that name in the library declaring the component, not the one instantiating it.
     Instances can't be used for this anyway, since ``u : name;`` parses as a procedure call.
+    These go in *components*, because unlike *named*, a design can compile without the entity.
     """
     for node in nodes_iter(root):
         kind = nodes.Get_Kind(node)
         if kind == nodes.Iir_Kind.Selected_Name:
             prefix = nodes.Get_Prefix(node)
             if nodes.Get_Kind(prefix) == nodes.Iir_Kind.Simple_Name:
-                refs.add((_name(nodes.Get_Identifier(prefix)), _name(nodes.Get_Identifier(node))))
+                named.add((_name(nodes.Get_Identifier(prefix)), _name(nodes.Get_Identifier(node))))
         elif kind == nodes.Iir_Kind.Component_Declaration:
-            refs.add(("work", _name(nodes.Get_Identifier(node))))
+            components.add(("work", _name(nodes.Get_Identifier(node))))
 
 
 def _scan(files: list[str]) -> dict[str, dict]:
@@ -95,14 +96,15 @@ def _scan(files: list[str]) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for path in files:
         entry = {"units": [], "entities": [], "arch_of": [], "libs": []}
-        refs: set[tuple[str, str]] = set()
+        named: set[tuple[str, str]] = set()
+        components: set[tuple[str, str]] = set()
         for unit in _design_units(path):
             item = nodes.Get_Context_Items(unit)
             while item:
                 if nodes.Get_Kind(item) == kinds.Library_Clause:
                     entry["libs"].append(_name(nodes.Get_Identifier(item)))
                 else:
-                    _collect_refs(item, refs)
+                    _collect_refs(item, named, components)
                 item = nodes.Get_Chain(item)
             library_unit = nodes.Get_Library_Unit(unit)
             kind = nodes.Get_Kind(library_unit)
@@ -116,8 +118,9 @@ def _scan(files: list[str]) -> dict[str, dict]:
                 entity = nodes.Get_Entity_Name(library_unit)
                 if nodes.Get_Kind(entity) == kinds.Simple_Name:
                     entry["arch_of"].append(_name(nodes.Get_Identifier(entity)))
-            _collect_refs(library_unit, refs)
-        entry["refs"] = sorted(refs)
+            _collect_refs(library_unit, named, components)
+        entry["refs"] = sorted(named | components)
+        entry["named"] = sorted(named)
         result[path] = entry
     return result
 

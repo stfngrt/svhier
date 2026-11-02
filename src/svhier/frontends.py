@@ -41,11 +41,14 @@ class Request:
     """What a frontend should elaborate.
 
     With *auto* (no ``--top``), the frontend also finds its own roots; *roots* are then the
-    units other languages instantiate, possibly with parameter values.
+    units other languages instantiate, possibly with parameter values.  *defined_elsewhere*
+    holds the lowercase names other languages define, which library directories must not
+    answer, because sources win over libraries.
     """
 
     auto: bool = False
     roots: list[Root] = field(default_factory=list)
+    defined_elsewhere: set[str] = field(default_factory=set)
 
 
 class Frontend(Protocol):
@@ -78,7 +81,13 @@ class Frontend(Protocol):
         """Describe inputs other than files, from the plugin's own options, such as ``2 command file(s)``."""
 
     def units(self, files: list[str]) -> dict[str, str]:
-        """Return ``{lowercase unit name: file}`` for what the inputs define."""
+        """Return ``{lowercase unit name: file}`` for what the inputs define, not searching ``-y``."""
+
+    def has_library(self) -> bool:
+        """Return whether ``-y`` holds anything this frontend reads, so it may run without inputs."""
+
+    def provide(self, name: str, files: list[str]) -> bool:
+        """Add the ``-y`` file defining *name*, in any case, to *files*; return whether one was found."""
 
     def elaborate(self, files: list[str], request: Request) -> dict:
         """Elaborate what *request* asks for."""
@@ -122,26 +131,39 @@ class _Stitcher:  # pylint: disable=too-few-public-methods
         catch_all = next((fe for fe, _ in inputs if fe.catch_all), inputs[0][0])
         self.requests = {id(fe): Request(auto=not tops) for fe, _ in inputs}
         for top in tops:
-            owner = next((fe for fe, _ in inputs if top.lower() in self.units[id(fe)]), catch_all)
+            owner = self._definer(top) or catch_all
             self.requests[id(owner)].roots.append(Root(top, requested=True))
         self.fragments: dict[int, dict] = {}
         self.notes: list[str] = []
 
+    def _definer(self, name: str, source: Frontend | None = None) -> Frontend | None:
+        """Return the frontend other than *source* defining *name*, in its sources or else its ``-y``."""
+        others = [(fe, files) for fe, files in self.inputs if fe is not source]
+        for other, _ in others:
+            if name.lower() in self.units[id(other)]:
+                return other
+        for other, files in others:
+            if other.provide(name, files):
+                self.units[id(other)] = other.units(files)
+                if name.lower() in self.units[id(other)]:
+                    return other
+        return None
+
     def _route(self, source: Frontend, fragment: dict) -> bool:
-        """Turn what *source* can't resolve into roots of the frontends that define it."""
+        """Turn what *source* can't resolve into roots of the frontend that defines it."""
         changed = False
         for name, uses in fragment["unresolved"].items():
-            for other, _ in self.inputs:
-                if other is source or name.lower() not in self.units[id(other)]:
-                    continue
-                for use in uses or [{"generics": {}, "unresolved": []}]:
-                    for param in use["unresolved"]:
-                        _add_unique(self.notes, [f"{name}: can't pass parameter {param} to {other.name}, so its default was used"])
-                    root = Root(name, tuple(sorted(use["generics"].items())))
-                    roots = self.requests[id(other)].roots
-                    if not any(r.name.lower() == name.lower() and r.generics == root.generics for r in roots):
-                        roots.append(root)
-                        changed = True
+            other = self._definer(name, source)
+            if other is None:
+                continue
+            for use in uses or [{"generics": {}, "unresolved": []}]:
+                for param in use["unresolved"]:
+                    _add_unique(self.notes, [f"{name}: can't pass parameter {param} to {other.name}, so its default was used"])
+                root = Root(name, tuple(sorted(use["generics"].items())))
+                roots = self.requests[id(other)].roots
+                if not any(r.name.lower() == name.lower() and r.generics == root.generics for r in roots):
+                    roots.append(root)
+                    changed = True
         return changed
 
     def run(self) -> dict:
@@ -153,6 +175,7 @@ class _Stitcher:  # pylint: disable=too-few-public-methods
                 key = id(frontend)
                 if done.get(key) != self.requests[key].roots:
                     done[key] = list(self.requests[key].roots)
+                    self.requests[key].defined_elsewhere = {name for fe, _ in self.inputs if fe is not frontend for name in self.units[id(fe)]}
                     self.fragments[key] = frontend.elaborate(files, self.requests[key])
             for frontend, _ in self.inputs:
                 changed = self._route(frontend, self.fragments[id(frontend)]) or changed
