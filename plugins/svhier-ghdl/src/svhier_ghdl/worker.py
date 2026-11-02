@@ -137,7 +137,8 @@ def _elaborate(top: str, work: str, generics: dict[str, str], files: list[str]) 
         return 5
 
     print(_MARKER + json.dumps(_file_deps(set(files))), flush=True)
-    _bind("elab__vhdl_debug__disp_hierarchy", None, c_void_p, c_bool, c_bool)(instance, True, False)
+    # recurse, with_objs: the objects include the evaluated generics of each instance.
+    _bind("elab__vhdl_debug__disp_hierarchy", None, c_void_p, c_bool, c_bool)(instance, True, True)
     return 0
 
 

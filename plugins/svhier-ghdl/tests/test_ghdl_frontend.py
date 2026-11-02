@@ -89,7 +89,7 @@ def test_filelist_keeps_cross_language_files_in_a_valid_order():
 
 
 @needs_ghdl
-def test_missing_and_required_parameter_modules_are_reported():
+def test_missing_module_is_reported_and_required_parameter_is_passed():
     proc = _svhier(".", "--top", "sv_top", "--no-tree")
     assert "nowhere" in proc.stderr
-    assert "sv_req" in proc.stderr
+    assert "its parameters aren't known" not in " ".join(proc.stderr.split())

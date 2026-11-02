@@ -24,7 +24,12 @@ KNOWN_SUFFIXES = {".vhd": "svhier-ghdl", ".vhdl": "svhier-ghdl", ".sv": "pyslang
 
 @dataclass(frozen=True)
 class Root:
-    """A unit to elaborate.  *requested* means the user named it, so failing is an error."""
+    """A unit to elaborate.  *requested* means the user named it, so failing is an error.
+
+    *generics* are ``(name, value)`` pairs.  Names are spelled as the instantiating language
+    has them; the frontend matches them to its own.  Values use one notation for every
+    language: ``6``, ``-4``, ``1'b1``, ``4'b1010``, ``2.5E+00`` or ``"text"``.
+    """
 
     name: str
     generics: tuple[tuple[str, str], ...] = ()
@@ -50,7 +55,8 @@ class Frontend(Protocol):
     these extra keys:
 
     * ``unresolved`` — ``{name: [{"generics": {...}, "unresolved": [text]}]}`` for every
-      instantiated name the frontend has no definition for.
+      instantiated name the frontend has no definition for.  ``generics`` hold values in
+      :class:`Root`'s notation; ``unresolved`` describes the ones that have no such form.
     * ``rejected_roots`` — roots that can't be elaborated with what is known about them.
     * ``notes`` — remarks for the user.
     """
