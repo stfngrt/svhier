@@ -6,16 +6,15 @@ at runtime.
 
 ## Try it
 
-From the repository root. A plain `uv run` or `uv sync` removes these two packages from
-the environment, so use `--no-sync` afterwards.
+From the repository root. `uv sync` removes these two packages from the environment, so
+use `uv run --no-sync` afterwards.
 
 ```bash
 uv sync --extra dev
 uv pip install --no-deps -e plugins/svhier-ghdl
 uv pip install https://github.com/ghdl/ghdl/releases/download/v6.0.0/pyghdl-6.0.0-cp312-cp312-linux_x86_64.whl
 
-cd plugins/svhier-ghdl/tests/mixed
-uv run --no-sync svhier . --top sv_top
+uv run --no-sync svhier plugins/svhier-ghdl/tests/mixed --top sv_top
 ```
 
 Options: `--vhdl-std` (default `08`) and `--vhdl-work LIB` (default `work`).
@@ -34,7 +33,8 @@ internals by symbol name; they may change between GHDL versions:
 
 ## Known limits
 
-- Tested only with GHDL 6.0.0 and its Linux Python 3.12 wheel.
+- CI tests the latest GHDL release, currently 6.0.0, with its Linux wheels for Python 3.11,
+  3.12 and 3.13. A new GHDL release that changes the internals above fails CI.
 - One VHDL library for all files.
 - VHDL that instantiates an SV module directly (`entity work.x`) fails, because GHDL needs
   to see the entity. Instantiating through a `component` works.
