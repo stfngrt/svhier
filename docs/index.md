@@ -114,6 +114,7 @@ guide/missing
 guide/libdirs
 guide/outputs
 guide/diagnostics
+guide/vhdl
 ```
 
 ```{toctree}

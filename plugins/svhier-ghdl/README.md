@@ -17,7 +17,9 @@ uv pip install https://github.com/ghdl/ghdl/releases/download/v6.0.0/pyghdl-6.0.
 uv run --no-sync svhier plugins/svhier-ghdl/tests/mixed --top sv_top
 ```
 
-Options: `--vhdl-std` (default `08`) and `--vhdl-work LIB` (default `work`).
+Options: `--vhdl-std` (default `08`) and `--vhdl-work LIB` (default `work`). `-y` finds VHDL too.
+
+See the [user guide](https://stfngrt.github.io/svhier/guide/vhdl.html).
 
 ## How it works
 
@@ -45,6 +47,7 @@ Files go into libraries automatically, based on how they refer to each other:
 
 ## Known limits
 
+- Linux only. Windows and macOS aren't supported.
 - CI tests the latest GHDL release, currently 6.0.0, with its Linux wheels for Python 3.11,
   3.12 and 3.13. A new GHDL release that changes the internals above fails CI. It also compiles and
   elaborates test designs from svhier's YAML and filelist, with GHDL's Docker image.

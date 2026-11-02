@@ -4,13 +4,47 @@ svhier parses SystemVerilog files using the `pyslang` C++ extension (slang elabo
 and turns the elaborated design into an instance tree, a report of missing
 definitions, YAML and a dependency-ordered filelist.
 
-The code is split into three modules:
+The code is split into these modules:
 
 | Module | Responsibility |
 |--------|----------------|
-| `svhier.parser` | Run slang, walk the elaborated hierarchy, collect missing names, order files |
-| `svhier.libsearch` | Index `-y` library directories and resolve missing names to files |
-| `svhier.cli` | Collect inputs, run the parse/resolve loop, render tree, tables and outputs |
+| `svhier.frontends` | The plugin interface, and stitching what the language plugins report into one hierarchy |
+| `svhier.slang_frontend` | The bundled SystemVerilog plugin: its options, the parse/resolve loop for `-y`, include directory discovery |
+| `svhier.parser` | Run slang, walk the elaborated hierarchy, collect missing names |
+| `svhier.libsearch` | Index `-y` library directories and resolve missing SV names to files |
+| `svhier.filelist` | Order files for compilation |
+| `svhier.cli` | Collect inputs, route them to plugins, render tree, tables and outputs |
+
+## Language plugins
+
+Core doesn't know any source language. A plugin registers a class in the
+`svhier.frontends` entry point group, and the bundled slang plugin registers the
+same way as the optional `svhier-ghdl` one in `plugins/`.
+
+```{eval-rst}
+.. autoclass:: svhier.frontends.Frontend
+   :members:
+
+.. autoclass:: svhier.frontends.Request
+
+.. autoclass:: svhier.frontends.Root
+
+.. autofunction:: svhier.frontends.stitch
+```
+
+Files go to the plugin whose `suffixes` match. With one plugin, its result is used
+as it is. With several, stitching repeats this until nothing changes:
+
+1. Each plugin elaborates its roots, and reports the instances it can't resolve as
+   `unresolved`, with any parameter values.
+2. Each unresolved name becomes a root of the plugin that defines it. If no source
+   defines it, core asks the other plugins to `provide` it from `-y`.
+
+`-y` is the one language-specific search in core's options, because a directory can
+hold several languages and an instance in one can need a file in another. Each
+plugin indexes the directories for its own file types. `units` must not search
+them: it covers every source, including modules outside `--top`'s tree. A plugin
+leaves names in `Request.defined_elsewhere` to the plugin whose sources define them.
 
 ## Parser
 
@@ -72,7 +106,7 @@ files the tops need (it follows module, interface, package and class references)
    :members: LibraryIndex, resolve_missing
 ```
 
-The CLI calls {func}`~svhier.libsearch.resolve_missing` after each parse and re-parses
+The slang plugin calls {func}`~svhier.libsearch.resolve_missing` after each parse and re-parses
 with the returned files and include dirs until nothing new resolves (at most 20
 rounds).  Candidate files are found with a regex over the source text, so the index
 is cheap to build; slang still does the real parse of whatever gets pulled in.
