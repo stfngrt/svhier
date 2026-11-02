@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 svhier = "svhier.cli:main"
 
+[project.entry-points."svhier.frontends"]
+slang = "svhier.slang_frontend:SlangFrontend"
+
 [project.optional-dependencies]
 dev = [
     "pytest",

@@ -16,14 +16,14 @@ from rich.table import Table
 from rich.tree import Tree
 from ruamel.yaml import YAML
 
-from svhier.libsearch import LibraryIndex, resolve_missing
-from svhier.parser import compute_filelist, parse_files
+from svhier.filelist import compute_filelist
+from svhier.frontends import KNOWN_SUFFIXES, Frontend, discover_frontends, stitch
 
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
 _err = Console(stderr=True)
 
 # Per-file keys returned by parse_files that are bookkeeping only, not YAML output.
-_INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs", "shadowed"}
+_INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs", "shadowed", "depends_on"}
 
 
 def _prepare_for_yaml(hierarchy: dict) -> dict:
@@ -354,8 +354,8 @@ class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-met
         setattr(namespace, self.dest, items)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    """Return the argument parser for the ``svhier`` CLI."""
+def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentParser:
+    """Return the argument parser for the ``svhier`` CLI, with options from *frontends*."""
     parser = argparse.ArgumentParser(
         prog="svhier",
         description="Show the module hierarchy of SystemVerilog sources, report what is missing, "
@@ -467,55 +467,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Library directory, searched recursively. Only files defining otherwise missing "
              "modules, interfaces or packages (and dirs of missing includes) are pulled in. Repeatable.",
     )
+    for frontend in frontends or []:
+        frontend.add_arguments(parser)
     return parser
-
-
-# Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
-_MAX_LIB_ROUNDS = 20
-
-
-def _add_pulled(
-    files: dict[str, tuple[Path, int]], incs: dict[str, Path],
-    sv_files: list[str], inc_dirs: list[str], pulled: list[tuple[str, Path, int]],
-) -> None:
-    """Extend *sv_files* / *inc_dirs* with one round of resolved library files and record them in *pulled*."""
-    for name, (path, others) in files.items():
-        if str(path) not in sv_files:
-            sv_files.append(str(path))
-        pulled.append((name, path, others))
-    for include, d in incs.items():
-        if str(d) not in inc_dirs:
-            inc_dirs.append(str(d))
-        pulled.append((include, d, 0))
-
-
-def _parse_with_libs(
-    sv_files: list[str], inc_dirs: list[str], index: LibraryIndex | None, options: dict,
-) -> tuple[dict, list[tuple[str, Path, int]]]:
-    """Parse, then keep pulling missing definitions from *index* until nothing new resolves.
-
-    *options* are passed to :func:`parse_files` as keyword arguments.  *sv_files* and
-    *inc_dirs* are extended in place.  Returns the hierarchy of the final parse (so
-    diagnostics, missing names and the exit code reflect the resolved design) and
-    ``(name, file, other candidates)`` for every library file pulled in.
-    Raises ``ValueError`` if slang rejects the inputs.
-    """
-    pulled: list[tuple[str, Path, int]] = []
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  console=_err, transient=True) as progress:
-        task = progress.add_task("Running slang elaboration…", total=None)
-        hierarchy = parse_files(sv_files, inc_dirs, **options)
-        for rnd in range(1, _MAX_LIB_ROUNDS + 1):
-            if index is None:
-                break
-            loaded = [f["file_name"] for f in hierarchy["files"]]
-            files, incs = resolve_missing(hierarchy["missing"], index, loaded, inc_dirs)
-            if not files and not incs:
-                break
-            _add_pulled(files, incs, sv_files, inc_dirs, pulled)
-            progress.update(task, description=f"Resolving from library dirs (round {rnd})…")
-            hierarchy = parse_files(sv_files, inc_dirs, **options)
-    return hierarchy, pulled
 
 
 def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
@@ -530,6 +484,38 @@ def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
     _err.print(table)
 
 
+def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[str]) -> list[tuple[Frontend, list[str]]]:
+    """Return ``(frontend, files)`` for each frontend with inputs; warn about files nothing can read."""
+    usable = []
+    for frontend in frontends:
+        frontend.configure(args)
+        reason = frontend.unavailable_reason()
+        if reason:
+            _err.print(f"[yellow]warning:[/yellow] plugin {frontend.name!r} is disabled: {reason}")
+        else:
+            usable.append(frontend)
+    routed: dict[int, list[str]] = {id(f): [] for f in usable}
+    fallback = next((f for f in usable if f.catch_all), None)
+    for fname in files:
+        suffix = Path(fname).suffix.lower()
+        owner = next((f for f in usable if suffix in f.suffixes), None)
+        if owner is None and suffix in KNOWN_SUFFIXES:
+            _err.print(f"[yellow]warning:[/yellow] skipping {fname}: install and enable {KNOWN_SUFFIXES[suffix]} to read it")
+        elif (owner or fallback) is not None:
+            routed[id(owner or fallback)].append(fname)
+    for frontend in usable:  # collect_sv_files only looks for SV files in directories
+        if frontend.catch_all:
+            continue
+        have = {Path(f).resolve() for f in routed[id(frontend)]}
+        for raw in args.paths:
+            if Path(raw).is_dir():
+                for found in _glob_files(Path(raw), args.recursive, tuple(f"*{x}" for x in frontend.suffixes), ignore):
+                    if found.resolve() not in have:
+                        have.add(found.resolve())
+                        routed[id(frontend)].append(str(found))
+    return [(f, routed[id(f)]) for f in usable if f.has_inputs(routed[id(f)])]
+
+
 def main():
     """Entry point: parse arguments, run slang elaboration, emit tree, YAML and filelist.
 
@@ -537,7 +523,8 @@ def main():
     clean for piped data.  Exits with code 1 if pyslang reports any error-level
     diagnostics.
     """
-    parser = _build_parser()
+    frontends = discover_frontends(lambda name, exc: _err.print(f"[yellow]warning:[/yellow] plugin {name!r} failed to load: {exc}"))
+    parser = _build_parser(frontends)
     args = parser.parse_intermixed_args()
     if not args.paths and not args.command_files:
         parser.error("give at least one PATH or -f/-F command file")
@@ -545,21 +532,24 @@ def main():
     ignore = {n.lower() for n in args.ignore} if args.ignore else set()
     sv_files = collect_sv_files(args.paths, args.recursive, ignore)
     inc_dirs = _dedupe(args.include_dirs + collect_inc_dirs(args.paths, args.recursive, ignore))
-    if not sv_files and not args.command_files:
+    args.include_dirs = inc_dirs
+    inputs = _route_files(frontends, args, sv_files, ignore)
+    if not inputs:
         _err.print("[red]error:[/red] no .sv/.v files found")
         sys.exit(1)
 
     _err.print(Panel(
-        f"Parsing [bold cyan]{len(sv_files)}[/bold cyan] file(s)"
+        f"Parsing [bold cyan]{sum(len(files) for _, files in inputs)}[/bold cyan] file(s)"
         + (f" and [bold cyan]{len(args.command_files)}[/bold cyan] command file(s)" if args.command_files else "") + "…",
         border_style="dim",
         padding=(0, 1),
     ))
 
-    index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
-    options = {"defines": args.defines, "tops": args.tops, "command_files": args.command_files}
     try:
-        hierarchy, pulled = _parse_with_libs(sv_files, inc_dirs, index, options)
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      console=_err, transient=True) as progress:
+            progress.add_task("Elaborating…", total=None)
+            hierarchy = stitch(inputs, list(args.tops or []))
     except ValueError as exc:
         _err.print(f"[red]error:[/red] {exc}")
         sys.exit(1)
@@ -569,22 +559,24 @@ def main():
     if args.summary:
         _print_summary(hierarchy)
 
-    _print_pulled(pulled)
+    _print_pulled(hierarchy.get("pulled", []))
     _print_duplicates(hierarchy)
     _print_missing(hierarchy)
+    for note in hierarchy.get("frontend_notes", []):
+        _err.print(f"[yellow]note:[/yellow] {note}")
 
     show_tree = args.tree
     if show_tree is None:
         show_tree = "-" not in (args.yaml, args.filelist)
     if show_tree:
-        _print_tree(hierarchy, args.tops or None)
+        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
 
     if args.yaml is not None:
         _write_yaml(hierarchy, args.yaml)
 
     if args.filelist is not None:
         ordered = compute_filelist(hierarchy)
-        _write_filelist(ordered, _dedupe(inc_dirs + hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
+        _write_filelist(ordered, _dedupe(hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
 
     if hierarchy["has_errors"]:
         sys.exit(1)

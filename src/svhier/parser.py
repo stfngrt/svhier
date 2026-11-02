@@ -18,12 +18,12 @@ Modules that are defined but never instantiated are unreachable via ``topInstanc
 and appear in the output with an empty ``insts`` list.
 """
 
+import re
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import networkx as nx
 from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
     Compilation,
@@ -35,6 +35,8 @@ from pyslang.ast import (
 )
 from pyslang.driver import Driver
 from pyslang.syntax import SyntaxKind, SyntaxTree
+
+from svhier.filelist import compute_filelist  # noqa: F401  pylint: disable=unused-import
 
 _IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 # Scopes that can hold module instances without being a module themselves.
@@ -166,10 +168,34 @@ class _Walk:
     sm: SourceManager
     insts: dict[DefKey, list[InstanceSymbol]] = field(default_factory=dict)
     imports: dict[DefKey, list[str]] = field(default_factory=dict)
+    blackbox_params: dict[str, list[dict]] = field(default_factory=dict)
 
     def key(self, defn: DefinitionSymbol) -> DefKey:
         """Return the :data:`DefKey` of *defn*."""
         return (defn.name, _canon(self.sm, defn.location))
+
+
+_NAMED_INT_PARAM = re.compile(r"\.(\w+)\s*\(\s*(\d+)\s*\)")
+
+
+def _blackbox_params(inst) -> dict:
+    """Return the parameters of a blackbox instance that are readable without elaboration.
+
+    slang doesn't evaluate parameters of unknown modules, so only the syntax is available.
+    Returns ``{"generics": {name: value}, "unresolved": [text]}``.
+    """
+    syntax = inst.syntax.parent.parameters if inst.syntax is not None and hasattr(inst.syntax.parent, "parameters") else None
+    use: dict = {"generics": {}, "unresolved": []}
+    if syntax is None:
+        return use
+    text = str(syntax).strip()[2:-1]  # strip "#(" and ")"
+    for part in re.split(r",(?![^()]*\))", text):
+        match = _NAMED_INT_PARAM.fullmatch(part.strip())
+        if match:
+            use["generics"][match.group(1)] = match.group(2)
+        elif part.strip():
+            use["unresolved"].append(part.strip())
+    return use
 
 
 def _walk_instances(tops, sm: SourceManager) -> _Walk:
@@ -194,6 +220,12 @@ def _walk_instances(tops, sm: SourceManager) -> _Walk:
         imports = walk.imports.setdefault(key, [])
         imports.extend(p for p in _collect_imports(inst.body) if p not in imports)
         stack.extend(reversed(list(_iter_module_instances(inst.body))))
+        for child in _iter_module_instances(inst.body, blackboxes=True):
+            if child.kind == SymbolKind.UninstantiatedDef:
+                uses = walk.blackbox_params.setdefault(child.definitionName, [])
+                use = _blackbox_params(child)
+                if use not in uses:
+                    uses.append(use)
     return walk
 
 
@@ -455,6 +487,7 @@ def parse_files(  # pylint: disable=too-many-arguments
     defines: list[str] | None = None,
     tops: list[str] | None = None,
     command_files: list[tuple[str, str]] | None = None,
+    frontend_info: bool = False,
 ) -> dict:
     """Parse SystemVerilog sources and return the module/instance hierarchy.
 
@@ -528,7 +561,10 @@ def parse_files(  # pylint: disable=too-many-arguments
     inputs = _Inputs(list(file_paths), list(inc_dirs or []), list(defines or []),
                      list(tops or []), list(command_files or []))
     with tempfile.TemporaryDirectory() as tmp:
-        return _elaborate(inputs, Path(tmp) / "modules.d")
+        result = _elaborate(inputs, Path(tmp) / "modules.d")
+    if not frontend_info:  # blackbox_params and invalid_tops are for svhier.slang_frontend
+        del result["blackbox_params"], result["invalid_tops"]
+    return result
 
 
 def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
@@ -555,68 +591,6 @@ def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
         "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
         "has_errors": has_errors or bool(load_errors),
         "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
+        "blackbox_params": walk.blackbox_params,
+        "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
     }
-
-
-def _file_deps(entry: dict, mod_to_file: dict[str, str], pkg_to_file: dict[str, str]) -> set[str]:
-    """Return the other input files that the file *entry* depends on."""
-    names = [(mod_to_file, i["mod_name"]) for d in entry["defs"] for i in d.get("insts", [])]
-    names += [(pkg_to_file, p) for d in entry["defs"] for p in d.get("pkg_imports", [])]
-    names += [(pkg_to_file, r) for r in entry.get("refs", [])]
-    deps = {lookup[name] for lookup, name in names if name in lookup}
-    deps.discard(entry["file_name"])
-    return deps
-
-
-def compute_filelist(result: dict) -> list[str]:
-    """Return file paths in topological dependency order (dependencies first).
-
-    Builds a ``networkx.DiGraph`` where an edge ``A → B`` means file A must be
-    compiled before file B.  Edges come from three sources:
-
-    * **Module instantiation** — a file that instantiates a module depends on the
-      file that defines it.
-    * **Package imports** — a file that imports a package depends on the file that
-      defines it.
-    * **Package / interface references** — a file whose ``refs`` name a package or
-      interface (``pkg::x`` without an import, packages using other packages,
-      interface ports and instances) depends on the file that defines it.
-
-    A name defined in several files (see ``duplicates``) maps to the copy slang uses.
-    When ``needed`` is set (``tops`` were given), files the tops do not need are left out.
-
-    ``nx.topological_sort`` produces the compilation order.  If the graph contains
-    a cycle the original input order is returned unchanged.
-
-    *result* is the dict returned by :func:`parse_files`.
-    """
-    files = result["files"]
-
-    mod_to_file: dict[str, str] = {}
-    pkg_to_file: dict[str, str] = {}
-    needed = result.get("needed")
-    if needed is not None:
-        keep = set(needed)
-        files = [entry for entry in files if entry["file_name"] in keep]
-    for entry in files:
-        fname = entry["file_name"]
-        shadowed = set(entry.get("shadowed", []))
-        for pkg in [*entry.get("pkgs", []), *entry.get("ifaces", [])]:
-            if pkg not in shadowed:
-                pkg_to_file[pkg] = fname
-        for d in entry["defs"]:
-            if d["mod_name"] not in shadowed:
-                mod_to_file[d["mod_name"]] = fname
-
-    deps = {entry["file_name"]: _file_deps(entry, mod_to_file, pkg_to_file) for entry in files}
-
-    g: nx.DiGraph = nx.DiGraph()
-    g.add_nodes_from(deps.keys())
-    for f, fdeps in deps.items():
-        for d in fdeps:
-            g.add_edge(d, f)
-
-    try:
-        return list(nx.topological_sort(g))
-    except nx.NetworkXUnfeasible:
-        return [entry["file_name"] for entry in files]
