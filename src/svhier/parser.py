@@ -198,6 +198,18 @@ def _blackbox_params(inst) -> dict:
     return use
 
 
+def _parameter_names(defn: DefinitionSymbol) -> list[str]:
+    """Return the parameters of *defn* that can be overridden.  Works without elaborating it."""
+    syntax = defn.syntax
+    declarations = list(syntax.header.parameters.declarations) if syntax.header.parameters is not None else []
+    declarations += [m.parameter for m in syntax.members if hasattr(m, "parameter")]
+    names = []
+    for declaration in declarations:
+        if hasattr(declaration, "declarators") and str(declaration.keyword).strip() != "localparam":
+            names += [str(d.name).strip() for d in declaration.declarators if hasattr(d, "name")]
+    return names
+
+
 def _walk_instances(tops, sm: SourceManager) -> _Walk:
     """Depth-first walk of the elaborated instance tree below *tops*.
 
@@ -320,6 +332,7 @@ class _Inputs:
     defines: list[str]
     tops: list[str]
     command_files: list[tuple[str, str]]
+    params: dict[str, str] = field(default_factory=dict)
 
     def args(self) -> list[str]:
         """Return the slang command line (without the program name)."""
@@ -329,6 +342,8 @@ class _Inputs:
         for flag, values in (("-I", self.inc_dirs), ("-D", self.defines), ("--top", self.tops)):
             for value in values:
                 args += [flag, value]
+        for name, value in self.params.items():
+            args += ["-G", f"{name}={value}"]
         for flag, path in self.command_files:
             if flag not in _COMMAND_FILE_FLAGS:
                 raise ValueError(f"command file flag must be -f or -F, got {flag!r}")
@@ -487,6 +502,7 @@ def parse_files(  # pylint: disable=too-many-arguments
     defines: list[str] | None = None,
     tops: list[str] | None = None,
     command_files: list[tuple[str, str]] | None = None,
+    params: dict[str, str] | None = None,
     frontend_info: bool = False,
 ) -> dict:
     """Parse SystemVerilog sources and return the module/instance hierarchy.
@@ -502,6 +518,8 @@ def parse_files(  # pylint: disable=too-many-arguments
       use ``+incdir+``, ``+define+``, nested ``-f``/``-F`` and ``${VAR}`` environment
       variables.  ``-F`` resolves paths relative to the command file, ``-f`` relative to
       the working directory.
+    * *params* — parameter values for the top modules, ``{name: SystemVerilog expression}``.
+      Names are case-sensitive; slang ignores names a top doesn't have.
 
     See the module docstring for the elaboration model.  Raises ``ValueError`` if slang
     rejects the inputs (for example a missing command file).
@@ -559,11 +577,12 @@ def parse_files(  # pylint: disable=too-many-arguments
         Instances of missing modules (blackboxes) are still listed in ``insts``.
     """
     inputs = _Inputs(list(file_paths), list(inc_dirs or []), list(defines or []),
-                     list(tops or []), list(command_files or []))
+                     list(tops or []), list(command_files or []), dict(params or {}))
     with tempfile.TemporaryDirectory() as tmp:
         result = _elaborate(inputs, Path(tmp) / "modules.d")
-    if not frontend_info:  # blackbox_params and invalid_tops are for svhier.slang_frontend
-        del result["blackbox_params"], result["invalid_tops"]
+    if not frontend_info:  # These are for svhier.slang_frontend.
+        for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
+            del result[key]
     return result
 
 
@@ -593,4 +612,6 @@ def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
         "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
         "blackbox_params": walk.blackbox_params,
         "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
+        "parameter_names": {d.name: _parameter_names(d) for defs in tables.modules.values() for d in defs},
+        "elaborated_tops": [t.name for t in compilation.getRoot().topInstances],
     }

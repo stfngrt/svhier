@@ -27,6 +27,11 @@ _INSTANCE = re.compile(r"^(\w+): (component|entity|configuration) (\w+)(\(\w+\))
 _FOR = re.compile(r"^(\w+): for-generate \((-?\d+) (to|downto) (-?\d+)\)$")
 _SCOPE = re.compile(r"^(\w+): (if-generate|case-generate|block)\b.*$")
 _BODY = "generate statement body"
+_GENERIC = re.compile(r'^constant interface "([^"]+)": (\w+)(?: \([^)]*\))? = (.*)$')
+_INTEGER = re.compile(r"^-?\d+$")
+_BITS = re.compile(r'^"([01XZ]+)"$')
+_LOGIC = {"'0'": "1'b0", "'1'": "1'b1", "'X'": "1'bx", "'Z'": "1'bz"}
+_BOOLEAN = {"true": "1'b1", "false": "1'b0", "'1'": "1'b1", "'0'": "1'b0"}
 
 
 @dataclass
@@ -36,6 +41,8 @@ class ForeignDef:
     name: str
     file: str | None = None
     insts: list[dict[str, str]] = field(default_factory=list)
+    # {unbound component: [{"generics": {name: literal}, "unresolved": [text]}]}
+    uses: dict[str, list[dict]] = field(default_factory=dict)
 
 
 @dataclass
@@ -52,21 +59,64 @@ class Elaboration:
 class _Node:
     text: str
     children: list["_Node"] = field(default_factory=list)
+    use: dict = field(default_factory=lambda: {"generics": {}, "unresolved": []})
+
+
+def to_literal(kind: str, value: str) -> str | None:  # pylint: disable=too-many-return-statements
+    """Translate a value GHDL printed into the notation frontends share, or ``None`` if it has none.
+
+    *kind* is GHDL's word for the value's type.  See :class:`svhier.frontends.Root`.
+    """
+    if kind == "discrete":
+        return value if _INTEGER.match(value) else None  # Otherwise a time or an enumeration.
+    if kind == "bit":
+        return _BOOLEAN.get(value)
+    if kind == "logic":
+        return _LOGIC.get(value)
+    if kind == "float":
+        return value
+    if kind == "vector":
+        match = _BITS.match(value)
+        return f"{len(match.group(1))}'b{match.group(1).lower()}" if match else None
+    if kind == "array" and value.startswith('"'):
+        inner = value[1:-1].replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{inner}"'
+    return None
+
+
+def _is_structure(body: str) -> bool:
+    return bool(body == _BODY or _ARCH.match(body) or _INSTANCE.match(body) or _FOR.match(body) or _SCOPE.match(body))
 
 
 def parse_tree(text: str) -> _Node:
-    """Turn indented ``Disp_Hierarchy`` output into nodes."""
+    """Turn indented ``Disp_Hierarchy`` output into nodes.
+
+    Object lines (signals, generics and so on) share the indent of what they belong to, so
+    they can't be nodes: they would become the parent of whatever follows.  The generics
+    printed right after an instance are stored on it; other object lines are dropped.
+    """
     root = _Node("")
+    last = root
     stack: list[tuple[int, _Node]] = [(-1, root)]
     for line in text.splitlines():
         if not line.strip():
             continue
         indent, body = _LINE.match(line).groups()
+        if not _is_structure(body):
+            match = _GENERIC.match(body)
+            if match and _INSTANCE.match(last.text) and stack[-1] == (len(indent), last):
+                name, kind, value = match.groups()
+                literal = to_literal(kind, value)
+                if literal is None:
+                    last.use["unresolved"].append(f"{name} = {value}")
+                else:
+                    last.use["generics"][name] = literal
+            continue
         while stack[-1][0] >= len(indent):
             stack.pop()
-        node = _Node(body)
-        stack[-1][1].children.append(node)
-        stack.append((len(indent), node))
+        last = _Node(body)
+        stack[-1][1].children.append(last)
+        stack.append((len(indent), last))
     return root
 
 
@@ -81,13 +131,13 @@ def _split_bodies(children: list[_Node]) -> list[list[_Node]]:
     return bodies
 
 
-def _scan(children: list[_Node], prefix: str, found: list[tuple[str, str, _Node | None]]) -> None:
-    """Collect ``(instance path, component name, architecture node)`` below a scope."""
+def _scan(children: list[_Node], prefix: str, found: list[tuple[str, str, _Node | None, dict]]) -> None:
+    """Collect ``(instance path, component name, architecture node, use)`` below a scope."""
     for child in children:
         match = _INSTANCE.match(child.text)
         if match:
             arch = next((c for c in child.children if _ARCH.match(c.text)), None)
-            found.append((f"{prefix}{match.group(1)}", match.group(3), arch))
+            found.append((f"{prefix}{match.group(1)}", match.group(3), arch, child.use))
             continue
         match = _FOR.match(child.text)
         if match:
@@ -114,14 +164,16 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     def visit(arch: _Node) -> str:
         entity = _ARCH.match(arch.text).group(2).lower()
         unit = defs.setdefault(entity, ForeignDef(entity, files.get(entity)))
-        found: list[tuple[str, str, _Node | None]] = []
+        found: list[tuple[str, str, _Node | None, dict]] = []
         _scan(arch.children, "", found)
-        for path, component, child_arch in found:
+        for path, component, child_arch, use in found:
             # A bound component may map to an entity with another name; trust the binding.
             child = visit(child_arch) if child_arch is not None else component.lower()
             inst = {"mod_name": child, "inst_name": path}
             if inst not in unit.insts:
                 unit.insts.append(inst)
+            if child_arch is None and use not in unit.uses.setdefault(child, []):
+                unit.uses[child].append(use)
         return entity
 
     for node in root.children:
@@ -201,6 +253,9 @@ class GhdlFrontend:
             for new in result.defs:
                 have = defs.setdefault(new.name, ForeignDef(new.name, new.file))
                 have.insts.extend(i for i in new.insts if i not in have.insts)
+                for name, uses in new.uses.items():
+                    have_uses = have.uses.setdefault(name, [])
+                    have_uses.extend(u for u in uses if u not in have_uses)
             for fname, needs in result.file_deps.items():
                 have_deps = file_deps.setdefault(fname, [])
                 have_deps.extend(n for n in needs if n not in have_deps)
@@ -243,6 +298,11 @@ class GhdlFrontend:
                         users = result["missing"]["modules"].setdefault(inst["mod_name"], [])
                         if entry["file_name"] not in users:
                             users.append(entry["file_name"])
+        for unit in defs.values():
+            for name, uses in unit.uses.items():
+                if unit.file and name not in defs:
+                    known = result["unresolved"].setdefault(name, [])
+                    known.extend(u for u in uses if u not in known)
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
