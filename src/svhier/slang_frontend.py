@@ -105,7 +105,8 @@ class SlangFrontend:
                 optional -= rejected
                 result = self._parse(files, [n for n in wanted if n not in rejected])
             # Instantiated, so still needed, even though slang can't elaborate them on their own.
-            units = self.units(files)
+            # Only when needed: units() parses with no top, which pulls in files for unused modules.
+            units = self.units(files) if rejected else {}
             result["needed"] = list(result["needed"] or []) + [units[n.lower()] for n in sorted(rejected) if n.lower() in units]
         result["unresolved"] = result.pop("blackbox_params")
         for name in result["missing"]["modules"]:
