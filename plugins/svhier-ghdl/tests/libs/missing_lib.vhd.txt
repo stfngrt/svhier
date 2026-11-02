@@ -1,0 +1,4 @@
+library nowhere;
+use nowhere.gone_pkg.all;
+entity lost_top is end entity;
+architecture rtl of lost_top is begin end architecture;
