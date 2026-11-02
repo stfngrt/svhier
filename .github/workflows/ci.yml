@@ -29,3 +29,44 @@ jobs:
 
       - name: Test
         run: uv run pytest tests/ -v
+
+  # The plugin binds GHDL internals by symbol name, so this runs against whatever GHDL
+  # released last. A new GHDL release that changes those internals fails here.
+  ghdl:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+          uv pip install --no-deps -e plugins/svhier-ghdl
+
+      - name: Install pyGHDL from the latest GHDL release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          tag="cp${PYTHON_VERSION/./}"
+          gh release download --repo ghdl/ghdl --dir "$RUNNER_TEMP/ghdl" \
+            --pattern "pyghdl-*-$tag-$tag-linux_x86_64.whl"
+          uv pip install "$RUNNER_TEMP"/ghdl/*.whl
+
+      # The plugin tests skip themselves without pyGHDL, so make a missing install fail.
+      - name: Check pyGHDL is installed
+        run: uv pip show pyghdl
+
+      - name: Lint
+        run: uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/
+
+      - name: Test
+        run: uv run --no-sync pytest tests/ plugins/svhier-ghdl/tests/ -v
