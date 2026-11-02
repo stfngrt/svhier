@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from svhier.frontends import Request, Root
+from svhier.libsearch import LibraryIndex
 from svhier.parser import parse_files
 from svhier.slang_frontend import SlangFrontend
 
@@ -140,3 +141,37 @@ def test_module_name_is_found_when_vhdl_lowercased_it(tmp_path):
     result = _elaborate([str(path)], Root("mixed_case", (("count", "1"),)))
     assert _insts(result, "Mixed_Case") == ["g[0].u"]
     assert result["rejected_roots"] == []
+
+
+def test_provide_finds_a_library_module_in_any_case_and_reports_it(tmp_path):
+    (tmp_path / "Lib_Cell.sv").write_text("module Lib_Cell; endmodule\n")
+    frontend = SlangFrontend()
+    frontend.index = LibraryIndex([str(tmp_path)])
+    files: list[str] = []
+    assert frontend.provide("lib_cell", files)
+    assert frontend.units(files) == {"lib_cell": str(tmp_path / "Lib_Cell.sv")}
+    assert [name for name, _, _ in frontend.pulled] == ["lib_cell"]
+    assert not frontend.provide("nothing", files)
+
+
+def test_units_do_not_search_the_library(tmp_path):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "cell.sv").write_text("module cell; endmodule\n")
+    source = tmp_path / "unused.sv"
+    source.write_text("module unused; cell u (); endmodule\n")
+    frontend = SlangFrontend()
+    frontend.index = LibraryIndex([str(tmp_path / "lib")])
+    files = [str(source)]
+    assert list(frontend.units(files)) == ["unused"]
+    assert files == [str(source)] and not frontend.pulled
+
+
+def test_a_module_another_language_defines_is_not_pulled_from_the_library(tmp_path):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "shared.sv").write_text("module shared; endmodule\n")
+    source = tmp_path / "top.sv"
+    source.write_text("module top; shared u (); endmodule\n")
+    frontend = SlangFrontend()
+    frontend.index = LibraryIndex([str(tmp_path / "lib")])
+    frontend.elaborate([str(source)], Request(roots=[Root("top", requested=True)], defined_elsewhere={"shared"}))
+    assert not frontend.pulled

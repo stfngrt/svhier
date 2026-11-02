@@ -143,7 +143,7 @@ def _nothing_elaborated(result: dict) -> dict:
     return result
 
 
-class SlangFrontend:
+class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     """Elaborate SystemVerilog with slang, including ``-f``, ``-I``, ``-D`` and ``-y``."""
 
     name = "slang"
@@ -156,6 +156,7 @@ class SlangFrontend:
         self.command_files: list = []
         self.index: LibraryIndex | None = None
         self.pulled: list = []
+        self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
         # {lowercase module name: (module name, its parameter names)}
         self._modules: dict[str, tuple[str, list[str]]] = {}
@@ -207,37 +208,62 @@ class SlangFrontend:
         """Command files are inputs too."""
         return [f"{len(self.command_files)} command file(s)"] if self.command_files else []
 
-    def _parse(self, files: list[str], tops: list[str], params: dict[str, str] | None = None) -> dict:
+    def has_library(self) -> bool:
+        """Report whether ``-y`` defines anything for slang."""
+        return self.index is not None and bool(self.index.defs)
+
+    def provide(self, name: str, files: list[str]) -> bool:
+        """Add the ``-y`` file defining *name*, spelled in any case."""
+        candidates = self.index.find_definition_any_case(name) if self.index else []
+        if not candidates:
+            return False
+        if str(candidates[0]) not in files:
+            files.append(str(candidates[0]))
+            self.pulled.append((name, candidates[0], len(candidates) - 1))
+        self._units = None
+        return True
+
+    def _library_candidates(self, missing: dict) -> dict:
+        """Return *missing* without modules that sources in another language define."""
+        return {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}
+
+    def _parse(self, files: list[str], tops: list[str], params: dict[str, str] | None = None, *, library: bool = True) -> dict:
         """Parse, then pull missing definitions from ``-y`` until nothing new resolves.
 
-        *files* and the include dirs grow in place.
+        *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
         from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
 
         options = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
         hierarchy = parse_files(files, self.inc_dirs, **options)
         for _ in range(_MAX_LIB_ROUNDS):
-            if self.index is None:
+            if self.index is None or not library:
                 break
             loaded = [f["file_name"] for f in hierarchy["files"]]
-            found, incs = resolve_missing(hierarchy["missing"], self.index, loaded, self.inc_dirs)
+            found, incs = resolve_missing(self._library_candidates(hierarchy["missing"]), self.index, loaded, self.inc_dirs)
             if not found and not incs:
                 break
-            for name, (path, others) in found.items():
-                if str(path) not in files:
-                    files.append(str(path))
-                self.pulled.append((name, path, others))
-            for include, directory in incs.items():
-                if str(directory) not in self.inc_dirs:
-                    self.inc_dirs.append(str(directory))
-                self.pulled.append((include, directory, 0))
+            self._add_pulled(found, incs, files)
             hierarchy = parse_files(files, self.inc_dirs, **options)
         return hierarchy
 
+    def _add_pulled(self, found: dict, incs: dict, files: list[str]) -> None:
+        """Add what :func:`~svhier.libsearch.resolve_missing` found to the compilation."""
+        for name, (path, others) in found.items():
+            if str(path) not in files:
+                files.append(str(path))
+            self.pulled.append((name, path, others))
+        for include, directory in incs.items():
+            if str(directory) not in self.inc_dirs:
+                self.inc_dirs.append(str(directory))
+            self.pulled.append((include, directory, 0))
+
     def units(self, files: list[str]) -> dict[str, str]:
-        """Return the modules the inputs define."""
+        """Return the modules the inputs define.  With no tops, ``-y`` would serve unused modules too."""
         if self._units is None:
-            result = self._parse(files, [])
+            if not files and not self.command_files:
+                return {}
+            result = self._parse(files, [], library=False)
             self._units = {d["mod_name"].lower(): f["file_name"] for f in result["files"] for d in f["defs"]}
             self._modules = {name.lower(): (name, params) for name, params in result["parameter_names"].items()}
         return self._units
@@ -318,6 +344,7 @@ class SlangFrontend:
         """Elaborate the roots, using the parameter values that come with them."""
         if not (files or self.command_files) or not (request.roots or request.auto):
             return empty_fragment()  # --top names only other languages' units so far
+        self._defined_elsewhere = request.defined_elsewhere
         if any(not r.requested for r in request.roots):
             self.units(files)  # To match the names and values other languages use.
         plain = [self._root_name(r) for r in request.roots if not r.generics]
@@ -336,7 +363,7 @@ class SlangFrontend:
         rejected |= plain_rejected - worked
         if base is not None:
             results.insert(0, base)
-        result = results[0] if results else _nothing_elaborated(self._parse(files, []))
+        result = results[0] if results else _nothing_elaborated(self._parse(files, [], library=False))
         for other in results[1:]:
             _merge_results(result, other)
         if request.auto:

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from svhier.frontends import Request, empty_fragment
+from svhier.libsearch import glob_files
 
 _MARKER = "@@svhier-order "
 _TIMEOUT_S = 120
@@ -32,6 +33,10 @@ _INTEGER = re.compile(r"^-?\d+$")
 _BITS = re.compile(r'^"([01XZ]+)"$')
 _LOGIC = {"'0'": "1'b0", "'1'": "1'b1", "'X'": "1'bx", "'Z'": "1'bz"}
 _BOOLEAN = {"true": "1'b1", "false": "1'b0", "'1'": "1'b1", "'0'": "1'b0"}
+_COMMENT = re.compile(r"--.*$", re.M)
+_PRIMARY_UNIT = re.compile(r"^\s*(?:entity|package|context|configuration\s+\w+\s+of)\s+(\w+)\s+is\b", re.I | re.M)
+_SECONDARY_UNIT = re.compile(r"^\s*(?:architecture\s+\w+\s+of|package\s+body)\s+(\w+)\s+is\b", re.I | re.M)
+_BUILTIN_LIBRARIES = {"std", "ieee"}
 
 
 @dataclass
@@ -83,6 +88,43 @@ def to_literal(kind: str, value: str) -> str | None:  # pylint: disable=too-many
         inner = value[1:-1].replace("\\", "\\\\").replace('"', '\\"')
         return f'"{inner}"'
     return None
+
+
+class VhdlLibrary:  # pylint: disable=too-few-public-methods
+    """What VHDL files under ``-y`` define.  A regex is enough to choose files; GHDL reads them."""
+
+    def __init__(self, dirs: list[str], ignore: set[str]) -> None:
+        self.primary: dict[str, list[Path]] = {}
+        self.secondary: dict[str, list[Path]] = {}
+        for directory in dirs:
+            for path in glob_files(Path(directory), True, ("*.vhd", "*.vhdl"), ignore):
+                try:
+                    text = _COMMENT.sub("", path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                for pattern, table in ((_PRIMARY_UNIT, self.primary), (_SECONDARY_UNIT, self.secondary)):
+                    for name in dict.fromkeys(n.lower() for n in pattern.findall(text)):
+                        table.setdefault(name, []).append(path)
+
+    def find(self, name: str, library: str = "") -> tuple[list[Path], int]:
+        """Return the files for unit *name*, and how many other files also define it.
+
+        The first file defines the unit.  Architectures and package bodies may live in their
+        own files, so the others are those in the same directory.  Same preference as for SV,
+        after a directory named after the *library* that references it.
+        """
+        name = name.lower()
+
+        def rank(path: Path) -> tuple:
+            stem = path.stem.lower()
+            return (library not in (p.lower() for p in path.parent.parts), stem != name, not name.startswith(stem), len(path.parts), str(path))
+
+        candidates = sorted(self.primary.get(name, []), key=rank)
+        if not candidates:
+            return [], 0
+        best = candidates[0]
+        rest = [p for p in self.secondary.get(name, []) if p.parent == best.parent and p != best]
+        return [best, *rest], len(candidates) - 1
 
 
 def _pick_named(name: str, library: str, candidates: list[str], notes: list[str]) -> str:
@@ -261,7 +303,7 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     return list(defs.values())
 
 
-class GhdlFrontend:
+class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
     """Elaborate VHDL by running :mod:`svhier_ghdl.worker` once per top and setting."""
 
     name = "ghdl"
@@ -277,6 +319,9 @@ class GhdlFrontend:
         self._libraries: dict[str, str] = {}
         self._notes: list[str] = []
         self._cache: dict[tuple, Elaboration] = {}
+        self._library: VhdlLibrary | None = None
+        self._pulled: list[tuple[str, Path, int]] = []
+        self._scan: dict[str, dict] = {}
 
     def add_arguments(self, parser) -> None:
         """Add the plugin's options."""
@@ -288,6 +333,8 @@ class GhdlFrontend:
         """Read the plugin's options."""
         self.std = args.vhdl_std
         self.work = args.vhdl_work
+        if args.libdirs:
+            self._library = VhdlLibrary(args.libdirs, {n.lower() for n in args.ignore} if args.ignore else set())
 
     def unavailable_reason(self) -> str | None:
         """Report why GHDL can't be used; None if it can."""
@@ -311,24 +358,84 @@ class GhdlFrontend:
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return the entities in *files*, or nothing if the worker failed.  Also chooses libraries."""
-        by_abs = {str(Path(f).resolve()): f for f in files}
-        proc = self._worker({"op": "scan", "files": list(by_abs)})
-        for line in proc.stdout.splitlines():
-            if line.startswith(_MARKER):
-                scan = {by_abs[path]: entry for path, entry in json.loads(line[len(_MARKER):]).items()}
-                self._libraries, self._notes = assign_libraries(scan, self.work.lower())
-                self._definers = {}
-                for path, entry in scan.items():
-                    for name in entry["entities"]:
-                        self._definers.setdefault(name, []).append(path)
-                self._units = {name: paths[0] for name, paths in self._definers.items()}
+        by_abs = {str(Path(f).resolve()): f for f in files if f not in self._scan}
+        if by_abs:
+            proc = self._worker({"op": "scan", "files": list(by_abs)})
+            for line in proc.stdout.splitlines():
+                if line.startswith(_MARKER):
+                    self._scan.update({by_abs[path]: entry for path, entry in json.loads(line[len(_MARKER):]).items()})
+        scan = {f: self._scan[f] for f in files if f in self._scan}
+        self._libraries, self._notes = assign_libraries(scan, self.work.lower())
+        self._definers = {}
+        for path, entry in scan.items():
+            for name in entry["entities"]:
+                self._definers.setdefault(name, []).append(path)
+        self._units = {name: paths[0] for name, paths in self._definers.items()}
         return self._units
 
+    def has_library(self) -> bool:
+        """Report whether ``-y`` defines any VHDL units."""
+        return self._library is not None and bool(self._library.primary)
+
+    def _pull(self, name: str, files: list[str], library: str = "") -> bool:
+        """Add the files defining *name* from ``-y``; return whether that added any."""
+        found, others = self._library.find(name, library) if self._library else ([], 0)
+        have = {Path(f).resolve() for f in files}
+        new = [p for p in found if p.resolve() not in have]
+        if not new:
+            return False
+        files.extend(str(p) for p in new)
+        self._pulled.append((name, found[0], others))
+        self._cache.clear()
+        return True
+
+    def provide(self, name: str, files: list[str]) -> bool:
+        """Add the ``-y`` file defining entity *name*, and what it needs to compile."""
+        return self._pull_needed([name], files) or bool(self._library and self._library.find(name)[0])
+
+    def _pull_needed(self, names: list[str], files: list[str]) -> bool:
+        """Pull in from ``-y`` what the units *names* must see to compile, however indirectly.
+
+        Unlike an instance through a component, ``use lib.pkg`` and ``entity lib.unit`` need the
+        unit to exist.  Only following them from *names* leaves out what other files need.
+        """
+        if self._library is None:
+            return False
+        pulled = False
+        pending = [("", n.lower()) for n in names]
+        seen: set[str] = set()
+        while pending:
+            library, unit = pending.pop()
+            if unit in seen:
+                continue
+            seen.add(unit)
+            if not any(unit in e["units"] for e in self._scan.values()) and self._pull(unit, files, library):
+                pulled = True
+                self.units(files)
+            for entry in self._scan.values():
+                if unit in entry["units"] or unit in entry["arch_of"]:
+                    local = {"work", *(lib.lower() for lib in entry["libs"])} - _BUILTIN_LIBRARIES
+                    pending.extend((lib, ref) for lib, ref in entry["named"] if lib in local)
+        return pulled
+
     def elaborate(self, files: list[str], request: Request) -> dict:
-        """Elaborate the roots; with ``auto``, also every entity nothing has reached yet."""
-        if not self._units:
+        """Elaborate the roots; with ``auto``, also every entity nothing has reached yet.
+
+        Instances still unbound afterwards may be entities under ``-y``, which needs another run.
+        """
+        if files and not self._units:
             self.units(files)
-        runs = [(r.name, dict(r.generics), False) for r in request.roots]
+        names = [r.name for r in request.roots]
+        # With auto, every entity is a root, even those only -y has components for.
+        self._pull_needed(names + [u for e in self._scan.values() for u in e["units"]] if request.auto else names, files)
+        while True:
+            defs, file_deps, errors = self._elaborate_all(files, request)
+            unbound = {i["mod_name"] for d in defs.values() for i in d.insts} - set(defs) - request.defined_elsewhere
+            if not self._pull_needed(sorted(unbound), files):
+                return self._fragment(defs, file_deps, errors, auto=request.auto)
+
+    def _elaborate_all(self, files: list[str], request: Request) -> tuple[dict[str, ForeignDef], dict[str, list[str]], list[str]]:
+        """Run the worker for every root, and merge what the runs report."""
         defs: dict[str, ForeignDef] = {}
         file_deps: dict[str, list[str]] = {}
         errors: list[str] = []
@@ -354,8 +461,8 @@ class GhdlFrontend:
             else:
                 errors.extend(e for e in result.errors if e not in errors)
 
-        for top, generics, is_soft in runs:
-            run(top, generics, is_soft)
+        for root in request.roots:
+            run(root.name, dict(root.generics), False)
         if request.auto:
             for unit in self._units:
                 if unit not in defs:
@@ -365,7 +472,7 @@ class GhdlFrontend:
         for unit, unit_errors in soft.items():
             if unit not in reached:
                 errors.extend(e for e in unit_errors if e not in errors)
-        return self._fragment(defs, file_deps, errors, auto=request.auto)
+        return defs, file_deps, errors
 
     def _fragment(self, defs: dict[str, ForeignDef], file_deps: dict[str, list[str]], errors: list[str], *, auto: bool) -> dict:
         """Build the result shape core expects, one entry per file."""
@@ -397,6 +504,7 @@ class GhdlFrontend:
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
         result["notes"] = list(self._notes)
+        result["pulled"] = list(self._pulled)
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
 

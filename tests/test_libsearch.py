@@ -73,3 +73,10 @@ def test_options_and_paths_can_be_intermixed(design, monkeypatch, capsys):
         "svhier", "-y", str(design / "lib"), str(design / "src"), "--no-tree", str(design / "src" / "top.sv")])
     main()
     assert "Pulled in from -y" in capsys.readouterr().err
+
+
+def test_any_case_lookup_keeps_exact_lookup_strict(tmp_path):
+    (tmp_path / "Top_Cell.sv").write_text("module Top_Cell;\nendmodule\n")
+    index = LibraryIndex([str(tmp_path)])
+    assert not index.find_definition("top_cell")
+    assert index.find_definition_any_case("top_cell") == [tmp_path / "Top_Cell.sv"]

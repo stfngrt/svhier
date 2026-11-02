@@ -10,11 +10,13 @@ class FakeFrontend:
     suffixes = (".fake",)
     catch_all = False
 
-    def __init__(self, name: str, table: dict, *, rejects=()):
+    def __init__(self, name: str, table: dict, *, rejects=(), library=None):
         self.name = name
         self.table = table
+        self.library = library or {}
         self.rejects = set(rejects)
         self.requests: list[Request] = []
+        self.seen_elsewhere: set[str] = set()
 
     def add_arguments(self, parser) -> None:
         """No options."""
@@ -31,9 +33,22 @@ class FakeFrontend:
     def units(self, files: list[str]) -> dict[str, str]:
         return {n.lower(): file for n, (file, _) in self.table.items()}
 
+    def has_library(self) -> bool:
+        return bool(self.library)
+
+    def provide(self, name: str, files: list[str]) -> bool:
+        """Move a unit from ``library`` to ``table``."""
+        for known, entry in list(self.library.items()):
+            if known.lower() == name.lower():
+                self.table[known] = self.library.pop(known)
+                files.append(entry[0])
+                return True
+        return False
+
     def elaborate(self, files: list[str], request: Request) -> dict:
         """Elaborate everything reachable from the roots (or everything, with ``auto``)."""
         self.requests.append(Request(request.auto, list(request.roots)))  # core extends roots between rounds
+        self.seen_elsewhere = set(request.defined_elsewhere)
         result = empty_fragment()
         pending = list(self.table) if request.auto else [r.name for r in request.roots]
         seen: set[str] = set()
@@ -124,6 +139,29 @@ def test_single_frontend_skips_unit_discovery():
 
     frontend = NoUnits("only", {"a": ("a.x", [])})
     assert stitch([(frontend, ["a.x"])], ["a"])["needed"] == ["a.x"]
+
+
+def test_unresolved_name_is_pulled_from_the_library_of_the_language_that_defines_it():
+    first = FakeFrontend("first", {"a": ("a.x", [("u_lib", "Lib")])})
+    second = FakeFrontend("second", {}, library={"lib": ("lib.y", [("u_c", "deep")]), "other": ("other.y", [])})
+    files = []
+    result = stitch([(first, ["a.x"]), (second, files)], ["a"])
+    assert _insts(result, "lib") == [("u_c", "deep")]
+    assert files == ["lib.y"]
+    assert "lib" not in result["missing"]["modules"]
+
+
+def test_top_can_come_from_a_library():
+    first = FakeFrontend("first", {"a": ("a.x", [])})
+    second = FakeFrontend("second", {}, library={"lib": ("lib.y", [])})
+    result = stitch([(first, ["a.x"]), (second, [])], ["lib"])
+    assert result["tops"] == ["lib"]
+
+
+def test_frontends_learn_what_others_define():
+    first, second = _pair()
+    stitch([(first, ["a.x", "c.x"]), (second, ["b.y"])], ["a"])
+    assert first.seen_elsewhere == {"b"}
 
 
 def test_slang_is_discovered_like_any_plugin():
