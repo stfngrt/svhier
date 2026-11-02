@@ -32,13 +32,27 @@ internals by symbol name; they may change between GHDL versions:
 - `elab__vhdl_debug__disp_hierarchy`, whose text output the plugin parses, including the
   evaluated generics of each instance
 
+## Libraries
+
+Files go into libraries automatically, based on how they refer to each other:
+
+1. `library lib; use lib.pkg.all;` or `entity lib.leaf` places the file defining that unit in `lib`.
+   If several files define it, a directory named after the library wins; otherwise the first is
+   used, with a note.
+2. `work.unit` references, a component declaration and the entity of that name, and an architecture
+   and its entity all share a library, so `lib` spreads through them.
+3. Everything else goes to `--vhdl-work` (default `work`).
+
 ## Known limits
 
 - CI tests the latest GHDL release, currently 6.0.0, with its Linux wheels for Python 3.11,
   3.12 and 3.13. A new GHDL release that changes the internals above fails CI.
-- One VHDL library for all files, set with `--vhdl-work`. A design that names its library, such
-  as `library neorv32;`, fails unless that option matches. Automatic detection has strict
-  expected-failure tests in `tests/test_ghdl_libraries.py`.
+- YAML gives each VHDL file's `library`, but the filelist can't, so it can't compile a design with
+  several libraries on its own.
+- VHDL-2008 generic types or subprograms make GHDL's printing crash. The tree stays correct, but
+  generics can't be read in that run, so SV modules below that top use their defaults, with a note.
+- Hierarchy is keyed by name, so a design that uses entities with the same name from two libraries
+  shows them as one.
 - VHDL that instantiates an SV module directly (`entity work.x`) fails, because GHDL needs
   to see the entity. Instantiating through a `component` works.
 - Values VHDL passes to SV modules are integers, booleans, `std_logic`, bit and logic vectors,

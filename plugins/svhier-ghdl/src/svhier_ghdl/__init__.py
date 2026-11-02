@@ -53,6 +53,7 @@ class Elaboration:
     # {file: [files it must be compiled after]}, for every file the top needs.
     file_deps: dict[str, list[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +83,84 @@ def to_literal(kind: str, value: str) -> str | None:  # pylint: disable=too-many
         inner = value[1:-1].replace("\\", "\\\\").replace('"', '\\"')
         return f'"{inner}"'
     return None
+
+
+def _pick_named(name: str, library: str, candidates: list[str], notes: list[str]) -> str:
+    """Choose which file defining *name* a ``library.name`` reference means."""
+    if len(candidates) == 1:
+        return candidates[0]
+    in_directory = [c for c in candidates if library in (p.lower() for p in Path(c).parent.parts)]
+    if in_directory:
+        return in_directory[0]
+    note = f"several files define {name} for library {library}; using {candidates[0]}"
+    if note not in notes:
+        notes.append(note)
+    return candidates[0]
+
+
+def _pick_local(path: str, candidates: list[str], placed: dict[str, str]) -> str | None:
+    """Choose which file a reference from *path* to its own library means; None if unclear."""
+    if path in candidates:
+        return path
+    if len(candidates) == 1:
+        return candidates[0]
+    near = [c for c in candidates if Path(c).parent == Path(path).parent]
+    if near:
+        return near[0]
+    return next((c for c in candidates if c in placed and placed[c] == placed.get(path)), None)
+
+
+def _place_named(scan: dict[str, dict], definers: dict[str, list[str]], placed: dict[str, str], notes: list[str]) -> None:
+    """Follow every ``library.unit`` reference to a library some file declares."""
+    declared = {lib.lower() for entry in scan.values() for lib in entry["libs"]} - {"work"}
+    for path in sorted(scan):
+        for library, unit in scan[path]["refs"]:
+            library, unit = library.lower(), unit.lower()
+            if library not in declared or unit not in definers:
+                continue
+            target = _pick_named(unit, library, definers[unit], notes)
+            if placed.setdefault(target, library) != library:
+                note = f"{target} is referenced as part of both {placed[target]} and {library}; using {placed[target]}"
+                if note not in notes:
+                    notes.append(note)
+
+
+def _spread_local(scan: dict[str, dict], definers: dict[str, list[str]], placed: dict[str, str]) -> None:
+    """Files linked by ``work.unit``, or by an architecture and its entity, share a library."""
+    changed = True
+    while changed:
+        changed = False
+        for path in sorted(scan):
+            linked = [r[1].lower() for r in scan[path]["refs"] if r[0].lower() == "work"] + [a.lower() for a in scan[path]["arch_of"]]
+            for unit in linked:
+                target = _pick_local(path, definers[unit], placed) if unit in definers else None
+                if target is None or target == path:
+                    continue
+                if path in placed and target not in placed:
+                    placed[target] = placed[path]
+                    changed = True
+                elif target in placed and path not in placed:
+                    placed[path] = placed[target]
+                    changed = True
+
+
+def assign_libraries(scan: dict[str, dict], default: str) -> tuple[dict[str, str], list[str]]:
+    """Choose a library for each file from how the files refer to each other.
+
+    *scan* is ``{file: {"units", "arch_of", "refs", "libs"}}``, as the worker reports it.  A
+    ``library.unit`` reference places the file defining the unit, with a directory named
+    after the library breaking ties.  ``work.unit`` references and architectures then spread
+    that library.  Other files go to *default*.  Returns ``({file: library}, notes)``.
+    """
+    definers: dict[str, list[str]] = {}
+    for path in sorted(scan):
+        for unit in scan[path]["units"]:
+            definers.setdefault(unit.lower(), []).append(path)
+    placed: dict[str, str] = {}
+    notes: list[str] = []
+    _place_named(scan, definers, placed, notes)
+    _spread_local(scan, definers, placed)
+    return {path: placed.get(path, default) for path in scan}, notes
 
 
 def _is_structure(body: str) -> bool:
@@ -193,6 +272,10 @@ class GhdlFrontend:
         self.std = "08"
         self.work = "work"
         self._units: dict[str, str] = {}
+        # {lowercase entity name: every file defining it}, since libraries may share names.
+        self._definers: dict[str, list[str]] = {}
+        self._libraries: dict[str, str] = {}
+        self._notes: list[str] = []
         self._cache: dict[tuple, Elaboration] = {}
 
     def add_arguments(self, parser) -> None:
@@ -227,12 +310,18 @@ class GhdlFrontend:
                               capture_output=True, text=True, timeout=_TIMEOUT_S, env=env, check=False)
 
     def units(self, files: list[str]) -> dict[str, str]:
-        """Return the entities in *files*, or nothing if the worker failed."""
+        """Return the entities in *files*, or nothing if the worker failed.  Also chooses libraries."""
         by_abs = {str(Path(f).resolve()): f for f in files}
-        proc = self._worker({"op": "units", "files": list(by_abs)})
+        proc = self._worker({"op": "scan", "files": list(by_abs)})
         for line in proc.stdout.splitlines():
             if line.startswith(_MARKER):
-                self._units = {name: by_abs[path] for name, path in json.loads(line[len(_MARKER):]).items()}
+                scan = {by_abs[path]: entry for path, entry in json.loads(line[len(_MARKER):]).items()}
+                self._libraries, self._notes = assign_libraries(scan, self.work.lower())
+                self._definers = {}
+                for path, entry in scan.items():
+                    for name in entry["entities"]:
+                        self._definers.setdefault(name, []).append(path)
+                self._units = {name: paths[0] for name, paths in self._definers.items()}
         return self._units
 
     def elaborate(self, files: list[str], request: Request) -> dict:
@@ -250,6 +339,7 @@ class GhdlFrontend:
             if key not in self._cache:
                 self._cache[key] = self.elaborate_one(files, top, generics)
             result = self._cache[key]
+            self._notes.extend(n for n in result.notes if n not in self._notes)
             for new in result.defs:
                 have = defs.setdefault(new.name, ForeignDef(new.name, new.file))
                 have.insts.extend(i for i in new.insts if i not in have.insts)
@@ -286,7 +376,8 @@ class GhdlFrontend:
                 by_file.setdefault(unit.file, []).append(unit)
         for fname in list(file_deps) + [f for f in by_file if f not in file_deps]:
             result["files"].append({
-                "file_name": fname, "pkgs": [], "ifaces": [], "shadowed": [], "refs": [],
+                "file_name": fname, "library": self._libraries.get(fname, self.work.lower()),
+                "pkgs": [], "ifaces": [], "shadowed": [], "refs": [],
                 "depends_on": file_deps.get(fname, []),
                 "defs": [{"mod_name": d.name, "pkg_imports": [], "insts": [dict(i) for i in d.insts]} for d in by_file.get(fname, [])],
             })
@@ -305,6 +396,7 @@ class GhdlFrontend:
                     known.extend(u for u in uses if u not in known)
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
+        result["notes"] = list(self._notes)
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
 
@@ -316,8 +408,21 @@ class GhdlFrontend:
     def elaborate_one(self, files: list[str], top: str, generics: dict[str, str]) -> Elaboration:
         """Elaborate *top*.  Failures, including worker crashes, come back in ``errors``."""
         by_abs = {str(Path(f).resolve()): f for f in files}
+        request = {
+            "op": "elaborate", "files": list(by_abs), "top": top, "generics": generics,
+            "top_library": self._libraries.get(self._units.get(top.lower(), ""), self.work),
+            "libraries": {path: self._libraries[name] for path, name in by_abs.items() if name in self._libraries},
+            "objects": True,
+        }
+        notes: list[str] = []
         try:
-            proc = self._worker({"op": "elaborate", "files": list(by_abs), "top": top, "generics": generics})
+            proc = self._worker(request)
+            if proc.returncode != 0 and "raised " in proc.stderr:
+                # Printing objects crashes on some VHDL-2008 generics.  The tree doesn't need them.
+                retry = self._worker({**request, "objects": False})
+                if retry.returncode == 0:
+                    proc = retry
+                    notes.append(f"{top}: couldn't read generics, so SV modules below it use their defaults")
         except subprocess.TimeoutExpired:
             return Elaboration(errors=[f"ghdl: elaborating {top} timed out after {_TIMEOUT_S} s"])
         file_deps: dict[str, list[str]] = {}
@@ -329,6 +434,8 @@ class GhdlFrontend:
             else:
                 body.append(line)
         if proc.returncode != 0:
-            detail = [ln for ln in proc.stderr.splitlines() if ":error:" in ln or "raised " in ln]
+            detail = [ln for ln in proc.stderr.splitlines() if ":error:" in ln or ln.startswith("error:") or "raised " in ln]
             return Elaboration(errors=[f"ghdl: {top}: {d}" for d in detail] or [f"ghdl: {top}: worker exited with code {proc.returncode}"])
-        return Elaboration(defs=tree_to_defs(parse_tree("\n".join(body)), self._units), file_deps=file_deps)
+        # Of several files defining a name, the design used the one in its dependencies.
+        located = {name: next((p for p in paths if p in file_deps), paths[0]) for name, paths in self._definers.items()}
+        return Elaboration(defs=tree_to_defs(parse_tree("\n".join(body)), located), file_deps=file_deps, notes=notes)

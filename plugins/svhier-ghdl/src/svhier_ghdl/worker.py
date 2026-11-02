@@ -17,8 +17,8 @@ import sys
 from ctypes import c_bool, c_int32, c_void_p
 
 import pyGHDL.libghdl as lg
-from pyGHDL.libghdl import errorout_console, files_map, flags, libghdl, name_table
-from pyGHDL.libghdl.utils import list_iter
+from pyGHDL.libghdl import errorout_console, files_map, flags, libghdl, libraries, name_table
+from pyGHDL.libghdl.utils import list_iter, nodes_iter
 from pyGHDL.libghdl.vhdl import nodes, sem_lib
 
 _MARKER = "@@svhier-order "
@@ -56,31 +56,96 @@ def _setup(std: str, work: str) -> None:
         raise RuntimeError("libghdl failed to initialize")
 
 
-def _load(files: list[str]) -> dict[str, str]:
-    """Add *files* to the library without analyzing them, so their order doesn't matter.
+def _name(identifier: int) -> str:
+    return name_table.Get_Name_Ptr(identifier).lower()
 
-    Returns ``{lowercase entity name: file}``.  Dates rise in load order, because an
-    instance with no explicit architecture binds to the most recently analyzed one.
+
+def _design_units(path: str):
+    """Parse *path* without analyzing it, and yield its design units."""
+    sfe = files_map.Read_Source_File(name_table.Null_Identifier, name_table.Get_Identifier(path))
+    unit = nodes.Get_First_Design_Unit(sem_lib.Load_File(sfe))
+    while unit:
+        following = nodes.Get_Chain(unit)
+        yield unit
+        unit = following
+
+
+def _collect_refs(root: int, refs: set[tuple[str, str]]) -> None:
+    """Add every ``prefix.name`` below *root*.  Without analysis, it may not be a library.
+
+    A component declaration counts as ``work.name``: GHDL binds a component by default to the
+    entity of that name in the library declaring the component, not the one instantiating it.
+    Instances can't be used for this anyway, since ``u : name;`` parses as a procedure call.
     """
-    add_unit = _bind("libraries__add_design_unit_into_library", None, c_int32, c_bool)
-    entities: dict[str, str] = {}
-    date = _FIRST_DATE
+    for node in nodes_iter(root):
+        kind = nodes.Get_Kind(node)
+        if kind == nodes.Iir_Kind.Selected_Name:
+            prefix = nodes.Get_Prefix(node)
+            if nodes.Get_Kind(prefix) == nodes.Iir_Kind.Simple_Name:
+                refs.add((_name(nodes.Get_Identifier(prefix)), _name(nodes.Get_Identifier(node))))
+        elif kind == nodes.Iir_Kind.Component_Declaration:
+            refs.add(("work", _name(nodes.Get_Identifier(node))))
+
+
+def _scan(files: list[str]) -> dict[str, dict]:
+    """Report what each file defines and references, for choosing its library."""
+    kinds = nodes.Iir_Kind
+    primary = (kinds.Entity_Declaration, kinds.Package_Declaration, kinds.Package_Instantiation_Declaration,
+               kinds.Configuration_Declaration, kinds.Context_Declaration)
+    result: dict[str, dict] = {}
     for path in files:
-        sfe = files_map.Read_Source_File(name_table.Null_Identifier, name_table.Get_Identifier(path))
-        unit = nodes.Get_First_Design_Unit(sem_lib.Load_File(sfe))
-        while unit:
-            following = nodes.Get_Chain(unit)
-            nodes.Set_Chain(unit, 0)
+        entry = {"units": [], "entities": [], "arch_of": [], "libs": []}
+        refs: set[tuple[str, str]] = set()
+        for unit in _design_units(path):
+            item = nodes.Get_Context_Items(unit)
+            while item:
+                if nodes.Get_Kind(item) == kinds.Library_Clause:
+                    entry["libs"].append(_name(nodes.Get_Identifier(item)))
+                else:
+                    _collect_refs(item, refs)
+                item = nodes.Get_Chain(item)
             library_unit = nodes.Get_Library_Unit(unit)
             kind = nodes.Get_Kind(library_unit)
-            if kind == nodes.Iir_Kind.Entity_Declaration:
-                entities[name_table.Get_Name_Ptr(nodes.Get_Identifier(library_unit)).lower()] = path
+            if kind in primary:
+                entry["units"].append(_name(nodes.Get_Identifier(library_unit)))
+            if kind == kinds.Entity_Declaration:
+                entry["entities"].append(_name(nodes.Get_Identifier(library_unit)))
+            elif kind == kinds.Package_Body:
+                entry["arch_of"].append(_name(nodes.Get_Identifier(library_unit)))
+            elif kind in (kinds.Architecture_Body, kinds.Configuration_Declaration):
+                entity = nodes.Get_Entity_Name(library_unit)
+                if nodes.Get_Kind(entity) == kinds.Simple_Name:
+                    entry["arch_of"].append(_name(nodes.Get_Identifier(entity)))
+            _collect_refs(library_unit, refs)
+        entry["refs"] = sorted(refs)
+        result[path] = entry
+    return result
+
+
+def _load(files: list[str], assigned: dict[str, str], work: str) -> None:
+    """Add *files* to their libraries without analyzing them, so their order doesn't matter.
+
+    Dates rise in load order, because an instance with no explicit architecture binds to the
+    most recently analyzed one.  Loading uses the current work library, and analysis later
+    takes ``work`` to mean the library of the file being analyzed.
+    """
+    default = libraries.Work_Library.value
+    add_unit = _bind("libraries__add_design_unit_into_library", None, c_int32, c_bool)
+    date = _FIRST_DATE
+    for path in files:
+        name = assigned.get(path, work)
+        # GHDL answers the work library's own name with whichever library is current, so that
+        # one can't be looked up.  Force: create the others, since they only exist in memory.
+        libraries.Work_Library.value = (
+            default if name == work else libraries.Get_Library(name_table.Get_Identifier(name), libraries.Library_Location.value, True))
+        for unit in _design_units(path):
+            nodes.Set_Chain(unit, 0)
+            kind = nodes.Get_Kind(nodes.Get_Library_Unit(unit))
             add_unit(unit, False)
             if kind == nodes.Iir_Kind.Architecture_Body:
                 date += 1
                 nodes.Set_Date(unit, date)
-            unit = following
-    return entities
+    libraries.Work_Library.value = default
 
 
 def _ada_string(text: str, keep: list):
@@ -114,8 +179,29 @@ def _file_deps(known: set[str]) -> dict[str, list[str]]:
     return deps
 
 
-def _elaborate(top: str, work: str, generics: dict[str, str], files: list[str]) -> int:
-    """Elaborate *top*; print the file dependencies, then libghdl's hierarchy, to stdout."""
+def _strip_declarations() -> None:
+    """Remove declarations, so printing objects only covers interfaces such as generics.
+
+    ``Disp_Hierarchy`` stops with an internal error on declarations it can't print, such as a
+    configuration specification.  Only printing is left to do, so nothing needs them anymore.
+    """
+    kinds = nodes.Iir_Kind
+    holders = (kinds.Entity_Declaration, kinds.Architecture_Body, kinds.Block_Statement, kinds.Generate_Statement_Body,
+               kinds.Process_Statement, kinds.Sensitized_Process_Statement)
+    last = _bind("vhdl__configuration__design_units__last", c_int32)()
+    table = ctypes.cast(c_void_p.in_dll(libghdl, "vhdl__configuration__design_units__t"), ctypes.POINTER(c_int32))
+    found: list[int] = []
+    for index in range(last):
+        library_unit = nodes.Get_Library_Unit(table[index])
+        if nodes.Get_Kind(library_unit) in (kinds.Entity_Declaration, kinds.Architecture_Body):
+            found.extend(n for n in nodes_iter(library_unit) if nodes.Get_Kind(n) in holders)
+    for node in found:
+        nodes.Set_Declaration_Chain(node, 0)
+
+
+def _elaborate(request: dict) -> int:
+    """Elaborate the top; print the file dependencies, then libghdl's hierarchy, to stdout."""
+    top, generics, files = request["top"], request["generics"], request["files"]
     add_override = _bind("vhdl__configuration__add_generic_override", None)
     add_override.argtypes = None
     keep: list = []
@@ -124,7 +210,7 @@ def _elaborate(top: str, work: str, generics: dict[str, str], files: list[str]) 
 
     config = _bind("vhdl__configuration__configure", c_int32, c_int32, c_int32, c_int32)(
         # GHDL's name table holds basic identifiers in lowercase.
-        name_table.Get_Identifier(work.lower()), name_table.Get_Identifier(top.lower()), 0)
+        name_table.Get_Identifier(request["top_library"].lower()), name_table.Get_Identifier(top.lower()), 0)
     if not config or _error_count():
         return 3
     entity = _bind("vhdl__utils__get_entity_from_configuration", c_int32, c_int32)(config)
@@ -137,20 +223,22 @@ def _elaborate(top: str, work: str, generics: dict[str, str], files: list[str]) 
         return 5
 
     print(_MARKER + json.dumps(_file_deps(set(files))), flush=True)
+    if request["objects"]:
+        _strip_declarations()
     # recurse, with_objs: the objects include the evaluated generics of each instance.
-    _bind("elab__vhdl_debug__disp_hierarchy", None, c_void_p, c_bool, c_bool)(instance, True, True)
+    _bind("elab__vhdl_debug__disp_hierarchy", None, c_void_p, c_bool, c_bool)(instance, True, request["objects"])
     return 0
 
 
 def main() -> int:
-    """Read a JSON request from argv: ``{op, files, std, work, top, generics}``."""
+    """Read a JSON request from argv: ``{op, files, std, work, top, top_library, generics, libraries, objects}``."""
     request = json.loads(sys.argv[1])
     _setup(request["std"], request["work"])
-    entities = _load(request["files"])
-    if request["op"] == "units":
-        print(_MARKER + json.dumps(entities), flush=True)
+    if request["op"] == "scan":
+        print(_MARKER + json.dumps(_scan(request["files"])), flush=True)
         return 0
-    return _elaborate(request["top"], request["work"], request["generics"], request["files"])
+    _load(request["files"], request["libraries"], request["work"].lower())
+    return _elaborate(request)
 
 
 if __name__ == "__main__":
