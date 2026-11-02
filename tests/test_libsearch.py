@@ -57,6 +57,17 @@ def test_libdir_pulls_in_only_needed_files(design, monkeypatch, capsys):
     assert f"+incdir+{design / 'lib' / 'cells' / 'inc'}" in filelist
 
 
+def test_top_limits_what_is_pulled_in(design, monkeypatch, capsys):
+    """A module outside --top's tree must not pull library files in, or list them as pulled."""
+    (design / "src" / "orphan.sv").write_text("module orphan;\n  unused u_unused ();\nendmodule\n")
+    monkeypatch.setattr("sys.argv", [
+        "svhier", str(design / "src"), "-y", str(design / "lib"), "--top", "top", "--no-tree"])
+    main()
+    err = capsys.readouterr().err
+    assert "Pulled in from -y" in err and "mid" in err
+    assert "unused" not in err
+
+
 def test_options_and_paths_can_be_intermixed(design, monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", [
         "svhier", "-y", str(design / "lib"), str(design / "src"), "--no-tree", str(design / "src" / "top.sv")])
