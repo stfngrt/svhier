@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from svhier_ghdl import parse_tree, to_literal, tree_to_defs
+from svhier_ghdl import GhdlFrontend, parse_tree, to_literal, tree_to_defs
 
 GENERICS = Path(__file__).parent / "generics"
 needs_ghdl = pytest.mark.skipif(importlib.util.find_spec("pyGHDL") is None, reason="pyGHDL is not installed")
@@ -199,3 +199,117 @@ def test_without_top_a_module_vhdl_sets_is_not_also_shown_with_its_default():
     proc = _svhier(".", "--tree")
     assert "on.u_on (sv_leaf)" in proc.stdout
     assert "off.u_off" not in proc.stdout
+
+
+_AWKWARD_DECLARATIONS = """\
+library ieee; use ieee.std_logic_1164.all;
+entity real_one is generic (W : integer := 1); port (y : in std_logic := '0'); end entity;
+architecture a of real_one is begin end architecture;
+
+library ieee; use ieee.std_logic_1164.all;
+entity awk_top is generic (N : integer := 2); end entity;
+architecture a of awk_top is
+  type rec_t is record a : integer; end record;
+  type ptr_t is access integer;
+  type int_file_t is file of integer;
+  file f_out : int_file_t;
+  signal s : std_logic bus;
+  disconnect s : std_logic after 1 ns;
+  alias s_alias : std_logic is s;
+  attribute keep : string;
+  attribute keep of s : signal is "true";
+  group g_t is (signal <>);
+  function f (x : integer) return integer is begin return x; end function;
+  component shown is generic (W : integer); port (x : in std_logic); end component;
+  component sv_after is generic (COUNT : integer); end component;
+  for u_s : shown use entity work.real_one generic map (W => W) port map (y => x);
+begin
+  u_s : shown generic map (W => 2) port map (x => s);
+  blk : block
+    for u_b : shown use entity work.real_one generic map (W => W) port map (y => x);
+  begin
+    u_b : shown generic map (W => 3) port map (x => s);
+  end block;
+  gen : for i in 0 to 0 generate
+    for u_g : shown use entity work.real_one generic map (W => W) port map (y => x);
+  begin
+    u_g : shown generic map (W => 4) port map (x => s);
+  end generate;
+  p : process
+    variable v : integer := f(1);
+  begin
+    wait;
+  end process;
+  u_after : sv_after generic map (COUNT => N);
+end architecture;
+"""
+
+
+@needs_ghdl
+def test_declarations_ghdl_cannot_print_do_not_stop_generics_being_read(tmp_path):
+    (tmp_path / "awk.vhd").write_text(_AWKWARD_DECLARATIONS)
+    (tmp_path / "sv_after.sv").write_text(
+        "module sv_after #(parameter int COUNT) (); for (genvar i = 0; i < COUNT; i++) begin : g leaf u (); end endmodule\nmodule leaf; endmodule\n")
+    proc = subprocess.run([sys.executable, "-c", "from svhier.cli import main; main()", ".", "--top", "awk_top", "--tree", "-E"],
+                          capture_output=True, text=True, cwd=tmp_path, check=False)
+    assert proc.returncode == 0, proc.stderr
+    for line in ("u_s (real_one)", "blk.u_b (real_one)", "gen[0].u_g (real_one)", "u_after (sv_after)", "g[1].u (leaf)"):
+        assert line in proc.stdout
+    assert "couldn't read" not in " ".join(proc.stderr.split())
+
+
+@needs_ghdl
+def test_vhdl_2008_generic_types_and_subprograms_do_not_break_the_tree(tmp_path):
+    (tmp_path / "g.vhd").write_text("""\
+entity gen_ent is
+  generic (type t; function f (x : t) return t; W : integer := 1);
+end entity;
+architecture a of gen_ent is begin end architecture;
+
+entity g_top is end entity;
+architecture a of g_top is
+  function same (x : integer) return integer is begin return x; end function;
+  component sv_after is generic (COUNT : integer); end component;
+begin
+  u_gen : entity work.gen_ent generic map (t => integer, f => same, W => 2);
+  u_after : sv_after generic map (COUNT => 1);
+end architecture;
+""")
+    (tmp_path / "sv_after.sv").write_text("module sv_after #(parameter int COUNT) (); endmodule\n")
+    proc = subprocess.run([sys.executable, "-c", "from svhier.cli import main; main()", ".", "--top", "g_top", "--tree", "-E"],
+                          capture_output=True, text=True, cwd=tmp_path, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "u_gen (gen_ent)" in proc.stdout
+    assert "u_after (sv_after)" in proc.stdout
+    assert "g_top: couldn't read generics" in " ".join(proc.stderr.split())
+
+
+def test_a_crash_while_printing_objects_keeps_the_tree_and_is_noted(monkeypatch):
+    frontend = GhdlFrontend()
+    calls = []
+
+    def fake_worker(request):
+        calls.append(request["objects"])
+        if request["objects"]:
+            return subprocess.CompletedProcess([], 1, "", "raised TYPES.INTERNAL_ERROR : vhdl-errors.adb:30\n")
+        return subprocess.CompletedProcess([], 0, "architecture a of top\n  u_sv: component sv_m [not bound]\n", "")
+
+    monkeypatch.setattr(frontend, "_worker", fake_worker)
+    result = frontend.elaborate_one(["t.vhd"], "top", {})
+    assert calls == [True, False]
+    assert not result.errors
+    assert result.defs[0].insts == [{"mod_name": "sv_m", "inst_name": "u_sv"}]
+    assert result.notes == ["top: couldn't read generics, so SV modules below it use their defaults"]
+
+
+def test_a_design_error_is_not_retried_without_objects(monkeypatch):
+    frontend = GhdlFrontend()
+    calls = []
+
+    def fake_worker(request):
+        calls.append(request["objects"])
+        return subprocess.CompletedProcess([], 3, "", "t.vhd:1:1:error: nope\n")
+
+    monkeypatch.setattr(frontend, "_worker", fake_worker)
+    assert frontend.elaborate_one(["t.vhd"], "top", {}).errors == ["ghdl: top: t.vhd:1:1:error: nope"]
+    assert calls == [True]
