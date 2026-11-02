@@ -1,31 +1,32 @@
-"""Tests for CLI helpers: collect_sv_files, collect_inc_dirs, _write_filelist."""
+"""Tests for CLI helpers: collect_source_files, collect_inc_dirs, _write_filelist."""
 
 from pathlib import Path
 
-from svhier.cli import collect_sv_files, _write_filelist, main
+from svhier.cli import collect_source_files, _write_filelist, main
 from svhier.slang_frontend import collect_inc_dirs
 
+SV_SUFFIXES = (".sv", ".v")
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 INCLUDE_DIR = VERILOG_DIR / "include"
 
 
 # ---------------------------------------------------------------------------
-# collect_sv_files
+# collect_source_files
 # ---------------------------------------------------------------------------
 
-def test_collect_sv_files_single_file():
+def test_collect_source_files_single_file():
     path = str(VERILOG_DIR / "simple.sv")
-    assert collect_sv_files([path], recursive=False) == [path]
+    assert collect_source_files([path], recursive=False, suffixes=SV_SUFFIXES) == [path]
 
 
-def test_collect_sv_files_picks_up_v_files():
+def test_collect_source_files_picks_up_v_files():
     path = str(VERILOG_DIR / "legacy.v")
-    result = collect_sv_files([path], recursive=False)
+    result = collect_source_files([path], recursive=False, suffixes=SV_SUFFIXES)
     assert path in result
 
 
-def test_collect_sv_files_directory_non_recursive():
-    result = collect_sv_files([str(VERILOG_DIR)], recursive=False)
+def test_collect_source_files_directory_non_recursive():
+    result = collect_source_files([str(VERILOG_DIR)], recursive=False, suffixes=SV_SUFFIXES)
     names = [Path(f).name for f in result]
     assert "simple.sv" in names
     assert "legacy.v" in names
@@ -33,15 +34,15 @@ def test_collect_sv_files_directory_non_recursive():
     assert "tb_top.sv" not in names
 
 
-def test_collect_sv_files_directory_recursive():
-    result = collect_sv_files([str(VERILOG_DIR)], recursive=True)
+def test_collect_source_files_directory_recursive():
+    result = collect_source_files([str(VERILOG_DIR)], recursive=True, suffixes=SV_SUFFIXES)
     names = [Path(f).name for f in result]
     assert "tb_top.sv" in names
 
 
-def test_collect_sv_files_deduplicates():
+def test_collect_source_files_deduplicates():
     path = str(VERILOG_DIR / "simple.sv")
-    result = collect_sv_files([path, path], recursive=False)
+    result = collect_source_files([path, path], recursive=False, suffixes=SV_SUFFIXES)
     assert result.count(path) == 1
 
 

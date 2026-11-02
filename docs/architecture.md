@@ -40,6 +40,30 @@ as it is. With several, stitching repeats this until nothing changes:
 2. Each unresolved name becomes a root of the plugin that defines it. If no source
    defines it, core asks the other plugins to `provide` it from `-y`.
 
+### How a plugin is built
+
+Both plugins have the same parts, and the frontend's constructor takes them with
+defaults, because the entry point calls it with no arguments:
+
+| Part | slang | GHDL |
+|------|-------|------|
+| Frontend | `svhier.slang_frontend.SlangFrontend` | `svhier_ghdl.GhdlFrontend` |
+| `tool`: the only code that touches the language tool | `PyslangTool`, which imports `svhier.parser` when it runs | `GhdlWorkerTool`, which runs `svhier_ghdl.worker` in a child process |
+| `library_factory`: what `-y` holds | `svhier.libsearch.LibraryIndex` | `svhier_ghdl.VhdlLibrary` |
+
+Both frontends use the same method names: `units` caches `_read_units`, `provide`
+adds a `-y` file, and `elaborate` ends in `_fragment`. A
+{class}`~svhier.libsearch.LibrarySearch` pulls files from either kind of library and
+records them for the "Pulled in from -y" table. Tests can inject a stand-in tool, so a
+frontend's logic runs without pyslang or GHDL.
+
+The tools differ where the languages do. GHDL needs a child process because libghdl
+keeps global state and can abort the process, and it needs one worker run per top
+because of that state. slang runs in-process, with one compilation per parameter
+setting.
+
+### `-y`
+
 `-y` is the one language-specific search in core's options, because a directory can
 hold several languages and an instance in one can need a file in another. Each
 plugin indexes the directories for its own file types. `units` must not search
@@ -103,7 +127,7 @@ files the tops need (it follows module, interface, package and class references)
 
 ```{eval-rst}
 .. automodule:: svhier.libsearch
-   :members: LibraryIndex, resolve_missing
+   :members: Library, LibrarySearch, LibraryIndex, resolve_missing
 ```
 
 The slang plugin calls {func}`~svhier.libsearch.resolve_missing` after each parse and re-parses
@@ -117,13 +141,13 @@ is cheap to build; slang still does the real parse of whatever gets pulled in.
 .. autosummary::
    :nosignatures:
 
-   svhier.cli.collect_sv_files
+   svhier.cli.collect_source_files
    svhier.slang_frontend.collect_inc_dirs
    svhier.cli.main
 ```
 
 ```{eval-rst}
-.. autofunction:: svhier.cli.collect_sv_files
+.. autofunction:: svhier.cli.collect_source_files
 ```
 
 ```{eval-rst}
