@@ -25,8 +25,8 @@ class FakeFrontend:
     def unavailable_reason(self) -> str | None:
         return None
 
-    def has_inputs(self, files: list[str]) -> bool:
-        return bool(files)
+    def extra_inputs(self) -> list[str]:
+        return []
 
     def units(self, files: list[str]) -> dict[str, str]:
         return {n.lower(): file for n, (file, _) in self.table.items()}

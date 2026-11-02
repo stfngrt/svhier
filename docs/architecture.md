@@ -84,7 +84,7 @@ is cheap to build; slang still does the real parse of whatever gets pulled in.
    :nosignatures:
 
    svhier.cli.collect_sv_files
-   svhier.cli.collect_inc_dirs
+   svhier.slang_frontend.collect_inc_dirs
    svhier.cli.main
 ```
 
@@ -93,7 +93,7 @@ is cheap to build; slang still does the real parse of whatever gets pulled in.
 ```
 
 ```{eval-rst}
-.. autofunction:: svhier.cli.collect_inc_dirs
+.. autofunction:: svhier.slang_frontend.collect_inc_dirs
 ```
 
 ```{eval-rst}

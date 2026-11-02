@@ -6,13 +6,93 @@
 Imports pyslang only when it runs, through :mod:`svhier.parser`, so svhier starts without it.
 """
 
+import argparse
 import importlib.util
+import re
+from pathlib import Path
 
 from svhier.frontends import Request, Root, empty_fragment
-from svhier.libsearch import LibraryIndex, resolve_missing
+from svhier.libsearch import LibraryIndex, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
 _MAX_LIB_ROUNDS = 20
+
+
+_INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
+
+
+def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
+    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
+
+    For every include path with a directory component, each known header whose path
+    ends with that include path contributes the directory it must be resolved from,
+    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
+    """
+    by_name: dict[str, list[Path]] = {}
+    for hdr in headers:
+        by_name.setdefault(hdr.name, []).append(hdr)
+
+    bases: list[Path] = []
+    for src in sources:
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for inc in _INCLUDE_RE.findall(text):
+            parts = Path(inc).parts
+            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
+                continue
+            for hdr in by_name.get(parts[-1], []):
+                if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
+                    bases.append(hdr.parents[len(parts) - 1])
+    return bases
+
+
+def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
+    """Return include directories for the ``.svh``/``.vh`` header files under *paths*.
+
+    The result is passed to slang as `` `include`` search paths and written as
+    ``+incdir+<dir>`` lines at the top of the generated filelist, which is the
+    format expected by VCS, Questa, and Xcelium.
+
+    Every directory that contains a header is returned.  In addition, when a source
+    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
+    the directory that include path is relative to is returned too.
+
+    For directory inputs the search respects the *recursive* flag.
+    For explicit file inputs the parent directory is checked for headers.
+    Directories are returned in discovery order, deduplicated.
+    """
+    ign = ignore or set()
+    headers: list[Path] = []
+    sources: list[Path] = []
+
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            headers.extend(glob_files(p, recursive, ("*.svh", "*.vh"), ign))
+            sources.extend(glob_files(p, recursive, ("*.sv", "*.v"), ign))
+        elif p.is_file() and not is_ignored(p, ign):
+            sources.append(p)
+            headers.extend(glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
+
+    seen: set[Path] = set()
+    result: list[str] = []
+    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
+        resolved = d.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(str(d))
+    return result
+
+
+class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-methods
+    """Collect ``-f``/``-F`` options as ``(flag, path)`` pairs, in command-line order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        items = list(getattr(namespace, self.dest) or [])
+        items.append((option_string, values))
+        setattr(namespace, self.dest, items)
 
 
 def _add_unique(target: list, items: list) -> None:
@@ -81,13 +161,41 @@ class SlangFrontend:
         self._modules: dict[str, tuple[str, list[str]]] = {}
 
     def add_arguments(self, parser) -> None:
-        """The SV options still live in the CLI's parser (spike shortcut)."""
+        """Add the SystemVerilog options."""
+        group = parser.add_argument_group("SystemVerilog (slang)")
+        group.add_argument(
+            "-f", "-F",
+            action=_CommandFileAction,
+            metavar="FILE",
+            dest="command_files",
+            default=[],
+            help="Read sources and options from a command file (filelist). Supports +incdir+, +define+, "
+                 "nested -f/-F and ${VAR} environment variables. With -F, paths inside FILE are relative to FILE. "
+                 "Repeatable.",
+        )
+        group.add_argument(
+            "-I", "--include-dir",
+            action="append",
+            metavar="DIR",
+            default=[],
+            dest="include_dirs",
+            help="Add a directory to search for include files. Repeatable.",
+        )
+        group.add_argument(
+            "-D", "--define",
+            action="append",
+            metavar="NAME[=VALUE]",
+            default=[],
+            dest="defines",
+            help="Define a preprocessor macro. Repeatable.",
+        )
 
     def configure(self, args) -> None:
         """Read the SV options."""
         ignore = {n.lower() for n in args.ignore} if args.ignore else set()
         self.defines = args.defines
-        self.inc_dirs = list(args.include_dirs)
+        found = collect_inc_dirs(args.paths, args.recursive, ignore)
+        self.inc_dirs = list(dict.fromkeys(args.include_dirs + found))
         self.command_files = args.command_files
         self.index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
 
@@ -95,9 +203,9 @@ class SlangFrontend:
         """Report if pyslang is missing."""
         return None if importlib.util.find_spec("pyslang") else "pyslang is not installed"
 
-    def has_inputs(self, files: list[str]) -> bool:
-        """Command files count as inputs too."""
-        return bool(files or self.command_files)
+    def extra_inputs(self) -> list[str]:
+        """Command files are inputs too."""
+        return [f"{len(self.command_files)} command file(s)"] if self.command_files else []
 
     def _parse(self, files: list[str], tops: list[str], params: dict[str, str] | None = None) -> dict:
         """Parse, then pull missing definitions from ``-y`` until nothing new resolves.
@@ -208,7 +316,7 @@ class SlangFrontend:
 
     def elaborate(self, files: list[str], request: Request) -> dict:
         """Elaborate the roots, using the parameter values that come with them."""
-        if not self.has_inputs(files) or not (request.roots or request.auto):
+        if not (files or self.command_files) or not (request.roots or request.auto):
             return empty_fragment()  # --top names only other languages' units so far
         if any(not r.requested for r in request.roots):
             self.units(files)  # To match the names and values other languages use.

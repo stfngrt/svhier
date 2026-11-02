@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-from svhier.cli import collect_inc_dirs, collect_sv_files, _write_filelist, main
+from svhier.cli import collect_sv_files, _write_filelist, main
+from svhier.slang_frontend import collect_inc_dirs
 
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 INCLUDE_DIR = VERILOG_DIR / "include"

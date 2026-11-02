@@ -4,7 +4,6 @@
 """Command-line interface for svhier: parse SV hierarchies and emit YAML."""
 
 import argparse
-import re
 import sys
 from io import StringIO
 from pathlib import Path
@@ -18,6 +17,7 @@ from ruamel.yaml import YAML
 
 from svhier.filelist import compute_filelist
 from svhier.frontends import KNOWN_SUFFIXES, Frontend, discover_frontends, stitch
+from svhier.libsearch import glob_files, is_ignored
 
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
 _err = Console(stderr=True)
@@ -44,10 +44,6 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
     return {"files": files}
 
 
-def _is_ignored(p: Path, ignore: set[str]) -> bool:
-    return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
-
-
 def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
     """Expand a mix of ``.sv``/``.v`` files and directories into a deduplicated file list.
 
@@ -61,12 +57,12 @@ def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None 
     for raw in paths:
         p = Path(raw)
         if p.is_file():
-            if not _is_ignored(p, ign):
+            if not is_ignored(p, ign):
                 result.append(p)
         elif p.is_dir():
             prefix = "**/" if recursive else ""
             for ext in ("*.sv", "*.v"):
-                result.extend(f for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ign))
+                result.extend(f for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, ign))
         else:
             _err.print(f"[yellow]warning:[/yellow] {raw!r} is not a file or directory, skipping")
     seen: set[Path] = set()
@@ -77,79 +73,6 @@ def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None 
             seen.add(resolved)
             unique.append(str(p))
     return unique
-
-
-_INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
-
-
-def _glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
-    prefix = "**/" if recursive else ""
-    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ignore)]
-
-
-def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
-    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
-
-    For every include path with a directory component, each known header whose path
-    ends with that include path contributes the directory it must be resolved from,
-    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
-    """
-    by_name: dict[str, list[Path]] = {}
-    for hdr in headers:
-        by_name.setdefault(hdr.name, []).append(hdr)
-
-    bases: list[Path] = []
-    for src in sources:
-        try:
-            text = src.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for inc in _INCLUDE_RE.findall(text):
-            parts = Path(inc).parts
-            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
-                continue
-            for hdr in by_name.get(parts[-1], []):
-                if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
-                    bases.append(hdr.parents[len(parts) - 1])
-    return bases
-
-
-def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
-    """Return include directories for the ``.svh``/``.vh`` header files under *paths*.
-
-    The result is passed to slang as `` `include`` search paths and written as
-    ``+incdir+<dir>`` lines at the top of the generated filelist, which is the
-    format expected by VCS, Questa, and Xcelium.
-
-    Every directory that contains a header is returned.  In addition, when a source
-    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
-    the directory that include path is relative to is returned too.
-
-    For directory inputs the search respects the *recursive* flag.
-    For explicit file inputs the parent directory is checked for headers.
-    Directories are returned in discovery order, deduplicated.
-    """
-    ign = ignore or set()
-    headers: list[Path] = []
-    sources: list[Path] = []
-
-    for raw in paths:
-        p = Path(raw)
-        if p.is_dir():
-            headers.extend(_glob_files(p, recursive, ("*.svh", "*.vh"), ign))
-            sources.extend(_glob_files(p, recursive, ("*.sv", "*.v"), ign))
-        elif p.is_file() and not _is_ignored(p, ign):
-            sources.append(p)
-            headers.extend(_glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
-
-    seen: set[Path] = set()
-    result: list[str] = []
-    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
-        resolved = d.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            result.append(str(d))
-    return result
 
 
 def _print_summary(hierarchy: dict) -> None:
@@ -345,17 +268,13 @@ def _write_filelist(ordered: list[str], inc_dirs: list[str], dest: str, defines:
     _write_to("\n".join(lines), dest, f"filelist ({len(ordered)} files)")
 
 
-class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-methods
-    """Collect ``-f``/``-F`` options as ``(flag, path)`` pairs, in command-line order."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        items = list(getattr(namespace, self.dest) or [])
-        items.append((option_string, values))
-        setattr(namespace, self.dest, items)
-
-
 def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentParser:
-    """Return the argument parser for the ``svhier`` CLI, with options from *frontends*."""
+    """Return the argument parser for the ``svhier`` CLI, with options from *frontends*.
+
+    Without *frontends*, uses the installed ones, so the docs show the bundled plugin's options.
+    """
+    if frontends is None:
+        frontends = discover_frontends()
     parser = argparse.ArgumentParser(
         prog="svhier",
         description="Show the module hierarchy of SystemVerilog sources, report what is missing, "
@@ -365,34 +284,7 @@ def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentP
         "paths",
         nargs="*",
         metavar="PATH",
-        help=".sv/.v files or directories containing .sv/.v files.",
-    )
-    parser.add_argument(
-        "-f",
-        "-F",
-        action=_CommandFileAction,
-        metavar="FILE",
-        dest="command_files",
-        default=[],
-        help="Read sources and options from a command file (filelist). Supports +incdir+, +define+, "
-             "nested -f/-F and ${VAR} environment variables. With -F, paths inside FILE are relative to FILE. "
-             "Repeatable.",
-    )
-    parser.add_argument(
-        "-I", "--include-dir",
-        action="append",
-        metavar="DIR",
-        default=[],
-        dest="include_dirs",
-        help="Add a directory to search for include files. Repeatable.",
-    )
-    parser.add_argument(
-        "-D", "--define",
-        action="append",
-        metavar="NAME[=VALUE]",
-        default=[],
-        dest="defines",
-        help="Define a preprocessor macro. Repeatable.",
+        help="Source files, or directories containing them.",
     )
     parser.add_argument(
         "-r", "--recursive",
@@ -464,10 +356,10 @@ def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentP
         metavar="DIR",
         default=None,
         dest="libdirs",
-        help="Library directory, searched recursively. Only files defining otherwise missing "
-             "modules, interfaces or packages (and dirs of missing includes) are pulled in. Repeatable.",
+        help="Library directory, searched recursively by every language plugin. Only files defining "
+             "what is otherwise missing (and dirs of missing includes) are pulled in. Repeatable.",
     )
-    for frontend in frontends or []:
+    for frontend in frontends:
         frontend.add_arguments(parser)
     return parser
 
@@ -485,10 +377,9 @@ def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
 
 
 def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[str]) -> list[tuple[Frontend, list[str]]]:
-    """Return ``(frontend, files)`` for each frontend with inputs; warn about files nothing can read."""
+    """Return ``(frontend, files)`` for each usable frontend with inputs; warn about files nothing can read."""
     usable = []
     for frontend in frontends:
-        frontend.configure(args)
         reason = frontend.unavailable_reason()
         if reason:
             _err.print(f"[yellow]warning:[/yellow] plugin {frontend.name!r} is disabled: {reason}")
@@ -509,11 +400,11 @@ def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[
         have = {Path(f).resolve() for f in routed[id(frontend)]}
         for raw in args.paths:
             if Path(raw).is_dir():
-                for found in _glob_files(Path(raw), args.recursive, tuple(f"*{x}" for x in frontend.suffixes), ignore):
+                for found in glob_files(Path(raw), args.recursive, tuple(f"*{x}" for x in frontend.suffixes), ignore):
                     if found.resolve() not in have:
                         have.add(found.resolve())
                         routed[id(frontend)].append(str(found))
-    return [(f, routed[id(f)]) for f in usable if f.has_inputs(routed[id(f)])]
+    return [(f, routed[id(f)]) for f in usable if routed[id(f)] or f.extra_inputs()]
 
 
 def main():
@@ -526,21 +417,21 @@ def main():
     frontends = discover_frontends(lambda name, exc: _err.print(f"[yellow]warning:[/yellow] plugin {name!r} failed to load: {exc}"))
     parser = _build_parser(frontends)
     args = parser.parse_intermixed_args()
-    if not args.paths and not args.command_files:
-        parser.error("give at least one PATH or -f/-F command file")
+    for frontend in frontends:
+        frontend.configure(args)
+    if not args.paths and not any(f.extra_inputs() for f in frontends):
+        parser.error("give at least one PATH or an input option such as -f (see --help)")
 
     ignore = {n.lower() for n in args.ignore} if args.ignore else set()
     sv_files = collect_sv_files(args.paths, args.recursive, ignore)
-    inc_dirs = _dedupe(args.include_dirs + collect_inc_dirs(args.paths, args.recursive, ignore))
-    args.include_dirs = inc_dirs
     inputs = _route_files(frontends, args, sv_files, ignore)
     if not inputs:
         _err.print("[red]error:[/red] no .sv/.v files found")
         sys.exit(1)
 
+    extras = "".join(f" and [bold cyan]{extra}[/bold cyan]" for f, _ in inputs for extra in f.extra_inputs())
     _err.print(Panel(
-        f"Parsing [bold cyan]{sum(len(files) for _, files in inputs)}[/bold cyan] file(s)"
-        + (f" and [bold cyan]{len(args.command_files)}[/bold cyan] command file(s)" if args.command_files else "") + "…",
+        f"Parsing [bold cyan]{sum(len(files) for _, files in inputs)}[/bold cyan] file(s){extras}…",
         border_style="dim",
         padding=(0, 1),
     ))

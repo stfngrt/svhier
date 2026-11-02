@@ -295,9 +295,9 @@ class GhdlFrontend:
             return f"pyGHDL is not installed; {_INSTALL_HINT}"
         return None
 
-    def has_inputs(self, files: list[str]) -> bool:
+    def extra_inputs(self) -> list[str]:
         """Only files count."""
-        return bool(files)
+        return []
 
     def _worker(self, request: dict) -> subprocess.CompletedProcess:
         spec = importlib.util.find_spec("pyGHDL")
