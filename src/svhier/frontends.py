@@ -69,13 +69,13 @@ class Frontend(Protocol):
         """Add plugin options to the ``svhier`` argument parser."""
 
     def configure(self, args) -> None:
-        """Read the parsed command line."""
+        """Read the parsed command line, including the core's ``paths``, ``recursive``, ``ignore`` and ``libdirs``."""
 
     def unavailable_reason(self) -> str | None:
         """Return why the plugin can't run (for example, tool not installed), or ``None``."""
 
-    def has_inputs(self, files: list[str]) -> bool:
-        """Return whether there is anything to do, counting inputs other than *files*."""
+    def extra_inputs(self) -> list[str]:
+        """Describe inputs other than files, from the plugin's own options, such as ``2 command file(s)``."""
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return ``{lowercase unit name: file}`` for what the inputs define."""

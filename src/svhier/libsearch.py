@@ -19,8 +19,15 @@ _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:auto
 _DEF_KINDS = ("modules", "interfaces", "packages")
 
 
-def _is_ignored(p: Path, ignore: set[str]) -> bool:
+def is_ignored(p: Path, ignore: set[str]) -> bool:
+    """Return whether any component of *p* contains one of the lowercase names in *ignore*."""
     return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
+
+
+def glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
+    """Return the files in directory *p* matching the patterns *exts*, leaving out ignored ones."""
+    prefix = "**/" if recursive else ""
+    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, ignore)]
 
 
 class LibraryIndex:
@@ -34,7 +41,7 @@ class LibraryIndex:
             root = Path(d)
             for ext in ("*.sv", "*.v"):
                 for f in sorted(root.glob(f"**/{ext}")):
-                    if _is_ignored(f, ign):
+                    if is_ignored(f, ign):
                         continue
                     try:
                         text = f.read_text(encoding="utf-8", errors="replace")
@@ -43,7 +50,7 @@ class LibraryIndex:
                     for name in dict.fromkeys(_DEF_RE.findall(text)):
                         self.defs.setdefault(name, []).append(f)
             for ext in ("*.svh", "*.vh"):
-                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not _is_ignored(f, ign))
+                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not is_ignored(f, ign))
 
     @staticmethod
     def _rank(name: str, path: Path) -> tuple:
