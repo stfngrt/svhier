@@ -60,3 +60,21 @@ svhier -r rtl/ -y vendor/ -x xilinx
 `-x` applies to library directories too. Any path with a component that
 contains the given name (case-insensitive) is skipped.
 :::
+
+## Mixed designs
+
+With the [VHDL plugin](vhdl.md), `-y` searches for `.vhd` and `.vhdl` files
+too, and either language can find what the other needs. Only what the design
+needs comes in:
+
+- **An instance with no definition in any source** pulls in the file defining it,
+  whichever language that file is in. Names match in any case, since VHDL's are
+  case-insensitive.
+- **`use lib.pkg.all` and `entity lib.unit`** pull in the units they name, because
+  VHDL can't compile without them.
+- **Architectures and package bodies in their own files** come along if they're
+  in the same directory as the entity or package.
+- **Sources always win.** If a source file in either language defines a name,
+  `-y` isn't searched for it.
+
+With `--top`, modules and entities outside the top's tree don't pull anything in.

@@ -63,6 +63,12 @@ svhier -r rtl/ --yaml hierarchy.yaml             # hierarchy as YAML
 New to it? The [getting started guide](https://stfngrt.github.io/svhier/getting-started.html)
 takes the CVA6 RISC-V core from 300 loose files to a complete hierarchy in four commands.
 
+## Mixed SystemVerilog and VHDL
+
+The optional, experimental `svhier-ghdl` plugin lets one tree cross between
+SystemVerilog and VHDL, using [GHDL](https://github.com/ghdl/ghdl) to elaborate the
+VHDL. See [its guide](https://stfngrt.github.io/svhier/guide/vhdl.html).
+
 ## Documentation
 
 **[stfngrt.github.io/svhier](https://stfngrt.github.io/svhier/)** has the

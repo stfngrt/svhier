@@ -60,6 +60,17 @@ table lists `cva6_config_pkg` (one variant per target in `core/include/`), `risc
 and the hpdcache SRAM wrappers. About 97 slang errors remain, almost all caused by
 those duplicates, not by missing files.
 
+## GHDL plugin
+
+`plugins/svhier-ghdl` is a separate package, and its tests skip themselves without
+pyGHDL. Install steps are in [docs/guide/vhdl.md](docs/guide/vhdl.md). `uv sync`
+removes the plugin, so use `uv run --no-sync` afterwards:
+
+```bash
+uv run --no-sync pytest tests/ plugins/svhier-ghdl/tests/ -v
+uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/
+```
+
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture reference

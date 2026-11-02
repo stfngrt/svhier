@@ -30,6 +30,8 @@ Paths can be files or directories. Directories contribute every `.sv` and
 `.v` file in them, and every subdirectory too with `-r`. Every directory that
 contains `.svh`/`.vh` headers is added to the include path automatically.
 
+With the [VHDL plugin](vhdl.md), `.vhd` and `.vhdl` files count too.
+
 `-x NAME` skips any file or directory with a path component that contains
 `NAME` (case-insensitive). It can be repeated, and applies to library
 directories too:
