@@ -376,8 +376,8 @@ def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
     _err.print(table)
 
 
-def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[str]) -> list[tuple[Frontend, list[str]]]:
-    """Return ``(frontend, files)`` for each usable frontend with inputs; warn about files nothing can read."""
+def _usable_frontends(frontends: list[Frontend]) -> list[Frontend]:
+    """Return the frontends that can run; warn about the others."""
     usable = []
     for frontend in frontends:
         reason = frontend.unavailable_reason()
@@ -385,6 +385,12 @@ def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[
             _err.print(f"[yellow]warning:[/yellow] plugin {frontend.name!r} is disabled: {reason}")
         else:
             usable.append(frontend)
+    return usable
+
+
+def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[str]) -> list[tuple[Frontend, list[str]]]:
+    """Return ``(frontend, files)`` for each usable frontend with inputs; warn about files nothing can read."""
+    usable = _usable_frontends(frontends)
     routed: dict[int, list[str]] = {id(f): [] for f in usable}
     fallback = next((f for f in usable if f.catch_all), None)
     for fname in files:
@@ -408,6 +414,36 @@ def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[
         return []
     # A frontend with only -y still joins in, in case another language instantiates what it finds.
     return [(f, routed[id(f)]) for f in usable if routed[id(f)] or f.extra_inputs() or f.has_library()]
+
+
+def _report(hierarchy: dict, args) -> None:
+    """Print the tables and notes."""
+    _print_diagnostics(hierarchy, errors=args.errors, warnings=args.warnings)
+
+    if args.summary:
+        _print_summary(hierarchy)
+
+    _print_pulled(hierarchy.get("pulled", []))
+    _print_duplicates(hierarchy)
+    _print_missing(hierarchy)
+    for note in hierarchy.get("frontend_notes", []):
+        _err.print(f"[yellow]note:[/yellow] {note}")
+
+
+def _write_outputs(hierarchy: dict, args) -> None:
+    """Print the tree, and write the requested YAML and filelist."""
+    show_tree = args.tree
+    if show_tree is None:
+        show_tree = "-" not in (args.yaml, args.filelist)
+    if show_tree:
+        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
+
+    if args.yaml is not None:
+        _write_yaml(hierarchy, args.yaml)
+
+    if args.filelist is not None:
+        ordered = compute_filelist(hierarchy)
+        _write_filelist(ordered, _dedupe(hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
 
 
 def main():
@@ -448,29 +484,8 @@ def main():
         _err.print(f"[red]error:[/red] {exc}")
         sys.exit(1)
 
-    _print_diagnostics(hierarchy, errors=args.errors, warnings=args.warnings)
-
-    if args.summary:
-        _print_summary(hierarchy)
-
-    _print_pulled(hierarchy.get("pulled", []))
-    _print_duplicates(hierarchy)
-    _print_missing(hierarchy)
-    for note in hierarchy.get("frontend_notes", []):
-        _err.print(f"[yellow]note:[/yellow] {note}")
-
-    show_tree = args.tree
-    if show_tree is None:
-        show_tree = "-" not in (args.yaml, args.filelist)
-    if show_tree:
-        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
-
-    if args.yaml is not None:
-        _write_yaml(hierarchy, args.yaml)
-
-    if args.filelist is not None:
-        ordered = compute_filelist(hierarchy)
-        _write_filelist(ordered, _dedupe(hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
+    _report(hierarchy, args)
+    _write_outputs(hierarchy, args)
 
     if hierarchy["has_errors"]:
         sys.exit(1)
