@@ -71,13 +71,13 @@ jobs:
           docker pull "$image"
           echo "GHDL_IMAGE=$image" >> "$GITHUB_ENV"
           # Tests use the workspace and pytest's directories in /tmp, under the same paths.
-          cat > "$RUNNER_TEMP/ghdl" <<'WRAPPER'
+          cat > "$RUNNER_TEMP/ghdl-docker" <<'WRAPPER'
           #!/bin/sh
           exec docker run --rm -u "$(id -u):$(id -g)" -v /tmp:/tmp \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" "$GHDL_IMAGE" ghdl "$@"
           WRAPPER
-          chmod +x "$RUNNER_TEMP/ghdl"
-          echo "SVHIER_GHDL_BIN=$RUNNER_TEMP/ghdl" >> "$GITHUB_ENV"
+          chmod +x "$RUNNER_TEMP/ghdl-docker"
+          echo "SVHIER_GHDL_BIN=$RUNNER_TEMP/ghdl-docker" >> "$GITHUB_ENV"
 
       # The plugin tests skip themselves without these, so make a missing install fail.
       - name: Check pyGHDL and GHDL are installed
