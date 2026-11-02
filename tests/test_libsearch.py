@@ -79,4 +79,4 @@ def test_any_case_lookup_keeps_exact_lookup_strict(tmp_path):
     (tmp_path / "Top_Cell.sv").write_text("module Top_Cell;\nendmodule\n")
     index = LibraryIndex([str(tmp_path)])
     assert not index.find_definition("top_cell")
-    assert index.find_definition_any_case("top_cell") == [tmp_path / "Top_Cell.sv"]
+    assert index.find("top_cell") == ([tmp_path / "Top_Cell.sv"], 0)

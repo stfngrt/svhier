@@ -11,7 +11,9 @@ are found under.
 """
 
 import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:automatic|static)\s+)?(\w+)", re.M)
 
@@ -28,6 +30,52 @@ def glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]
     """Return the files in directory *p* matching the patterns *exts*, leaving out ignored ones."""
     prefix = "**/" if recursive else ""
     return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, ignore)]
+
+
+class Library(Protocol):
+    """What a language plugin knows about the files under ``-y``."""
+
+    def __bool__(self) -> bool:
+        """Return whether the directories hold anything for this language."""
+
+    def find(self, name: str, scope: str = "") -> tuple[list[Path], int]:
+        """Return the files for *name* in any case, and how many other files also define it.
+
+        *scope* is the library a language refers to it through, if it has such a thing.
+        """
+
+
+LibraryFactory = Callable[[list[str], set[str]], Library]
+
+
+class LibrarySearch:
+    """Pulls files from a :class:`Library` into a compilation, and records what it pulled."""
+
+    def __init__(self, library: Library | None = None) -> None:
+        self.library = library
+        self.pulled: list[tuple[str, Path, int]] = []
+
+    def __bool__(self) -> bool:
+        return bool(self.library)
+
+    def has(self, name: str) -> bool:
+        """Return whether the library defines *name*."""
+        return bool(self.library and self.library.find(name)[0])
+
+    def pull(self, name: str, files: list[str], scope: str = "") -> bool:
+        """Add the files defining *name* to *files*; return whether that added any."""
+        found, others = self.library.find(name, scope) if self.library else ([], 0)
+        have = {Path(f).resolve() for f in files}
+        new = [p for p in found if p.resolve() not in have]
+        if not new:
+            return False
+        files.extend(str(p) for p in new)
+        self.record(name, found[0], others)
+        return True
+
+    def record(self, name: str, path: Path, others: int = 0) -> None:
+        """Note that *path* was pulled in for *name*."""
+        self.pulled.append((name, path, others))
 
 
 class LibraryIndex:
@@ -62,11 +110,15 @@ class LibraryIndex:
         """Return the files defining *name*, best candidate first."""
         return sorted(self.defs.get(name, []), key=lambda p: self._rank(name, p))
 
-    def find_definition_any_case(self, name: str) -> list[Path]:
-        """Like :meth:`find_definition`, for names from case-insensitive languages."""
+    def __bool__(self) -> bool:
+        return bool(self.defs or self.headers)
+
+    def find(self, name: str, scope: str = "") -> tuple[list[Path], int]:  # pylint: disable=unused-argument
+        """Implement :class:`Library`, for names from case-insensitive languages.  SV has no scope."""
         lowered = name.lower()
         spellings = [n for n in self.defs if n.lower() == lowered]
-        return sorted((p for n in spellings for p in self.defs[n]), key=lambda p: self._rank(spellings[0], p))
+        candidates = sorted((p for n in spellings for p in self.defs[n]), key=lambda p: self._rank(spellings[0], p))
+        return candidates[:1], max(len(candidates) - 1, 0)
 
     def find_include_dir(self, include: str) -> Path | None:
         """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if any header matches."""

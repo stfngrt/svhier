@@ -44,13 +44,13 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
     return {"files": files}
 
 
-def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
-    """Expand a mix of ``.sv``/``.v`` files and directories into a deduplicated file list.
+def collect_source_files(paths: list[str], recursive: bool, suffixes: tuple[str, ...], ignore: set[str] | None = None) -> list[str]:
+    """Expand a mix of files and directories into a deduplicated file list.
 
-    Directories are searched for ``*.sv`` and ``*.v`` files; when *recursive* is
-    ``True`` the search descends into subdirectories (``**/``).  Duplicate paths
-    (by resolved canonical path) are silently dropped.  Paths that are neither a
-    file nor a directory emit a warning to stderr and are skipped.
+    Files are kept whatever their suffix.  Directories are searched for files with one of
+    *suffixes*; when *recursive* is ``True`` the search descends into subdirectories.
+    Duplicate paths (by resolved canonical path) are silently dropped.  Paths that are
+    neither a file nor a directory emit a warning to stderr and are skipped.
     """
     ign = ignore or set()
     result: list[Path] = []
@@ -60,9 +60,7 @@ def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None 
             if not is_ignored(p, ign):
                 result.append(p)
         elif p.is_dir():
-            prefix = "**/" if recursive else ""
-            for ext in ("*.sv", "*.v"):
-                result.extend(f for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, ign))
+            result.extend(glob_files(p, recursive, tuple(f"*{suffix}" for suffix in suffixes), ign))
         else:
             _err.print(f"[yellow]warning:[/yellow] {raw!r} is not a file or directory, skipping")
     seen: set[Path] = set()
@@ -101,7 +99,7 @@ def _print_summary(hierarchy: dict) -> None:
 
 
 def _print_diagnostics(hierarchy: dict, *, errors: bool = False, warnings: bool = False) -> None:
-    """Report pyslang diagnostics on stderr.
+    """Report the plugins' diagnostics on stderr.
 
     By default only a one-line count is printed.  With *errors* every error is
     listed; with *warnings* every error and warning is listed.
@@ -112,7 +110,7 @@ def _print_diagnostics(hierarchy: dict, *, errors: bool = False, warnings: bool 
     if not errors and not warnings:
         if n_err or n_warn:
             parts = [f"{n} {name}{'s' if n != 1 else ''}" for n, name in ((n_err, "error"), (n_warn, "warning")) if n]
-            _err.print(f"[dim]slang reported {', '.join(parts)} (use -E to list errors, -W to also list warnings)[/dim]")
+            _err.print(f"[dim]reported {', '.join(parts)} (use -E to list errors, -W to also list warnings)[/dim]")
         return
     for d in diags:
         if d["severity"] == "error":
@@ -135,7 +133,7 @@ _MISSING_LABELS = {
 
 
 def _print_missing(hierarchy: dict) -> None:
-    """Print a table of everything slang could not find to stderr.
+    """Print a table of everything that could not be found to stderr.
 
     Unknown modules are reported as blackboxes; packages, interfaces, include files
     and macros that could not be found follow.  Nothing is printed when the design
@@ -334,13 +332,13 @@ def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentP
         "-E", "--errors",
         action="store_true",
         default=False,
-        help="Print slang error diagnostics to stderr (by default only a count is shown).",
+        help="Print error diagnostics to stderr (by default only a count is shown).",
     )
     parser.add_argument(
         "-W", "--warnings",
         action="store_true",
         default=False,
-        help="Print slang error and warning diagnostics to stderr.",
+        help="Print error and warning diagnostics to stderr.",
     )
     parser.add_argument(
         "-x", "--ignore",
@@ -388,7 +386,7 @@ def _usable_frontends(frontends: list[Frontend]) -> list[Frontend]:
     return usable
 
 
-def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[str]) -> list[tuple[Frontend, list[str]]]:
+def _route_files(frontends: list[Frontend], files: list[str]) -> list[tuple[Frontend, list[str]]]:
     """Return ``(frontend, files)`` for each usable frontend with inputs; warn about files nothing can read."""
     usable = _usable_frontends(frontends)
     routed: dict[int, list[str]] = {id(f): [] for f in usable}
@@ -400,16 +398,6 @@ def _route_files(frontends: list[Frontend], args, files: list[str], ignore: set[
             _err.print(f"[yellow]warning:[/yellow] skipping {fname}: install and enable {KNOWN_SUFFIXES[suffix]} to read it")
         elif (owner or fallback) is not None:
             routed[id(owner or fallback)].append(fname)
-    for frontend in usable:  # collect_sv_files only looks for SV files in directories
-        if frontend.catch_all:
-            continue
-        have = {Path(f).resolve() for f in routed[id(frontend)]}
-        for raw in args.paths:
-            if Path(raw).is_dir():
-                for found in glob_files(Path(raw), args.recursive, tuple(f"*{x}" for x in frontend.suffixes), ignore):
-                    if found.resolve() not in have:
-                        have.add(found.resolve())
-                        routed[id(frontend)].append(str(found))
     if not any(routed[id(f)] or f.extra_inputs() for f in usable):
         return []
     # A frontend with only -y still joins in, in case another language instantiates what it finds.
@@ -447,10 +435,10 @@ def _write_outputs(hierarchy: dict, args) -> None:
 
 
 def main():
-    """Entry point: parse arguments, run slang elaboration, emit tree, YAML and filelist.
+    """Entry point: parse arguments, elaborate through the plugins, emit tree, YAML and filelist.
 
     All Rich diagnostics (spinner, tables, warnings) go to stderr so stdout stays
-    clean for piped data.  Exits with code 1 if pyslang reports any error-level
+    clean for piped data.  Exits with code 1 if a plugin reports any error-level
     diagnostics.
     """
     frontends = discover_frontends(lambda name, exc: _err.print(f"[yellow]warning:[/yellow] plugin {name!r} failed to load: {exc}"))
@@ -462,10 +450,10 @@ def main():
         parser.error("give at least one PATH or an input option such as -f (see --help)")
 
     ignore = {n.lower() for n in args.ignore} if args.ignore else set()
-    sv_files = collect_sv_files(args.paths, args.recursive, ignore)
-    inputs = _route_files(frontends, args, sv_files, ignore)
+    suffixes = tuple(suffix for frontend in frontends for suffix in frontend.suffixes)
+    inputs = _route_files(frontends, collect_source_files(args.paths, args.recursive, suffixes, ignore))
     if not inputs:
-        _err.print("[red]error:[/red] no .sv/.v files found")
+        _err.print("[red]error:[/red] no source files found")
         sys.exit(1)
 
     extras = "".join(f" and [bold cyan]{extra}[/bold cyan]" for f, _ in inputs for extra in f.extra_inputs())

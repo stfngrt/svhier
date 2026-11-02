@@ -3,7 +3,9 @@
 
 """SPIKE: the SystemVerilog frontend, registered like any other plugin.
 
-Imports pyslang only when it runs, through :mod:`svhier.parser`, so svhier starts without it.
+Built like the GHDL plugin: a tool that alone touches pyslang, a library of what ``-y`` holds,
+and a frontend that takes both.  pyslang is only imported when the tool runs, so svhier starts
+without it.
 """
 
 import argparse
@@ -12,7 +14,7 @@ import re
 from pathlib import Path
 
 from svhier.frontends import Request, Root, empty_fragment
-from svhier.libsearch import LibraryIndex, glob_files, is_ignored, resolve_missing
+from svhier.libsearch import LibraryFactory, LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
 _MAX_LIB_ROUNDS = 20
@@ -143,19 +145,37 @@ def _nothing_elaborated(result: dict) -> dict:
     return result
 
 
+class PyslangTool:
+    """Everything the frontend needs from pyslang."""
+
+    def unavailable_reason(self) -> str | None:
+        """Report if pyslang is missing."""
+        return None if importlib.util.find_spec("pyslang") else "pyslang is not installed"
+
+    def parse(self, files: list[str], inc_dirs: list[str], **options) -> dict:
+        """Elaborate *files*; see :func:`svhier.parser.parse_files`."""
+        from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
+
+        return parse_files(files, inc_dirs, **options)
+
+
 class SlangFrontend:  # pylint: disable=too-many-instance-attributes
-    """Elaborate SystemVerilog with slang, including ``-f``, ``-I``, ``-D`` and ``-y``."""
+    """Elaborate SystemVerilog with slang, including ``-f``, ``-I``, ``-D`` and ``-y``.
+
+    *tool* runs slang, and *library_factory* builds the index of ``-y``.
+    """
 
     name = "slang"
     suffixes = (".sv", ".v")
     catch_all = True
 
-    def __init__(self) -> None:
+    def __init__(self, tool: PyslangTool | None = None, library_factory: LibraryFactory = LibraryIndex) -> None:
+        self.tool = tool or PyslangTool()
+        self._library_factory = library_factory
+        self.search = LibrarySearch()
         self.defines: list[str] = []
         self.inc_dirs: list[str] = []
         self.command_files: list = []
-        self.index: LibraryIndex | None = None
-        self.pulled: list = []
         self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
         # {lowercase module name: (module name, its parameter names)}
@@ -198,75 +218,71 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         found = collect_inc_dirs(args.paths, args.recursive, ignore)
         self.inc_dirs = list(dict.fromkeys(args.include_dirs + found))
         self.command_files = args.command_files
-        self.index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
+        self.search = LibrarySearch(self._library_factory(args.libdirs, ignore) if args.libdirs else None)
 
     def unavailable_reason(self) -> str | None:
-        """Report if pyslang is missing."""
-        return None if importlib.util.find_spec("pyslang") else "pyslang is not installed"
+        """Report why slang can't be used; None if it can."""
+        return self.tool.unavailable_reason()
 
     def extra_inputs(self) -> list[str]:
         """Command files are inputs too."""
         return [f"{len(self.command_files)} command file(s)"] if self.command_files else []
 
+    def units(self, files: list[str]) -> dict[str, str]:
+        """Return the modules the inputs define.  With no tops, ``-y`` would serve unused modules too."""
+        if self._units is None:
+            self._units = self._read_units(files)
+        return self._units
+
+    def _read_units(self, files: list[str]) -> dict[str, str]:
+        if not files and not self.command_files:
+            return {}
+        result = self._parse(files, [], library=False)
+        self._modules = {name.lower(): (name, params) for name, params in result["parameter_names"].items()}
+        return {d["mod_name"].lower(): f["file_name"] for f in result["files"] for d in f["defs"]}
+
     def has_library(self) -> bool:
-        """Report whether ``-y`` defines anything for slang."""
-        return self.index is not None and bool(self.index.defs)
+        """Report whether ``-y`` holds anything for slang."""
+        return bool(self.search)
 
     def provide(self, name: str, files: list[str]) -> bool:
-        """Add the ``-y`` file defining *name*, spelled in any case."""
-        candidates = self.index.find_definition_any_case(name) if self.index else []
-        if not candidates:
+        """Add the ``-y`` file defining *name*.  What it needs in turn comes when it's parsed."""
+        if not self.search.has(name):
             return False
-        if str(candidates[0]) not in files:
-            files.append(str(candidates[0]))
-            self.pulled.append((name, candidates[0], len(candidates) - 1))
-        self._units = None
+        self.search.pull(name, files)
+        self._units = None  # Even if it was there already, since parsing pulls files in too.
         return True
-
-    def _library_candidates(self, missing: dict) -> dict:
-        """Return *missing* without modules that sources in another language define."""
-        return {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}
 
     def _parse(self, files: list[str], tops: list[str], params: dict[str, str] | None = None, *, library: bool = True) -> dict:
         """Parse, then pull missing definitions from ``-y`` until nothing new resolves.
 
         *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
-        from svhier.parser import parse_files  # pylint: disable=import-outside-toplevel
-
         options = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
-        hierarchy = parse_files(files, self.inc_dirs, **options)
+        hierarchy = self.tool.parse(files, self.inc_dirs, **options)
         for _ in range(_MAX_LIB_ROUNDS):
-            if self.index is None or not library:
+            if not library or not self._pull_missing(hierarchy, files):
                 break
-            loaded = [f["file_name"] for f in hierarchy["files"]]
-            found, incs = resolve_missing(self._library_candidates(hierarchy["missing"]), self.index, loaded, self.inc_dirs)
-            if not found and not incs:
-                break
-            self._add_pulled(found, incs, files)
-            hierarchy = parse_files(files, self.inc_dirs, **options)
+            hierarchy = self.tool.parse(files, self.inc_dirs, **options)
         return hierarchy
 
-    def _add_pulled(self, found: dict, incs: dict, files: list[str]) -> None:
-        """Add what :func:`~svhier.libsearch.resolve_missing` found to the compilation."""
+    def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
+        """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define."""
+        if not self.search:
+            return False
+        missing = hierarchy["missing"]
+        wanted = {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}
+        loaded = [f["file_name"] for f in hierarchy["files"]]
+        found, incs = resolve_missing(wanted, self.search.library, loaded, self.inc_dirs)
         for name, (path, others) in found.items():
             if str(path) not in files:
                 files.append(str(path))
-            self.pulled.append((name, path, others))
+            self.search.record(name, path, others)
         for include, directory in incs.items():
             if str(directory) not in self.inc_dirs:
                 self.inc_dirs.append(str(directory))
-            self.pulled.append((include, directory, 0))
-
-    def units(self, files: list[str]) -> dict[str, str]:
-        """Return the modules the inputs define.  With no tops, ``-y`` would serve unused modules too."""
-        if self._units is None:
-            if not files and not self.command_files:
-                return {}
-            result = self._parse(files, [], library=False)
-            self._units = {d["mod_name"].lower(): f["file_name"] for f in result["files"] for d in f["defs"]}
-            self._modules = {name.lower(): (name, params) for name, params in result["parameter_names"].items()}
-        return self._units
+            self.search.record(include, directory)
+        return bool(found or incs)
 
     def _module_name(self, name: str) -> str:
         """Return the spelling slang needs.  VHDL names reach this frontend in lowercase."""
@@ -372,16 +388,16 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
             # Instantiated, so still needed, even though slang can't elaborate them on their own.
             units = self.units(files) if rejected else {}
             result["needed"] = list(result["needed"] or []) + [units[n.lower()] for n in sorted(rejected) if n.lower() in units]
-        return self._finish(result, rejected, notes)
+        return self._fragment(result, rejected, notes)
 
-    def _finish(self, result: dict, rejected: set[str], notes: list[str]) -> dict:
-        """Turn a merged result into what core expects from a frontend."""
+    def _fragment(self, result: dict, rejected: set[str], notes: list[str]) -> dict:
+        """Build the result shape core expects from a merged result."""
         result["unresolved"] = result.pop("blackbox_params")
         for name in result["missing"]["modules"]:
             result["unresolved"].setdefault(name, [])
         result["rejected_roots"] = sorted(rejected)
         result["notes"] = notes
-        result["pulled"] = self.pulled
+        result["pulled"] = self.search.pulled
         result["inc_dirs"] = list(dict.fromkeys(self.inc_dirs + result["inc_dirs"]))
         result.pop("invalid_tops")
         return result

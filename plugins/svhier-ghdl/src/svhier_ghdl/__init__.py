@@ -2,8 +2,10 @@
 """SPIKE: svhier frontend that elaborates VHDL with GHDL through pyGHDL.
 
 GHDL is not a dependency and isn't bundled: the plugin looks for an installed pyGHDL at
-runtime and reports what's missing if there is none.  Only :mod:`svhier_ghdl.worker`
-imports pyGHDL, in a child process.
+runtime and reports what's missing if there is none.
+
+Built like the slang plugin: a tool that alone touches pyGHDL, through :mod:`svhier_ghdl.worker`
+in a child process, a library of what ``-y`` holds, and a frontend that takes both.
 """
 
 import importlib.util
@@ -16,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from svhier.frontends import Request, empty_fragment
-from svhier.libsearch import glob_files
+from svhier.libsearch import LibraryFactory, LibrarySearch, glob_files
 
 _MARKER = "@@svhier-order "
 _TIMEOUT_S = 120
@@ -90,7 +92,7 @@ def to_literal(kind: str, value: str) -> str | None:  # pylint: disable=too-many
     return None
 
 
-class VhdlLibrary:  # pylint: disable=too-few-public-methods
+class VhdlLibrary:
     """What VHDL files under ``-y`` define.  A regex is enough to choose files; GHDL reads them."""
 
     def __init__(self, dirs: list[str], ignore: set[str]) -> None:
@@ -106,18 +108,21 @@ class VhdlLibrary:  # pylint: disable=too-few-public-methods
                     for name in dict.fromkeys(n.lower() for n in pattern.findall(text)):
                         table.setdefault(name, []).append(path)
 
-    def find(self, name: str, library: str = "") -> tuple[list[Path], int]:
+    def __bool__(self) -> bool:
+        return bool(self.primary)
+
+    def find(self, name: str, scope: str = "") -> tuple[list[Path], int]:
         """Return the files for unit *name*, and how many other files also define it.
 
         The first file defines the unit.  Architectures and package bodies may live in their
         own files, so the others are those in the same directory.  Same preference as for SV,
-        after a directory named after the *library* that references it.
+        after a directory named after *scope*, the library that references it.
         """
         name = name.lower()
 
         def rank(path: Path) -> tuple:
             stem = path.stem.lower()
-            return (library not in (p.lower() for p in path.parent.parts), stem != name, not name.startswith(stem), len(path.parts), str(path))
+            return (scope not in (p.lower() for p in path.parent.parts), stem != name, not name.startswith(stem), len(path.parts), str(path))
 
         candidates = sorted(self.primary.get(name, []), key=rank)
         if not candidates:
@@ -303,24 +308,46 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     return list(defs.values())
 
 
+class GhdlWorkerTool:
+    """Everything the frontend needs from pyGHDL, which :mod:`svhier_ghdl.worker` does for it."""
+
+    def unavailable_reason(self) -> str | None:
+        """Report if pyGHDL is missing."""
+        return None if importlib.util.find_spec("pyGHDL") else f"pyGHDL is not installed; {_INSTALL_HINT}"
+
+    def run(self, request: dict) -> subprocess.CompletedProcess:
+        """Run one worker request."""
+        spec = importlib.util.find_spec("pyGHDL")
+        env = dict(os.environ)
+        # The wheel bundles libgnat, but the loader only finds it through this path.
+        lib_dir = Path(spec.origin).parent / "lib"
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [str(lib_dir), env.get("LD_LIBRARY_PATH", "")]))
+        return subprocess.run([sys.executable, "-m", "svhier_ghdl.worker", json.dumps(request)],
+                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=env, check=False)
+
+
 class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
-    """Elaborate VHDL by running :mod:`svhier_ghdl.worker` once per top and setting."""
+    """Elaborate VHDL, running the tool once per top and setting.
+
+    *tool* runs GHDL, and *library_factory* builds the index of ``-y``.
+    """
 
     name = "ghdl"
     suffixes = (".vhd", ".vhdl")
     catch_all = False
 
-    def __init__(self) -> None:
+    def __init__(self, tool: GhdlWorkerTool | None = None, library_factory: LibraryFactory = VhdlLibrary) -> None:
+        self.tool = tool or GhdlWorkerTool()
+        self._library_factory = library_factory
+        self.search = LibrarySearch()
         self.std = "08"
         self.work = "work"
-        self._units: dict[str, str] = {}
+        self._units: dict[str, str] | None = None
         # {lowercase entity name: every file defining it}, since libraries may share names.
         self._definers: dict[str, list[str]] = {}
         self._libraries: dict[str, str] = {}
         self._notes: list[str] = []
         self._cache: dict[tuple, Elaboration] = {}
-        self._library: VhdlLibrary | None = None
-        self._pulled: list[tuple[str, Path, int]] = []
         self._scan: dict[str, dict] = {}
 
     def add_arguments(self, parser) -> None:
@@ -333,31 +360,27 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         """Read the plugin's options."""
         self.std = args.vhdl_std
         self.work = args.vhdl_work
-        if args.libdirs:
-            self._library = VhdlLibrary(args.libdirs, {n.lower() for n in args.ignore} if args.ignore else set())
+        ignore = {n.lower() for n in args.ignore} if args.ignore else set()
+        self.search = LibrarySearch(self._library_factory(args.libdirs, ignore) if args.libdirs else None)
 
     def unavailable_reason(self) -> str | None:
         """Report why GHDL can't be used; None if it can."""
-        if importlib.util.find_spec("pyGHDL") is None:
-            return f"pyGHDL is not installed; {_INSTALL_HINT}"
-        return None
+        return self.tool.unavailable_reason()
 
     def extra_inputs(self) -> list[str]:
         """Only files count."""
         return []
 
     def _worker(self, request: dict) -> subprocess.CompletedProcess:
-        spec = importlib.util.find_spec("pyGHDL")
-        env = dict(os.environ)
-        # The wheel bundles libgnat, but the loader only finds it through this path.
-        lib_dir = Path(spec.origin).parent / "lib"
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [str(lib_dir), env.get("LD_LIBRARY_PATH", "")]))
-        request = {"std": self.std, "work": self.work, **request}
-        return subprocess.run([sys.executable, "-m", "svhier_ghdl.worker", json.dumps(request)],
-                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=env, check=False)
+        return self.tool.run({"std": self.std, "work": self.work, **request})
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return the entities in *files*, or nothing if the worker failed.  Also chooses libraries."""
+        if self._units is None:
+            self._units = self._read_units(files)
+        return self._units
+
+    def _read_units(self, files: list[str]) -> dict[str, str]:
         by_abs = {str(Path(f).resolve()): f for f in files if f not in self._scan}
         if by_abs:
             proc = self._worker({"op": "scan", "files": list(by_abs)})
@@ -370,28 +393,19 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         for path, entry in scan.items():
             for name in entry["entities"]:
                 self._definers.setdefault(name, []).append(path)
-        self._units = {name: paths[0] for name, paths in self._definers.items()}
-        return self._units
+        return {name: paths[0] for name, paths in self._definers.items()}
 
     def has_library(self) -> bool:
-        """Report whether ``-y`` defines any VHDL units."""
-        return self._library is not None and bool(self._library.primary)
-
-    def _pull(self, name: str, files: list[str], library: str = "") -> bool:
-        """Add the files defining *name* from ``-y``; return whether that added any."""
-        found, others = self._library.find(name, library) if self._library else ([], 0)
-        have = {Path(f).resolve() for f in files}
-        new = [p for p in found if p.resolve() not in have]
-        if not new:
-            return False
-        files.extend(str(p) for p in new)
-        self._pulled.append((name, found[0], others))
-        self._cache.clear()
-        return True
+        """Report whether ``-y`` holds anything for GHDL."""
+        return bool(self.search)
 
     def provide(self, name: str, files: list[str]) -> bool:
         """Add the ``-y`` file defining entity *name*, and what it needs to compile."""
-        return self._pull_needed([name], files) or bool(self._library and self._library.find(name)[0])
+        if not self.search.has(name):
+            return False
+        self._pull_needed([name], files)
+        self._units = None
+        return True
 
     def _pull_needed(self, names: list[str], files: list[str]) -> bool:
         """Pull in from ``-y`` what the units *names* must see to compile, however indirectly.
@@ -399,7 +413,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         Unlike an instance through a component, ``use lib.pkg`` and ``entity lib.unit`` need the
         unit to exist.  Only following them from *names* leaves out what other files need.
         """
-        if self._library is None:
+        if not self.search:
             return False
         pulled = False
         pending = [("", n.lower()) for n in names]
@@ -409,8 +423,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
             if unit in seen:
                 continue
             seen.add(unit)
-            if not any(unit in e["units"] for e in self._scan.values()) and self._pull(unit, files, library):
+            if not any(unit in e["units"] for e in self._scan.values()) and self.search.pull(unit, files, library):
                 pulled = True
+                self._units = None
+                self._cache.clear()
                 self.units(files)
             for entry in self._scan.values():
                 if unit in entry["units"] or unit in entry["arch_of"]:
@@ -423,8 +439,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
 
         Instances still unbound afterwards may be entities under ``-y``, which needs another run.
         """
-        if files and not self._units:
-            self.units(files)
+        self.units(files)
         names = [r.name for r in request.roots]
         # With auto, every entity is a root, even those only -y has components for.
         self._pull_needed(names + [u for e in self._scan.values() for u in e["units"]] if request.auto else names, files)
@@ -504,7 +519,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
         result["notes"] = list(self._notes)
-        result["pulled"] = list(self._pulled)
+        result["pulled"] = self.search.pulled
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
 
@@ -518,7 +533,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         by_abs = {str(Path(f).resolve()): f for f in files}
         request = {
             "op": "elaborate", "files": list(by_abs), "top": top, "generics": generics,
-            "top_library": self._libraries.get(self._units.get(top.lower(), ""), self.work),
+            "top_library": self._libraries.get((self._units or {}).get(top.lower(), ""), self.work),
             "libraries": {path: self._libraries[name] for path, name in by_abs.items() if name in self._libraries},
             "objects": True,
         }

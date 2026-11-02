@@ -1,5 +1,8 @@
 """SPIKE: core stitching with stand-in frontends, so these need neither pyslang nor GHDL."""
 
+from pathlib import Path
+
+import svhier.cli
 from svhier.filelist import compute_filelist
 from svhier.frontends import Request, discover_frontends, empty_fragment, stitch
 
@@ -179,3 +182,13 @@ def test_a_broken_plugin_does_not_break_discovery(monkeypatch):
     errors = []
     assert not discover_frontends(lambda name, exc: errors.append((name, str(exc))))
     assert errors == [("bad", "boom")]
+
+
+def test_cli_does_not_know_a_language():
+    text = Path(svhier.cli.__file__).read_text()
+    for name in ("slang", "ghdl"):
+        assert name not in text.lower(), name
+
+
+def test_cli_parser_builds_without_any_plugin():
+    assert svhier.cli._build_parser([]).parse_args(["x"]).paths == ["x"]  # pylint: disable=protected-access

@@ -1,11 +1,12 @@
 """The slang frontend elaborating roots with parameter values from another language."""
 
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from svhier.frontends import Request, Root
-from svhier.libsearch import LibraryIndex
+from svhier.libsearch import LibraryIndex, LibrarySearch
 from svhier.parser import parse_files
 from svhier.slang_frontend import SlangFrontend
 
@@ -146,11 +147,11 @@ def test_module_name_is_found_when_vhdl_lowercased_it(tmp_path):
 def test_provide_finds_a_library_module_in_any_case_and_reports_it(tmp_path):
     (tmp_path / "Lib_Cell.sv").write_text("module Lib_Cell; endmodule\n")
     frontend = SlangFrontend()
-    frontend.index = LibraryIndex([str(tmp_path)])
+    frontend.search = LibrarySearch(LibraryIndex([str(tmp_path)]))
     files: list[str] = []
     assert frontend.provide("lib_cell", files)
     assert frontend.units(files) == {"lib_cell": str(tmp_path / "Lib_Cell.sv")}
-    assert [name for name, _, _ in frontend.pulled] == ["lib_cell"]
+    assert [name for name, _, _ in frontend.search.pulled] == ["lib_cell"]
     assert not frontend.provide("nothing", files)
 
 
@@ -160,10 +161,10 @@ def test_units_do_not_search_the_library(tmp_path):
     source = tmp_path / "unused.sv"
     source.write_text("module unused; cell u (); endmodule\n")
     frontend = SlangFrontend()
-    frontend.index = LibraryIndex([str(tmp_path / "lib")])
+    frontend.search = LibrarySearch(LibraryIndex([str(tmp_path / "lib")]))
     files = [str(source)]
     assert list(frontend.units(files)) == ["unused"]
-    assert files == [str(source)] and not frontend.pulled
+    assert files == [str(source)] and not frontend.search.pulled
 
 
 def test_a_module_another_language_defines_is_not_pulled_from_the_library(tmp_path):
@@ -172,6 +173,45 @@ def test_a_module_another_language_defines_is_not_pulled_from_the_library(tmp_pa
     source = tmp_path / "top.sv"
     source.write_text("module top; shared u (); endmodule\n")
     frontend = SlangFrontend()
-    frontend.index = LibraryIndex([str(tmp_path / "lib")])
+    frontend.search = LibrarySearch(LibraryIndex([str(tmp_path / "lib")]))
     frontend.elaborate([str(source)], Request(roots=[Root("top", requested=True)], defined_elsewhere={"shared"}))
-    assert not frontend.pulled
+    assert not frontend.search.pulled
+
+
+class _FakeTool:
+    """Stands in for pyslang, so the frontend's logic can run without it."""
+
+    def __init__(self) -> None:
+        self.parsed: list[list[str]] = []
+
+    def unavailable_reason(self) -> str | None:
+        return "no slang here"
+
+    def parse(self, files, inc_dirs, **options):  # pylint: disable=unused-argument
+        self.parsed.append(list(files))
+        needs_lib = "lib.sv" not in " ".join(files)
+        return {
+            "files": [{"file_name": f, "defs": [{"mod_name": "Mod"}]} for f in files],
+            "parameter_names": {"Mod": ["P"]},
+            "missing": {"modules": {"lib": ["a.sv"]} if needs_lib else {}, "interfaces": {}, "packages": {}, "includes": {}, "macros": {}},
+        }
+
+
+def test_tool_and_library_are_injected(tmp_path):
+    (tmp_path / "lib.sv").write_text("module lib; endmodule\n")
+    tool = _FakeTool()
+    made = []
+
+    def factory(dirs, ignore):
+        made.append((dirs, ignore))
+        return LibraryIndex(dirs, ignore)
+
+    frontend = SlangFrontend(tool=tool, library_factory=factory)
+    frontend.configure(Namespace(paths=[], recursive=False, ignore=["x"], defines=[], include_dirs=[], command_files=[], libdirs=[str(tmp_path)]))
+    assert frontend.unavailable_reason() == "no slang here"
+    assert made == [([str(tmp_path)], {"x"})]
+    files = ["a.sv"]
+    assert frontend.units(files) == {"mod": "a.sv"}
+    assert tool.parsed == [["a.sv"]]  # units() doesn't search -y.
+    frontend._parse(files, ["Mod"])  # pylint: disable=protected-access
+    assert tool.parsed[-1] == ["a.sv", str(tmp_path / "lib.sv")]

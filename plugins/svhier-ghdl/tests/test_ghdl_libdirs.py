@@ -1,13 +1,16 @@
 """-y with GHDL: only what the design needs comes in, whichever language defines it."""
 
 import importlib.util
+import json
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
-from svhier_ghdl import VhdlLibrary
+from svhier.frontends import Request, Root
+from svhier_ghdl import GhdlFrontend, VhdlLibrary
 
 needs_ghdl = pytest.mark.skipif(importlib.util.find_spec("pyGHDL") is None, reason="pyGHDL is not installed")
 
@@ -127,3 +130,41 @@ def test_vhdl_alone_resolves_its_top_and_package_from_the_library(tmp_path):
     proc = _svhier(source, "-y", str(tmp_path / "lib"), "--top", "deep", "--yaml", "-", "--no-tree")
     assert proc.returncode == 0, proc.stderr
     assert "library: mylib" in proc.stdout
+
+
+class _FakeTool:
+    """Stands in for the worker, so the frontend's logic can run without GHDL."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.requests: list[dict] = []
+
+    def unavailable_reason(self) -> str | None:
+        return "no ghdl here"
+
+    def run(self, request: dict) -> subprocess.CompletedProcess:
+        self.requests.append(request)
+        if request["op"] == "scan":
+            entry = {"units": ["top"], "entities": ["top"], "arch_of": ["top"], "libs": [], "refs": [], "named": []}
+            out = "@@svhier-order " + json.dumps({self.path: entry})
+        else:
+            out = "@@svhier-order " + json.dumps({self.path: []}) + "\narchitecture rtl of top\n  u_x: component other [not bound]\n"
+        return subprocess.CompletedProcess([], 0, out, "")
+
+
+def test_tool_and_library_are_injected(tmp_path):
+    path = str((tmp_path / "top.vhd").resolve())
+    tool = _FakeTool(path)
+    made = []
+
+    def factory(dirs, ignore):
+        made.append((dirs, ignore))
+        return VhdlLibrary(dirs, ignore)
+
+    frontend = GhdlFrontend(tool=tool, library_factory=factory)
+    frontend.configure(Namespace(vhdl_std="93", vhdl_work="work", libdirs=[str(tmp_path)], ignore=["x"]))
+    assert frontend.unavailable_reason() == "no ghdl here"
+    assert made == [([str(tmp_path)], {"x"})]
+    result = frontend.elaborate([path], Request(roots=[Root("top", requested=True)]))
+    assert result["unresolved"] == {"other": [{"generics": {}, "unresolved": []}]}
+    assert {r["std"] for r in tool.requests} == {"93"}
