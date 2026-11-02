@@ -61,9 +61,29 @@ jobs:
             --pattern "pyghdl-*-$tag-$tag-linux_x86_64.whl"
           uv pip install "$RUNNER_TEMP"/ghdl/*.whl
 
-      # The plugin tests skip themselves without pyGHDL, so make a missing install fail.
-      - name: Check pyGHDL is installed
-        run: uv pip show pyghdl
+      # The same version as pyGHDL, because the image tag comes from the same release.
+      - name: Set up GHDL from its Docker image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(gh release view --repo ghdl/ghdl --json tagName --jq .tagName)"
+          image="ghdl/ghdl:${version#v}-mcode-ubuntu-24.04"
+          docker pull "$image"
+          echo "GHDL_IMAGE=$image" >> "$GITHUB_ENV"
+          # Tests use the workspace and pytest's directories in /tmp, under the same paths.
+          cat > "$RUNNER_TEMP/ghdl" <<'WRAPPER'
+          #!/bin/sh
+          exec docker run --rm -u "$(id -u):$(id -g)" -v /tmp:/tmp \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" "$GHDL_IMAGE" ghdl "$@"
+          WRAPPER
+          chmod +x "$RUNNER_TEMP/ghdl"
+          echo "SVHIER_GHDL_BIN=$RUNNER_TEMP/ghdl" >> "$GITHUB_ENV"
+
+      # The plugin tests skip themselves without these, so make a missing install fail.
+      - name: Check pyGHDL and GHDL are installed
+        run: |
+          uv pip show pyghdl
+          "$SVHIER_GHDL_BIN" --version
 
       - name: Lint
         run: uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/

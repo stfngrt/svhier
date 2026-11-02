@@ -46,7 +46,8 @@ Files go into libraries automatically, based on how they refer to each other:
 ## Known limits
 
 - CI tests the latest GHDL release, currently 6.0.0, with its Linux wheels for Python 3.11,
-  3.12 and 3.13. A new GHDL release that changes the internals above fails CI.
+  3.12 and 3.13. A new GHDL release that changes the internals above fails CI. It also compiles and
+  elaborates test designs from svhier's YAML and filelist, with GHDL's Docker image.
 - YAML gives each VHDL file's `library`, but the filelist can't, so it can't compile a design with
   several libraries on its own.
 - VHDL-2008 generic types or subprograms make GHDL's printing crash. The tree stays correct, but
