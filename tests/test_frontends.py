@@ -1,4 +1,4 @@
-"""SPIKE: core stitching with stand-in frontends, so these need neither pyslang nor GHDL."""
+"""Core stitching with stand-in frontends, so these need neither pyslang nor GHDL."""
 
 from pathlib import Path
 

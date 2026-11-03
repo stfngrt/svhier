@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Stefan Engert
 
-"""SPIKE: the SystemVerilog frontend, registered like any other plugin.
+"""The SystemVerilog frontend, registered like any other plugin.
 
 Built like the GHDL plugin: a tool that alone touches pyslang, a library of what ``-y`` holds,
 and a frontend that takes both.  pyslang is only imported when the tool runs, so svhier starts

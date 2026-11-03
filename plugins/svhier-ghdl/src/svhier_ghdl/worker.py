@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""SPIKE: run libghdl in a child process; everything that touches pyGHDL lives here.
+"""Run libghdl in a child process; everything that touches pyGHDL lives here.
 
 Run as ``python -m svhier_ghdl.worker``.  It has to be a separate process because libghdl
 keeps global state, an Ada assertion aborts the whole process, and the wheel's bundled
