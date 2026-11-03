@@ -53,9 +53,10 @@ _MISSING_CODES = {
     Diags.CouldNotOpenIncludeFile: "includes",
     Diags.UnknownDirective: "macros",
 }
+#: The categories of ``missing`` in a :func:`parse_files` result.
 MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
 
-# (name, canonical file) — identifies one definition even when the name is reused.
+#: (name, canonical file) — identifies one definition even when the name is reused.
 DefKey = tuple[str, str]
 
 
@@ -513,7 +514,7 @@ def parse_files(  # pylint: disable=too-many-arguments
     * *inc_dirs* — `` `include`` search directories (``-I``).
     * *defines* — macro definitions, ``NAME`` or ``NAME=VALUE`` (``-D``).
     * *tops* — top module names (``--top``).  When given, only these are elaborated
-      and :func:`compute_filelist` keeps only the files they need.
+      and :func:`~svhier.filelist.compute_filelist` keeps only the files they need.
     * *command_files* — ``("-f", path)`` or ``("-F", path)`` pairs.  Command files may
       use ``+incdir+``, ``+define+``, nested ``-f``/``-F`` and ``${VAR}`` environment
       variables.  ``-F`` resolves paths relative to the command file, ``-f`` relative to
@@ -538,7 +539,7 @@ def parse_files(  # pylint: disable=too-many-arguments
           where slang uses the other copy (internal).
         * ``refs`` — sorted package / interface names defined in *other* input
           files that this file references, by import, ``pkg::name``, interface
-          port or interface instance (internal; used by :func:`compute_filelist`).
+          port or interface instance (internal; used by :func:`~svhier.filelist.compute_filelist`).
         * ``defs`` — list of module definitions, each with ``mod_name``,
           ``pkg_imports`` (omitted from YAML when empty), and ``insts``
           (list of ``{"mod_name": str, "inst_name": str}``).  A shadowed copy of a

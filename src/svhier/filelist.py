@@ -37,7 +37,7 @@ def compute_filelist(result: dict) -> list[str]:
     ``nx.topological_sort`` produces the compilation order.  If the graph contains
     a cycle the original input order is returned unchanged.
 
-    *result* is the dict returned by :func:`parse_files`.
+    *result* is the dict returned by :func:`~svhier.parser.parse_files`.
     """
     files = result["files"]
 

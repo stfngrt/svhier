@@ -124,3 +124,13 @@ guide/vhdl
 cli
 architecture
 ```
+
+```{toctree}
+:hidden:
+:caption: Developer documentation
+
+dev/index
+dev/result-format
+dev/plugins
+dev/api/index
+```

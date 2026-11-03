@@ -15,10 +15,11 @@ from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from typing import Protocol
 
+#: The entry point group plugins register in.
 ENTRY_POINT_GROUP = "svhier.frontends"
 _MAX_ROUNDS = 20
 _MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
-# Suffix -> what to install, for files no enabled frontend reads.
+#: Suffix -> what to install, for files no enabled frontend reads.
 KNOWN_SUFFIXES = {".vhd": "svhier-ghdl", ".vhdl": "svhier-ghdl", ".sv": "pyslang", ".v": "pyslang"}
 
 

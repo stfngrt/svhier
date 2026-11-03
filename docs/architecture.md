@@ -1,206 +1,237 @@
 # Architecture
 
-svhier parses SystemVerilog files using the `pyslang` C++ extension (slang elaborator)
-and turns the elaborated design into an instance tree, a report of missing
-definitions, YAML and a dependency-ordered filelist.
+svhier turns source files into one instance tree, a report of what's missing, YAML and a
+dependency-ordered filelist. It doesn't parse any language itself. Real compilers do
+that, slang for SystemVerilog and GHDL for VHDL, each behind a plugin. Core decides which
+plugin reads what, connects the results, and writes the output.
 
-The code is split into these modules:
+This page follows one run from the command line to the output. For the code itself, see
+the [developer documentation](dev/index.md).
 
-| Module | Responsibility |
-|--------|----------------|
-| `svhier.frontends` | The plugin interface, and stitching what the language plugins report into one hierarchy |
-| `svhier.slang_frontend` | The bundled SystemVerilog plugin: its options, the parse/resolve loop for `-y`, include directory discovery |
-| `svhier.parser` | Run slang, walk the elaborated hierarchy, collect missing names |
-| `svhier.libsearch` | Index `-y` library directories and resolve missing SV names to files |
-| `svhier.filelist` | Order files for compilation |
-| `svhier.cli` | Collect inputs, route them to plugins, render tree, tables and outputs |
+## The parsing flow
 
-## Language plugins
-
-Core doesn't know any source language. A plugin registers a class in the
-`svhier.frontends` entry point group, and the bundled slang plugin registers the
-same way as the optional `svhier-ghdl` one in `plugins/`.
-
-```{eval-rst}
-.. autoclass:: svhier.frontends.Frontend
-   :members:
-
-.. autoclass:: svhier.frontends.Request
-
-.. autoclass:: svhier.frontends.Root
-
-.. autofunction:: svhier.frontends.stitch
+```text
+ svhier -r rtl -y lib --top chip
+              │
+              ▼
+ ┌─────────────────────────┐
+ │ 1. Load plugins         │  each one adds its options, then reads the parsed command line
+ └────────────┬────────────┘
+              ▼
+ ┌─────────────────────────┐
+ │ 2. Collect source files │  expand paths, using the file types the plugins declare
+ └────────────┬────────────┘
+              ▼
+ ┌─────────────────────────┐
+ │ 3. Route to plugins     │  each file goes to the plugin for its suffix
+ └────────────┬────────────┘
+              ▼
+ ┌─────────────────────────┐      ┌──────────────────────────────┐
+ │ 4. Elaborate and stitch │ ◄──► │ slang plugin ─► pyslang      │
+ │                         │ ◄──► │ GHDL plugin  ─► worker ─► GHDL│
+ └────────────┬────────────┘      └──────────────────────────────┘
+              ▼
+ ┌─────────────────────────┐
+ │ 5. One merged result    │  the same shape whichever languages produced it
+ └────────────┬────────────┘
+              ▼
+ ┌─────────────────────────┐
+ │ 6. Report and write     │  tree, tables, YAML, filelist, exit code
+ └─────────────────────────┘
 ```
 
-Files go to the plugin whose `suffixes` match. With one plugin, its result is used
-as it is. With several, stitching repeats this until nothing changes:
+| Stage | What happens | Code |
+|-------|--------------|------|
+| 1. Load plugins | Find every class in the `svhier.frontends` entry point group. A plugin that fails to load gives a warning and svhier carries on. | {func}`~svhier.frontends.discover_frontends` |
+| 2. Collect source files | Expand files and directories, applying `-r` and `-x`. A file you name directly is kept whatever its suffix. | {func}`~svhier.cli.collect_source_files` |
+| 3. Route to plugins | Give each file to the plugin for its suffix. A plugin whose tool isn't installed is disabled, with a warning. | {func}`~svhier.cli._route_files` |
+| 4. Elaborate and stitch | Run the plugins in turn until no plugin finds anything new. | {func}`~svhier.frontends.stitch` |
+| 5. Merged result | Combine what the plugins report into one dict. | {meth}`~svhier.frontends._Stitcher._merge` |
+| 6. Report and write | Print the tables to stderr, and the tree, YAML and filelist to stdout or files. Exit 1 if any error was reported. | {func}`~svhier.cli.main` |
 
-1. Each plugin elaborates its roots, and reports the instances it can't resolve as
-   `unresolved`, with any parameter values.
-2. Each unresolved name becomes a root of the plugin that defines it. If no source
-   defines it, core asks the other plugins to `provide` it from `-y`.
+Stages 1 to 3 and 6 know nothing about any language. All language knowledge sits behind
+the plugin interface, including the options `-f`, `-I` and `-D`, which the slang plugin
+adds itself.
 
-### How a plugin is built
+## Routing
 
-Both plugins have the same parts, and the frontend's constructor takes them with
-defaults, because the entry point calls it with no arguments:
+Each file has one owner:
 
-| Part | slang | GHDL |
+- **A plugin's suffix matches:** that plugin reads it.
+- **The suffix is unknown:** the *catch-all* plugin reads it, which is slang. This is
+  how an explicitly named file such as `design.pkg` still works.
+- **The suffix belongs to a plugin that isn't available:** the file is skipped, with a
+  message saying what to install.
+
+A plugin with no files of its own still takes part if `-y` holds files for it, in case
+another language instantiates something it finds there.
+
+## Elaboration and stitching
+
+### One language
+
+With one plugin taking part, nothing needs stitching. svhier calls its `elaborate` once
+and uses the result as it is, so a pure SystemVerilog run does no extra work.
+
+### Several languages
+
+Each compiler can only elaborate its own language. To slang, a VHDL entity is an unknown
+module. To GHDL, an SV module is a component with nothing bound to it. So each plugin
+elaborates what it can and reports the names it couldn't resolve, and core passes those
+names to the plugin that defines them:
+
+```text
+          ┌──────────────────────────────────────────────┐
+          ▼                                              │
+  each plugin elaborates its roots                       │
+          │                                              │
+          ▼                                              │
+  it reports names it can't resolve,                     │
+  with any parameter values                              │
+          │                                              │
+          ▼                                              │
+  which plugin defines each name?                        │
+    in its sources, or else under -y                     │
+          │                                              │
+          ├─ new root for some plugin ───────────────────┘
+          │
+          └─ nothing new ─► merge
+```
+
+A *root* is a name to elaborate, plus any parameter values. Before the first round, core
+asks each plugin which units its sources define, and gives each `--top` to the plugin
+defining it. A plugin only runs again if its roots changed. Stitching stops after 20
+rounds at most.
+
+Here's a real run on `plugins/svhier-ghdl/tests/mixed` with `--top sv_top`:
+
+| Round | Plugin | Roots | Can't resolve |
+|-------|--------|-------|---------------|
+| 1 | GHDL | none | nothing |
+| 1 | slang | `sv_top` | `Top_Vhd` with `N=3` |
+| 2 | GHDL | `Top_Vhd` with `N=3` | `sv_child`, `sv_req` with `DEPTH=6`, `nowhere` |
+| 3 | slang | `sv_top`, `sv_child`, `sv_req` with `DEPTH=6` | `vhdl_bottom`, `Top_Vhd` with `N=3` |
+| 4 | GHDL | `Top_Vhd` with `N=3`, `vhdl_bottom` | `sv_child`, `sv_req` with `DEPTH=6`, `nowhere` |
+
+After round 4 there are no new roots, so the loop ends. `N=3` is what gives `g_for` its
+three copies, and `DEPTH=6` is GHDL's evaluated value of `N * 2`, which `sv_req` needs
+because it has no default. No plugin defines `nowhere`, so it stays in the "Not found"
+table.
+
+When the results are merged, core removes each compiler's complaints about names another
+language defines. It also settles on one spelling for each name, because VHDL names are
+case-insensitive.
+
+### Library directories
+
+`-y` is a core option because a directory can hold several languages, and an instance in
+one language can need a file in another. Each plugin indexes the directories for its own
+file types, and pulls in only the files that define something missing.
+
+Two rules keep unused files out:
+
+- **Sources win over libraries.** A plugin leaves names that another language's sources
+  define (`Request.defined_elsewhere`) to that language.
+- **Listing what the sources define doesn't search `-y`.** That list covers every source,
+  including modules outside `--top`'s tree, so searching for them would pull in files
+  nothing uses.
+
+## Inside a plugin
+
+Both plugins are built from the same three parts:
+
+```text
+ ┌───────────────────────────────────┐
+ │ Frontend                          │  what core talks to
+ │  ├── tool             (injected)  │  the only code that touches the compiler
+ │  └── library_factory  (injected)  │  builds the index of what -y holds
+ └───────────────────────────────────┘
+```
+
+Both follow the same steps, but each compiler works differently:
+
+| Step | slang | GHDL |
 |------|-------|------|
-| Frontend | `svhier.slang_frontend.SlangFrontend` | `svhier_ghdl.GhdlFrontend` |
-| `tool`: the only code that touches the language tool | `PyslangTool`, which imports `svhier.parser` when it runs | `GhdlWorkerTool`, which runs `svhier_ghdl.worker` in a child process |
-| `library_factory`: what `-y` holds | `svhier.libsearch.LibraryIndex` | `svhier_ghdl.VhdlLibrary` |
+| List what the sources define | Parse them with `-y` turned off | A worker run that only scans, without elaborating |
+| Run the compiler | In-process through pyslang | In a child process, because libghdl keeps global state and can abort the process |
+| One run covers | One parameter setting, since `-G` applies to a whole compilation | One top and one setting, cached |
+| Get the hierarchy | Walk slang's elaborated objects | Parse the text of GHDL's hierarchy dump |
+| Pull from `-y` | Re-parse and pull what's reported missing, until nothing new resolves | Follow `use` and `entity` references first, then pull unbound instances and run again |
+| Find which files a top needs | slang's dependency trimming | The files GHDL's runs reached |
+| Find file dependencies | Instances, plus references in the syntax tree | The dependencies GHDL recorded while analysing |
 
-Both frontends use the same method names: `units` caches `_read_units`, `provide`
-adds a `-y` file, and `elaborate` ends in `_fragment`. A
-{class}`~svhier.libsearch.LibrarySearch` pulls files from either kind of library and
-records them for the "Pulled in from -y" table. Tests can inject a stand-in tool, so a
-frontend's logic runs without pyslang or GHDL.
+### The slang plugin
 
-The tools differ where the languages do. GHDL needs a child process because libghdl
-keeps global state and can abort the process, and it needs one worker run per top
-because of that state. slang runs in-process, with one compilation per parameter
-setting.
-
-### `-y`
-
-`-y` is the one language-specific search in core's options, because a directory can
-hold several languages and an instance in one can need a file in another. Each
-plugin indexes the directories for its own file types. `units` must not search
-them: it covers every source, including modules outside `--top`'s tree. A plugin
-leaves names in `Request.defined_elsewhere` to the plugin whose sources define them.
-
-## Parser
-
-```{eval-rst}
-.. autosummary::
-   :nosignatures:
-
-   svhier.parser.parse_files
-   svhier.parser.compute_filelist
+```text
+ roots ─► one compilation per parameter setting
+                    │
+                    ▼
+          ┌─ slang Driver loads the sources ◄───┐
+          │         │                           │
+          │         ▼                           │
+          │  elaborate into a Compilation       │
+          │         │                           │
+          │         ▼                           │ files or include dirs added
+          │  walk instances, collect missing ───┴── from -y, up to 20 times
+          │         │
+          └─────────┼─ next setting
+                    ▼
+       merge the settings into one fragment
 ```
 
-```{eval-rst}
-.. autofunction:: svhier.parser.parse_files
+The walk visits each unique pair of definition and parameter values once. A module whose
+generate branches depend on its parameters therefore lists the children of every setting
+it's used with.
+
+### The GHDL plugin
+
+```text
+ files ─► worker: scan ─► choose a library for each file
+                                   │
+                                   ▼
+                    pull what roots need from -y
+                                   │
+                                   ▼
+ ┌─► for each top and setting, in a child process:
+ │     load files ─► elaborate ─► print file order and hierarchy text
+ │                                 │
+ │                                 ▼
+ │          parse the text ─► one definition per entity
+ │                                 │
+ └── unbound instance found under -y
+                                   │ nothing new
+                                   ▼
+                               fragment
 ```
 
-:::{note}
-Modules that are defined but never instantiated are unreachable via `topInstances`
-and will appear in the output with an empty `insts` list.
-:::
+pyGHDL has no elaboration API, so the worker binds GHDL internals by symbol name. Keeping
+that in one child process limits the damage from a crash or from a GHDL release that
+changes them.
 
-### Inputs
+## The result
 
-All inputs go through slang's `Driver`, so source files, `-f`/`-F` command files
-(with `+incdir+`, `+define+`, nested command files and `${VAR}` environment
-variables), `-I`, `-D` and `--top` behave exactly as in slang itself.
+Every plugin returns the same dict shape, so everything after stitching is independent of
+language:
 
-### Parameterizations
+| Output | Built from | Code |
+|--------|-----------|------|
+| Instance tree | `files[].defs[].insts`, starting from the tops | {func}`~svhier.cli.build_tree` |
+| "Not found" table | `missing` | {func}`~svhier.cli._print_missing` |
+| "Defined more than once" table | `duplicates` | {func}`~svhier.cli._print_duplicates` |
+| "Pulled in from -y" table | `pulled` | {func}`~svhier.cli._print_pulled` |
+| YAML | `files`, without internal keys | {func}`~svhier.cli._prepare_for_yaml` |
+| Filelist | a graph of file dependencies, plus `inc_dirs` and `defines` | {func}`~svhier.filelist.compute_filelist` |
 
-The walk visits every unique (definition, parameter values) pair once, not every
-module name once.  A module whose generate branches depend on its parameters
-therefore lists the children of every setting it is instantiated with, merged
-without repeats.
+The keys are described in [Result format](dev/result-format.md).
 
-### Duplicate definitions
+## Design rules
 
-Definitions are keyed by `(name, file)`.  When a module, interface or package name
-is defined in more than one file, the result's `duplicates` list names every file
-and the copy slang actually uses (`used`).  The other copies are marked `shadowed`
-in their file entry: they are not elaborated (no `insts`) and `compute_filelist()`
-resolves the name to the used copy.  The CLI prints a warning per duplicate.
-
-```{eval-rst}
-.. autofunction:: svhier.parser.compute_filelist
-```
-
-:::{tip}
-If your design has genuine circular dependencies between files, the filelist falls
-back to the original input order rather than raising an error.
-:::
-
-When `--top` is given, slang's dependency trimming (`--depfile-trim`) decides which
-files the tops need (it follows module, interface, package and class references);
-`compute_filelist()` leaves the rest out and orders what remains.
-
-## Library search
-
-```{eval-rst}
-.. automodule:: svhier.libsearch
-   :members: Library, LibrarySearch, LibraryIndex, resolve_missing
-```
-
-The slang plugin calls {func}`~svhier.libsearch.resolve_missing` after each parse and re-parses
-with the returned files and include dirs until nothing new resolves (at most 20
-rounds).  Candidate files are found with a regex over the source text, so the index
-is cheap to build; slang still does the real parse of whatever gets pulled in.
-
-## CLI
-
-```{eval-rst}
-.. autosummary::
-   :nosignatures:
-
-   svhier.cli.collect_source_files
-   svhier.slang_frontend.collect_inc_dirs
-   svhier.cli.main
-```
-
-```{eval-rst}
-.. autofunction:: svhier.cli.collect_source_files
-```
-
-```{eval-rst}
-.. autofunction:: svhier.slang_frontend.collect_inc_dirs
-```
-
-```{eval-rst}
-.. autofunction:: svhier.cli.main
-```
-
-## Filtering rules
-
-The following symbols are intentionally excluded from the output:
-
-- **Packages and interfaces** — `getDefinitions()` is filtered to
-  `DefinitionKind.Module` only.
-- **Interface instances** — excluded inside module bodies via the `child.isModule`
-  guard (interface instances share `SymbolKind.Instance` with module instances but
-  have `isModule == False`).  They still count as filelist dependencies via `refs`.
-- **Untaken generate branches** — instances in generate blocks with
-  `isUninstantiated == True` are not listed.  Instances inside taken generate
-  blocks and instance arrays are listed with a path relative to the parent module
-  (e.g. `g_loop[0].u_core`, `u_arr[1]`).
-- **`pkgs`, `ifaces`, `refs`, `shadowed` keys** — internal bookkeeping stripped from YAML
-  output by `_prepare_for_yaml()`.  `refs` lists the packages and interfaces a
-  file references (imports, `pkg::name`, interface ports and instances), collected
-  from the syntax tree; `compute_filelist()` uses it to order files.
-- **`diagnostics`, `tops`, `needed`, `defines`, `inc_dirs` keys** —
-  top-level bookkeeping, not part of the YAML output.  Diagnostics are summarised
-  (or listed with `-E`/`-W`) on stderr; `defines` and `inc_dirs` go into the filelist.
-- **`missing` key** — names slang could not resolve, built from the
-  `UnknownModule`, `UnknownInterface`, `UnknownPackage`, `UnknownClassOrPackage`,
-  `CouldNotOpenIncludeFile` and `UnknownDirective` diagnostics.  Printed as the
-  **Not found** table and stripped from YAML output.
-- **`duplicates` key** — names defined in more than one file, with the copy slang
-  uses.  Printed as the **Defined more than once** table and stripped from YAML
-  output; the filelist resolves dependencies to the used copy.
-
-## Blackboxes
-
-Instances of undefined modules are `UninstantiatedDef` symbols in slang, not
-`Instance` symbols.  `_iter_module_instances(..., blackboxes=True)` yields them
-when building `insts`, using `definitionName` as `mod_name`, but the hierarchy
-walk never descends into them.
-
-## Development notes
-
-:::{warning}
-pyslang exposes its API through a compiled C++ extension that pylint cannot
-introspect.  `generated-members = ["pyslang.*"]` in `pyproject.toml` suppresses
-the resulting false-positive `no-member` errors.  The same list is passed to
-Sphinx via `autodoc_mock_imports` so the docs build without a compiled extension
-present.
-:::
-
-Line length is set to 160 in the pylint configuration.
+- **Core names no language.** A test checks that `cli.py` doesn't mention slang or GHDL.
+  The one exception is `KNOWN_SUFFIXES`, the install hint in `frontends.py`, because a
+  plugin that isn't installed can't report that itself.
+- **Compilers do the understanding.** Regexes only choose which library files to look at.
+  The compiler still parses whatever gets pulled in.
+- **A bad design isn't a crash.** Plugins report problems as diagnostics. The tree is
+  still printed, and the exit code is 1 if there are errors.
+- **stdout is for data.** Tables, warnings and the spinner go to stderr, so output can be
+  piped.
