@@ -15,8 +15,8 @@ svhier -r rtl/ -y vendor/ -y third_party/
 2. Every `-y` directory is indexed **recursively** for module, interface and
    package definitions, and for `.svh`/`.vh` headers.
 3. For each missing module, interface or package, the defining file is added
-   to the compilation. For each missing `` `include ``, the directory it lives
-   under is added as an include dir.
+   to the compilation. For each missing `` `include ``, the directory holding a
+   file of that name is added as an include dir, whatever the file's suffix.
 4. svhier re-parses and repeats until nothing new resolves, so dependencies of
    dependencies are found too.
 

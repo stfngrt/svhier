@@ -24,21 +24,22 @@ _MAX_LIB_ROUNDS = 20
 
 
 _INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
+# Files that are only ever included, but aren't headers whose directory is always searched.
+_OTHER_INCLUDES = ("*.svi", "*.vi", "*.inc", "*.def")
 # What slang's command file parser skips, and how it spells environment variables.
 _COMMAND_FILE_COMMENT = re.compile(r"(?:^|(?<=\s))(?:#[^\n]*|//[^\n]*|/\*.*?\*/)", re.M | re.S)
 _COMMAND_FILE_VAR = re.compile(r"\$(?:\{(\w+)\}|\((\w+)\)|(\w+))")
 _COMMAND_FILE_FLAG = re.compile(r"-([fF])=?(.*)")
 
 
-def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
-    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
+def _include_base_dirs(sources: list[Path], includable: list[Path]) -> list[Path]:
+    """Return the base dirs needed by `` `include`` directives in *sources*.
 
-    For every include path with a directory component, each known header whose path
-    ends with that include path contributes the directory it must be resolved from,
-    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
+    Each known file whose path ends with an include path contributes the directory it must
+    be resolved from, e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
     """
     by_name: dict[str, list[Path]] = {}
-    for hdr in headers:
+    for hdr in includable:
         by_name.setdefault(hdr.name, []).append(hdr)
 
     bases: list[Path] = []
@@ -49,8 +50,10 @@ def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
             continue
         for inc in _INCLUDE_RE.findall(text):
             parts = Path(inc).parts
-            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
+            if not parts or Path(inc).is_absolute() or ".." in parts:
                 continue
+            if len(parts) == 1 and (src.parent / inc).exists():
+                continue  # Resolves next to the file including it, with no search path.
             for hdr in by_name.get(parts[-1], []):
                 if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
                     bases.append(hdr.parents[len(parts) - 1])
@@ -65,8 +68,8 @@ def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None 
     format expected by VCS, Questa, and Xcelium.
 
     Every directory that contains a header is returned.  In addition, when a source
-    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
-    the directory that include path is relative to is returned too.
+    or header includes a file that exists, such as `` `include "sub/dir/file.svh"`` or
+    `` `include "defines.sv"``, the directory that include path is relative to is returned too.
 
     For directory inputs the search respects the *recursive* flag.
     For explicit file inputs the parent directory is checked for headers.
@@ -75,19 +78,21 @@ def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None 
     ign = ignore or set()
     headers: list[Path] = []
     sources: list[Path] = []
+    other_includes: list[Path] = []
 
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
             headers.extend(glob_files(p, recursive, ("*.svh", "*.vh"), ign))
             sources.extend(glob_files(p, recursive, ("*.sv", "*.v"), ign))
+            other_includes.extend(glob_files(p, recursive, _OTHER_INCLUDES, ign))
         elif p.is_file() and not is_ignored(p, p.parent, ign):
             sources.append(p)
             headers.extend(glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
 
     seen: set[Path] = set()
     result: list[str] = []
-    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
+    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers + sources + other_includes):
         resolved = d.resolve()
         if resolved not in seen:
             seen.add(resolved)
@@ -334,7 +339,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
         """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define."""
         library = self.search.library
-        if not library:
+        if library is None:  # Not "if not": a directory with only an include has nothing it counts.
             return False
         missing = hierarchy["missing"]
         wanted = {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}

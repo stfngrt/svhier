@@ -1,11 +1,14 @@
 """Tests for -y library directory resolution."""
 
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
 
 from svhier.cli import main
+from svhier.frontends import Request, Root
 from svhier.libsearch import LibraryIndex, resolve_missing
+from svhier.slang_frontend import SlangFrontend
 
 
 @pytest.fixture(name="design")
@@ -95,3 +98,35 @@ def test_library_index_ignore_matches_whole_names_below_the_library_dir(tmp_path
     assert index.find_definition("btb") == [lib / "btb.sv"]
     assert not index.find_definition("bench")
     assert index.headers == [lib / "regs.svh"]
+
+
+def test_include_with_any_suffix_is_found(tmp_path):
+    """`include can name anything: prim_assert.sv, bsg_defines.sv, HardFloat_consts.vi."""
+    (tmp_path / "lib/a").mkdir(parents=True)
+    (tmp_path / "lib/b").mkdir(parents=True)
+    (tmp_path / "lib/a/defs.sv").write_text("`define A\n")
+    (tmp_path / "lib/b/consts.vi").write_text("`define B\n")
+    index = LibraryIndex([str(tmp_path / "lib")])
+    assert index.find_include_dir("defs.sv") == tmp_path / "lib/a"
+    assert index.find_include_dir("consts.vi") == tmp_path / "lib/b"
+    assert index.find_include_dir("b/consts.vi") == tmp_path / "lib"
+    assert index.find_include_dir("nope.vi") is None
+
+
+def test_include_search_leaves_out_ignored_files(tmp_path):
+    (tmp_path / "lib/dv").mkdir(parents=True)
+    (tmp_path / "lib/dv/defs.sv").write_text("`define A\n")
+    assert LibraryIndex([str(tmp_path / "lib")], {"dv"}).find_include_dir("defs.sv") is None
+
+
+def test_y_resolves_an_include_named_like_a_source(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "lib/inc").mkdir(parents=True)
+    (tmp_path / "src/top.sv").write_text('`include "defs.sv"\nmodule top; logic [`W-1:0] x; endmodule\n')
+    (tmp_path / "lib/inc/defs.sv").write_text("`define W 4\n")
+    frontend = SlangFrontend()
+    frontend.configure(Namespace(paths=[], recursive=False, ignore=None, defines=[], include_dirs=[], command_files=[], libdirs=[str(tmp_path / "lib")]))
+    result = frontend.elaborate([str(tmp_path / "src/top.sv")], Request(roots=[Root("top", requested=True)]))
+    assert not result["has_errors"], result["diagnostics"]
+    assert result["missing"]["includes"] == {}
+    assert str(tmp_path / "lib/inc") in result["inc_dirs"]

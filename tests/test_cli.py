@@ -476,3 +476,24 @@ def test_command_file_with_only_vhdl_without_a_vhdl_plugin(monkeypatch, tmp_path
     err = capsys.readouterr().err
     assert "install and enable svhier-ghdl" in err
     assert "no source files found" in err
+
+
+def test_collect_inc_dirs_finds_included_sources(tmp_path):
+    """Only as far as something includes them: other source directories stay out."""
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n`include "consts.vi"\n`include "gone.sv"\n')
+    (tmp_path / "lib/defs.sv").write_text("`define A\n")
+    (tmp_path / "lib/consts.vi").write_text("`define B\n")
+    (tmp_path / "other/unrelated.sv").write_text("module unrelated; endmodule\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == [str(tmp_path / "lib")]
+
+
+def test_collect_inc_dirs_leaves_out_what_resolves_next_to_the_includer(tmp_path):
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n')
+    (tmp_path / "rtl/defs.sv").write_text("`define A\n")
+    (tmp_path / "other/defs.sv").write_text("`define A\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == []
