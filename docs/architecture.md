@@ -179,6 +179,12 @@ Both follow the same steps, but each compiler works differently:
        merge the settings into one fragment
 ```
 
+Rounds for `-y` are cheap, because only the last one is built into a result. A round walks
+the instances, since some missing names only show up while the design is elaborated, and
+reports what is missing and which files are loaded. Everything else waits until a round
+pulls nothing new: the definitions, the file entries with their references, the duplicates,
+the diagnostics and the trimmed file list. So the diagnostics describe the final load only.
+
 The walk visits each unique pair of definition and parameter values once. A module whose
 generate branches depend on its parameters therefore lists the children of every setting
 it's used with.

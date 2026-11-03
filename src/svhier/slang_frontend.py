@@ -13,6 +13,7 @@ import importlib.util
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from svhier.frontends import Request, Root, empty_fragment
 from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
@@ -259,16 +260,17 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
 
         *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
-        options = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
-        hierarchy = self.tool.parse(files, self.inc_dirs, **options)
-        for _ in range(_MAX_LIB_ROUNDS):
-            if not library or not self._pull_missing(hierarchy, files):
-                break
-            hierarchy = self.tool.parse(files, self.inc_dirs, **options)
-        return hierarchy
+        options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
+        if library and self.search.library:
+            # Only the last round is returned in full, so earlier ones just report what is missing.
+            options |= {"pull": lambda loaded: self._pull_missing(loaded, files), "max_pulls": _MAX_LIB_ROUNDS}
+        return self.tool.parse(files, self.inc_dirs, **options)
 
     def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
-        """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define."""
+        """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define.
+
+        *hierarchy* needs only ``files`` (with their ``file_name``) and ``missing``.
+        """
         library = self.search.library
         if not library:
             return False

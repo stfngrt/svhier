@@ -187,14 +187,19 @@ class _FakeTool:
     def unavailable_reason(self) -> str | None:
         return "no slang here"
 
-    def parse(self, files, inc_dirs, **options):  # pylint: disable=unused-argument
-        self.parsed.append(list(files))
-        needs_lib = "lib.sv" not in " ".join(files)
-        return {
-            "files": [{"file_name": f, "defs": [{"mod_name": "Mod"}]} for f in files],
-            "parameter_names": {"Mod": ["P"]},
-            "missing": {"modules": {"lib": ["a.sv"]} if needs_lib else {}, "interfaces": {}, "packages": {}, "includes": {}, "macros": {}},
-        }
+    def parse(self, files, inc_dirs, pull=None, max_pulls=0, **options):  # pylint: disable=unused-argument
+        """Load, then load again while *pull* adds to *files*, like the real tool."""
+        for _ in range(max_pulls + 1):
+            self.parsed.append(list(files))
+            needs_lib = "lib.sv" not in " ".join(files)
+            result = {
+                "files": [{"file_name": f, "defs": [{"mod_name": "Mod"}]} for f in files],
+                "parameter_names": {"Mod": ["P"]},
+                "missing": {"modules": {"lib": ["a.sv"]} if needs_lib else {}, "interfaces": {}, "packages": {}, "includes": {}, "macros": {}},
+            }
+            if not (pull and pull(result)):
+                break
+        return result
 
 
 def test_tool_and_library_are_injected(tmp_path):
@@ -215,3 +220,78 @@ def test_tool_and_library_are_injected(tmp_path):
     assert tool.parsed == [["a.sv"]]  # units() doesn't search -y.
     frontend._parse(files, ["Mod"])  # pylint: disable=protected-access
     assert tool.parsed[-1] == ["a.sv", str(tmp_path / "lib.sv")]
+
+
+def _chain(tmp_path: Path) -> tuple[SlangFrontend, list[str]]:
+    """A source whose library files need several rounds: top -> mid -> leaf, with a package and an include."""
+    lib = tmp_path / "lib"
+    (lib / "inc").mkdir(parents=True)
+    (lib / "inc" / "width.svh").write_text("`define WIDTH 4\n")
+    (lib / "pkg.sv").write_text("package pkg; localparam int N = 2; endpackage\n")
+    (lib / "mid.sv").write_text("`include \"width.svh\"\nmodule mid import pkg::*; #(parameter int P = N) ();\n"
+                                "  for (genvar i = 0; i < P; i++) begin : g leaf u_leaf (); end\n  deep u_deep ();\nendmodule\n")
+    (lib / "leaf.sv").write_text("module leaf; endmodule\n")
+    (lib / "deep.sv").write_text("module deep; nowhere u_nowhere (); endmodule\n")
+    source = tmp_path / "top.sv"
+    source.write_text("module top; mid u_mid (); endmodule\n")
+    frontend = SlangFrontend()
+    frontend.search = LibrarySearch(LibraryIndex([str(lib)]))
+    return frontend, [str(source)]
+
+
+def test_library_rounds_give_the_result_of_loading_everything_at_once(tmp_path):
+    frontend, files = _chain(tmp_path)
+    result = frontend._parse(files, ["top"])  # pylint: disable=protected-access
+    assert sorted(Path(f).name for f in files) == ["deep.sv", "leaf.sv", "mid.sv", "pkg.sv", "top.sv"]
+    once = parse_files(files, frontend.inc_dirs, tops=["top"], frontend_info=True)
+    assert result == once
+    assert _insts(result, "mid") == ["g[0].u_leaf", "g[1].u_leaf", "u_deep"]
+    assert list(result["missing"]["modules"]) == ["nowhere"]
+
+
+def test_diagnostics_come_from_the_last_round_only(tmp_path):
+    frontend, files = _chain(tmp_path)
+    first = parse_files(files, tops=["top"])
+    assert any("unknown module 'mid'" in d["message"] for d in first["diagnostics"])
+    result = frontend._parse(files, ["top"])  # pylint: disable=protected-access
+    messages = " ".join(d["message"] for d in result["diagnostics"])
+    assert "unknown module 'nowhere'" in messages
+    assert "unknown module 'mid'" not in messages and "unknown module 'leaf'" not in messages
+    assert len([d for d in result["diagnostics"] if "unknown module" in d["message"]]) == 1
+
+
+def test_include_dirs_pulled_in_a_round_reach_the_next_even_when_none_were_given(tmp_path):
+    frontend, files = _chain(tmp_path)
+    assert frontend.inc_dirs == []
+    frontend._parse(files, ["top"])  # pylint: disable=protected-access
+    assert frontend.inc_dirs == [str(tmp_path / "lib" / "inc")]
+
+
+def test_parse_files_asks_to_pull_only_so_often(tmp_path):
+    path = tmp_path / "a.sv"
+    path.write_text("module a; b u (); endmodule\n")
+    asked = []
+
+    def pull(loaded):
+        asked.append(loaded)
+        return True
+
+    result = parse_files([str(path)], tops=["a"], pull=pull, max_pulls=3)
+    assert len(asked) == 3
+    assert asked[0]["files"] == [{"file_name": str(path)}] and list(asked[0]["missing"]["modules"]) == ["b"]
+    assert _insts(result, "a") == ["u"]
+    assert parse_files([str(path)], pull=pull)["missing"]["modules"] == {"b": [str(path)]}
+    assert len(asked) == 3  # Without max_pulls nobody is asked.
+
+
+def test_files_that_moved_between_calls_are_seen(tmp_path):
+    first, second = tmp_path / "first.sv", tmp_path / "second.sv"
+    first.write_text("module m; endmodule\n")
+    second.write_text("module m; endmodule\n")
+    link = tmp_path / "link.sv"
+    link.symlink_to(first)
+    assert parse_files([str(link)])["duplicates"] == []
+    link.unlink()
+    link.symlink_to(second)
+    result = parse_files([str(link), str(first)])
+    assert [d["files"] for d in result["duplicates"]] == [[str(link), str(first)]]

@@ -20,8 +20,9 @@ and appear in the output with an empty ``insts`` list.
 
 import re
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import cast
 
@@ -66,9 +67,20 @@ DefKey = tuple[str, str]
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
+def _resolve(path: str) -> str:
+    """Return *path* made absolute with symlinks resolved.
+
+    Cached, because one run asks for the same few hundred files hundreds of thousands of
+    times and ``Path.resolve`` costs a ``lstat`` per path component.  :func:`parse_files`
+    clears the cache when it starts, so files that moved between calls are seen.
+    """
+    return str(Path(path).resolve())
+
+
 def _canon(sm: SourceManager, loc) -> str:
     """Return the resolved path of the file that *loc* (possibly inside a macro) belongs to."""
-    return str(Path(sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer)).resolve())
+    return _resolve(sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer))
 
 
 def _definitions_by_file(compilation: Compilation, sm: SourceManager, kind) -> dict[str, list[DefinitionSymbol]]:
@@ -173,10 +185,16 @@ class _Walk:
     insts: dict[DefKey, list[InstanceSymbol]] = field(default_factory=dict)
     imports: dict[DefKey, list[str]] = field(default_factory=dict)
     blackbox_params: dict[str, list[dict]] = field(default_factory=dict)
+    _files: dict[tuple[int, int], str] = field(default_factory=dict)  # (buffer id, offset) -> canonical file
 
     def key(self, defn: DefinitionSymbol) -> DefKey:
-        """Return the :data:`DefKey` of *defn*."""
-        return (defn.name, _canon(self.sm, defn.location))
+        """Return the :data:`DefKey` of *defn*.  Every instance asks, but few locations differ."""
+        loc = defn.location
+        where = (loc.buffer.id, loc.offset)
+        canonical = self._files.get(where)
+        if canonical is None:
+            canonical = self._files[where] = _canon(self.sm, loc)
+        return (defn.name, canonical)
 
 
 _NAMED_INT_PARAM = re.compile(r"\.(\w+)\s*\(\s*(\d+)\s*\)")
@@ -235,8 +253,9 @@ def _walk_instances(tops, sm: SourceManager) -> _Walk:
         walk.insts.setdefault(key, []).append(inst)
         imports = walk.imports.setdefault(key, [])
         imports.extend(p for p in _collect_imports(inst.body) if p not in imports)
-        stack.extend(reversed(list(_iter_module_instances(inst.body))))
-        for child in _iter_module_instances(inst.body, blackboxes=True):
+        children = list(_iter_module_instances(inst.body, blackboxes=True))
+        stack.extend(c for c in reversed(children) if c.kind != SymbolKind.UninstantiatedDef)
+        for child in children:
             if child.kind == SymbolKind.UninstantiatedDef:
                 uses = walk.blackbox_params.setdefault(child.definitionName, [])
                 use = _blackbox_params(child)
@@ -386,7 +405,7 @@ def _trimmed_files(driver: Driver, depfile: Path) -> set[str]:
     driver.optionallyWriteDepFiles()
     if not depfile.exists():
         return set()
-    return {str(Path(line.strip()).resolve()) for line in depfile.read_text().splitlines() if line.strip()}
+    return {_resolve(line.strip()) for line in depfile.read_text().splitlines() if line.strip()}
 
 
 def _include_dirs(trees: list[SyntaxTree], sm: SourceManager) -> list[str]:
@@ -471,12 +490,12 @@ def _collect_input_files(driver: Driver, file_paths: list[str]) -> list[tuple[st
     command file are named by the absolute path slang loaded.
     """
     sm = driver.sourceManager
-    explicit = {str(Path(p).resolve()): p for p in file_paths}
+    explicit = {_resolve(p): p for p in file_paths}
     out = []
     for tree in driver.syntaxTrees:
         loc = tree.root.getLastToken().location  # EOF token: always in the file itself
         full = sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer)
-        canonical = str(Path(full).resolve())
+        canonical = _resolve(full)
         out.append((explicit.get(canonical, str(full)), canonical, tree))
     return out
 
@@ -515,6 +534,8 @@ def parse_files(  # pylint: disable=too-many-arguments
     command_files: list[tuple[str, str]] | None = None,
     params: dict[str, str] | None = None,
     frontend_info: bool = False,
+    pull: Callable[[dict], bool] | None = None,
+    max_pulls: int = 0,
 ) -> dict:
     """Parse SystemVerilog sources and return the module/instance hierarchy.
 
@@ -531,6 +552,11 @@ def parse_files(  # pylint: disable=too-many-arguments
       the working directory.
     * *params* — parameter values for the top modules, ``{name: SystemVerilog expression}``.
       Names are case-sensitive; slang ignores names a top doesn't have.
+    * *pull* — called after loading, up to *max_pulls* times, with ``{"files": [{"file_name"}],
+      "missing": ...}`` (what is loaded, and the ``missing`` of the result).  When it returns
+      true it has added to *file_paths* or *inc_dirs*, which are read again, and the sources
+      are reloaded.  Only the last load is walked and returned in full, so a caller that
+      searches library directories doesn't pay for the hierarchy of every round.
 
     See the module docstring for the elaboration model.  Raises ``ValueError`` if slang
     rejects the inputs (for example a missing command file).
@@ -587,40 +613,94 @@ def parse_files(  # pylint: disable=too-many-arguments
         for each kind in :data:`MISSING_KINDS` (see :func:`_collect_missing`).
         Instances of missing modules (blackboxes) are still listed in ``insts``.
     """
-    inputs = _Inputs(list(file_paths), list(inc_dirs or []), list(defines or []),
-                     list(tops or []), list(command_files or []), dict(params or {}))
+    _resolve.cache_clear()
+    include_dirs = inc_dirs if inc_dirs is not None else []  # Read again after each pull.
+
+    def current() -> _Inputs:
+        return _Inputs(list(file_paths), list(include_dirs), list(defines or []),
+                       list(tops or []), list(command_files or []), dict(params or {}))
+
     with tempfile.TemporaryDirectory() as tmp:
-        result = _elaborate(inputs, Path(tmp) / "modules.d")
+        result = _elaborate(current, Path(tmp) / "modules.d", pull, max_pulls)
     if not frontend_info:  # These are for svhier.slang_frontend.
         for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
             del result[key]
     return result
 
 
-def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
-    """Run slang on *inputs* and build the :func:`parse_files` result.
+@dataclass
+class _Loaded:
+    """One load of the sources: slang's state, and what the rounds that settle on it have computed."""
 
-    *depfile* is a scratch path for slang's trimmed module list (used with tops only).
+    inputs: _Inputs
+    driver: Driver
+    compilation: Compilation
+    load_errors: list[str]
+    files: list[tuple[str, str, SyntaxTree]]
+    walk: _Walk
+    missing: dict[str, dict[str, list[str]]] | None = None
+
+    @property
+    def sm(self) -> SourceManager:
+        """The driver's source manager."""
+        return self.driver.sourceManager
+
+    @property
+    def pairs(self) -> list[tuple[str, str]]:
+        """``(file_name, canonical)`` per loaded file."""
+        return [(f, c) for f, c, _ in self.files]
+
+    def collect_missing(self) -> dict[str, dict[str, list[str]]]:
+        """Return the ``missing`` of the result, collected once."""
+        if self.missing is None:
+            self.missing = _collect_missing(self.compilation, self.sm, {c: f for f, c in self.pairs})
+        return self.missing
+
+
+def _load(inputs: _Inputs, depfile: Path) -> _Loaded:
+    """Load *inputs* and walk the instances, which is all that deciding on another round needs.
+
+    The walk elaborates parts of the design that the diagnostics alone don't reach, and some
+    of the missing names only show up there.
     """
     extra = ["--Mmodule", str(depfile), "--depfile-trim"] if inputs.tops else []
     driver, compilation, load_errors = _run_driver(inputs, extra)
-    sm = driver.sourceManager
-    files = _collect_input_files(driver, inputs.files)
+    walk = _walk_instances(compilation.getRoot().topInstances, driver.sourceManager)
+    return _Loaded(inputs, driver, compilation, load_errors, _collect_input_files(driver, inputs.files), walk)
+
+
+def _elaborate(inputs_now: Callable[[], _Inputs], depfile: Path, pull: Callable[[dict], bool] | None = None, max_pulls: int = 0) -> dict:
+    """Run slang on the inputs and build the :func:`parse_files` result.
+
+    *depfile* is a scratch path for slang's trimmed module list (used with tops only).
+    After each of the first *max_pulls* loads, *pull* is asked whether to load again.
+    Only the last load is built into a result, since the others are only asked what is missing.
+    """
+    loaded = _load(inputs_now(), depfile)
+    for _ in range(max_pulls):
+        if pull is None or not pull({"files": [{"file_name": f} for f, _ in loaded.pairs], "missing": loaded.collect_missing()}):
+            break
+        del loaded  # A design takes gigabytes, so the last load goes before the next starts.
+        loaded = _load(inputs_now(), depfile)
+    return _result(loaded, depfile)
+
+
+def _result(loaded: _Loaded, depfile: Path) -> dict:
+    """Build the :func:`parse_files` result for *loaded*."""
+    compilation, sm, walk, pairs = loaded.compilation, loaded.sm, loaded.walk, loaded.pairs
     tables = _build_tables(compilation, sm)
-    walk = _walk_instances(compilation.getRoot().topInstances, sm)
-    needed = _trimmed_files(driver, depfile) if inputs.tops else None
+    needed = _trimmed_files(loaded.driver, depfile) if loaded.inputs.tops else None
     diags, has_errors = _collect_diagnostics(compilation, sm)
-    pairs = [(f, c) for f, c, _ in files]
     return {
-        "files": _build_file_entries(walk, tables, files),
+        "files": _build_file_entries(walk, tables, loaded.files),
         "duplicates": _find_duplicates(tables, pairs),
-        "tops": inputs.tops,
+        "tops": loaded.inputs.tops,
         "needed": None if needed is None else [f for f, c in pairs if c in needed],
-        "defines": list(driver.createOptionBag().preprocessorOptions.predefines),
-        "inc_dirs": _include_dirs(driver.syntaxTrees, sm),
-        "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
-        "has_errors": has_errors or bool(load_errors),
-        "missing": _collect_missing(compilation, sm, {c: f for f, c in pairs}),
+        "defines": list(loaded.driver.createOptionBag().preprocessorOptions.predefines),
+        "inc_dirs": _include_dirs(loaded.driver.syntaxTrees, sm),
+        "diagnostics": [{"severity": "error", "file": "", "message": e} for e in loaded.load_errors] + diags,
+        "has_errors": has_errors or bool(loaded.load_errors),
+        "missing": loaded.collect_missing(),
         "blackbox_params": walk.blackbox_params,
         "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
         "parameter_names": {d.name: _parameter_names(d) for defs in tables.modules.values() for d in defs},
