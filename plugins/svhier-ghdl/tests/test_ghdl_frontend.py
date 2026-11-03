@@ -1,6 +1,7 @@
 """The plugin against real GHDL and slang.  Skipped when pyGHDL isn't installed."""
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -93,3 +94,36 @@ def test_missing_module_is_reported_and_required_parameter_is_passed():
     proc = _svhier(".", "--top", "sv_top", "--no-tree")
     assert "nowhere" in proc.stderr
     assert "its parameters aren't known" not in " ".join(proc.stderr.split())
+
+
+_LEAF_VHD = "entity leaf is end;\narchitecture rtl of leaf is begin end;\n"
+
+
+@needs_ghdl
+def test_command_file_with_only_vhdl(tmp_path):
+    (tmp_path / "leaf.vhd").write_text(_LEAF_VHD)
+    (tmp_path / "top.vhdl").write_text(
+        "entity top is end;\narchitecture rtl of top is begin\n  u_leaf: entity work.leaf;\nend;\n")
+    # -F: relative to the file, and through a nested file, a variable and a comment.
+    (tmp_path / "inner.f").write_text("# not_a_file.vhd\n$SVHIER_TEST_DIR/top.vhdl\n")
+    (tmp_path / "list.f").write_text("// not_a_file.vhd\nleaf.vhd\n-f inner.f\n")
+    proc = subprocess.run(
+        [sys.executable, "-c", "from svhier.cli import main; main()", "-F", str(tmp_path / "list.f"), "--top", "top", "-E"],
+        capture_output=True, text=True, check=False, env={**os.environ, "SVHIER_TEST_DIR": str(tmp_path)})
+    assert proc.returncode == 0, proc.stderr
+    assert "u_leaf (leaf)" in proc.stdout
+    assert "not_a_file" not in proc.stderr
+
+
+@needs_ghdl
+def test_command_file_mixing_languages(tmp_path):
+    (tmp_path / "leaf.vhd").write_text(_LEAF_VHD)
+    (tmp_path / "top.sv").write_text("module top; leaf u_leaf (); endmodule\n")
+    (tmp_path / "list.f").write_text("leaf.vhd\ntop.sv\n")
+    proc = subprocess.run(
+        [sys.executable, "-c", "from svhier.cli import main; main()", "-F", str(tmp_path / "list.f"), "--top", "top", "--filelist", "-", "--tree"],
+        capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "u_leaf (leaf)" in proc.stdout
+    assert "(blackbox)" not in proc.stdout
+    assert str(tmp_path / "leaf.vhd") in proc.stdout

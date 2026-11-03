@@ -10,11 +10,13 @@ without it.
 
 import argparse
 import importlib.util
+import os
 import re
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 
-from svhier.frontends import Request, Root, empty_fragment
+from svhier.frontends import KNOWN_SUFFIXES, Request, Root, empty_fragment
 from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
@@ -22,6 +24,10 @@ _MAX_LIB_ROUNDS = 20
 
 
 _INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
+# What slang's command file parser skips, and how it spells environment variables.
+_COMMAND_FILE_COMMENT = re.compile(r"(?:^|(?<=\s))(?:#[^\n]*|//[^\n]*|/\*.*?\*/)", re.M | re.S)
+_COMMAND_FILE_VAR = re.compile(r"\$(?:\{(\w+)\}|\((\w+)\)|(\w+))")
+_COMMAND_FILE_FLAG = re.compile(r"-([fF])=?(.*)")
 
 
 def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
@@ -98,6 +104,38 @@ class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-met
         setattr(namespace, self.dest, items)
 
 
+def files_in_command_files(command_files: list[tuple[str, str]], suffixes: set[str]) -> list[str]:
+    """Return the entries of ``(flag, path)`` command files whose suffix is in *suffixes*.
+
+    slang has no way to list what it read, so this follows ``-f``/``-F``, comments, quotes and
+    environment variables the same way.  A command file that can't be read is left for slang
+    to report.
+    """
+    found: list[str] = []
+    seen: set[Path] = set()
+
+    def read(path: Path, base: Path) -> None:
+        if path.resolve() in seen:
+            return
+        seen.add(path.resolve())
+        try:
+            text = _COMMAND_FILE_COMMENT.sub("", path.read_text(encoding="utf-8", errors="replace"))
+            tokens = iter(shlex.split(_COMMAND_FILE_VAR.sub(lambda m: os.environ.get(m[1] or m[2] or m[3], ""), text)))
+        except (OSError, ValueError):
+            return
+        for token in tokens:
+            flag = _COMMAND_FILE_FLAG.fullmatch(token)
+            if flag:
+                nested = base / (flag[2] or next(tokens, ""))
+                read(nested, nested.parent if flag[1] == "F" else base)
+            elif not token.startswith(("+", "-")) and Path(token).suffix.lower() in suffixes:
+                found.append(str(base / token))
+
+    for flag, name in command_files:
+        read(Path(name), Path(name).parent if flag == "-F" else Path())
+    return found
+
+
 def _add_unique(target: list, items: list) -> None:
     target.extend(item for item in items if item not in target)
 
@@ -159,6 +197,12 @@ class PyslangTool:
 
         return parse_files(files, inc_dirs, **options)
 
+    def has_sources(self, command_files: list[tuple[str, str]], exclude_exts: list[str]) -> bool:
+        """Return whether *command_files* name any source, apart from *exclude_exts*."""
+        from svhier.parser import command_files_have_sources  # pylint: disable=import-outside-toplevel
+
+        return command_files_have_sources(command_files, exclude_exts)
+
 
 class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     """Elaborate SystemVerilog with slang, including ``-f``, ``-I``, ``-D`` and ``-y``.
@@ -177,6 +221,9 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         self.defines: list[str] = []
         self.inc_dirs: list[str] = []
         self.command_files: list = []
+        # Entries of the command files for other languages, and their suffixes as slang sees them.
+        self._foreign: list[str] = []
+        self._exclude_exts: list[str] = []
         self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
         # {lowercase module name: (module name, its parameter names)}
@@ -219,7 +266,19 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         found = collect_inc_dirs(args.paths, args.recursive, ignore)
         self.inc_dirs = list(dict.fromkeys(args.include_dirs + found))
         self.command_files = args.command_files
+        self._read_foreign_entries()
         self.search = LibrarySearch(self._library_factory(args.libdirs, ignore) if args.libdirs else None)
+
+    def _read_foreign_entries(self) -> None:
+        """Keep entries other languages read away from slang, which would parse them as SV."""
+        self._foreign = files_in_command_files(self.command_files, set(KNOWN_SUFFIXES) - set(self.suffixes))
+        self._exclude_exts = sorted({Path(f).suffix[1:] for f in self._foreign})
+        if not self._foreign or self.unavailable_reason():
+            return
+        # An entry slang would read counts even if the file is missing, so slang reports that.
+        listed = files_in_command_files(self.command_files, set(self.suffixes))
+        if not listed and not self.tool.has_sources(self.command_files, self._exclude_exts):
+            self.command_files = []
 
     def unavailable_reason(self) -> str | None:
         """Report why slang can't be used; None if it can."""
@@ -228,6 +287,10 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     def extra_inputs(self) -> list[str]:
         """Command files are inputs too."""
         return [f"{len(self.command_files)} command file(s)"] if self.command_files else []
+
+    def foreign_files(self) -> list[str]:
+        """Return the command files' entries that another language reads."""
+        return self._foreign
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return the modules the inputs define.  With no tops, ``-y`` would serve unused modules too."""
@@ -259,7 +322,8 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
 
         *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
-        options = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
+        options = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files,
+                   "exclude_exts": self._exclude_exts, "frontend_info": True}
         hierarchy = self.tool.parse(files, self.inc_dirs, **options)
         for _ in range(_MAX_LIB_ROUNDS):
             if not library or not self._pull_missing(hierarchy, files):

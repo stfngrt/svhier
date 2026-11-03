@@ -21,6 +21,7 @@ this order:
 | | `configure(args)` | Read them, along with core's `paths`, `recursive`, `ignore` and `libdirs` |
 | Routing | `unavailable_reason()` | Say why it can't run, or return `None`. svhier then disables it with a warning |
 | | `extra_inputs()` | Describe inputs other than files, such as command files |
+| | `foreign_files()` | Return files its own inputs name that another plugin reads, as slang does for `.vhd` entries of command files. They're routed like paths on the command line |
 | | `has_library()` | Say whether `-y` holds anything for it |
 | Stitching | `units(files)` | Return `{lowercase name: file}` for what the sources define, without searching `-y` |
 | | `provide(name, files)` | Add the `-y` file defining `name` to `files`, and say whether there was one |
@@ -74,6 +75,9 @@ class ToyFrontend:
         return None
 
     def extra_inputs(self) -> list[str]:
+        return []
+
+    def foreign_files(self) -> list[str]:
         return []
 
     def has_library(self) -> bool:

@@ -459,12 +459,13 @@ def main():
     args = parser.parse_intermixed_args()
     for frontend in frontends:
         frontend.configure(args)
-    if not args.paths and not any(f.extra_inputs() for f in frontends):
+    foreign = [path for frontend in frontends for path in frontend.foreign_files()]
+    if not args.paths and not foreign and not any(f.extra_inputs() for f in frontends):
         parser.error("give at least one PATH or an input option such as -f (see --help)")
 
     ignore = {n.lower() for n in args.ignore} if args.ignore else set()
     suffixes = tuple(suffix for frontend in frontends for suffix in frontend.suffixes)
-    inputs = _route_files(frontends, collect_source_files(args.paths, args.recursive, suffixes, ignore))
+    inputs = _route_files(frontends, collect_source_files(args.paths + foreign, args.recursive, suffixes, ignore))
     if not inputs:
         _err.print("[red]error:[/red] no source files found")
         sys.exit(1)

@@ -67,6 +67,10 @@ svhier -f $CVA6_REPO_DIR/core/Flist.cva6 --top cva6 --filelist cva6.f
 With `-F FILE`, paths inside FILE are resolved relative to FILE. With `-f`,
 they're resolved relative to the working directory.
 
+`.vhd` and `.vhdl` entries go to the [VHDL plugin](vhdl.md) instead of slang, so
+a filelist can list both languages, or only VHDL. Without the plugin, they're
+skipped with a warning.
+
 :::{tip}
 A project filelist usually picks one variant of each config package or
 technology cell. That makes it the quickest way to a clean, duplicate-free

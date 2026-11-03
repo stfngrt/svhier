@@ -375,6 +375,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         """Only files count."""
         return []
 
+    def foreign_files(self) -> list[str]:
+        """The plugin's options name no files."""
+        return []
+
     def _worker(self, request: dict) -> subprocess.CompletedProcess:
         return self.tool.run({"std": self.std, "work": self.work, **request})
 

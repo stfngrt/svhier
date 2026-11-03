@@ -81,6 +81,9 @@ class Frontend(Protocol):
     def extra_inputs(self) -> list[str]:
         """Describe inputs other than files, from the plugin's own options, such as ``2 command file(s)``."""
 
+    def foreign_files(self) -> list[str]:
+        """Return files the plugin's own inputs name that another language reads, for core to route."""
+
     def units(self, files: list[str]) -> dict[str, str]:
         """Return ``{lowercase unit name: file}`` for what the inputs define, not searching ``-y``."""
 

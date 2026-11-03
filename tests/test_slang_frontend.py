@@ -8,7 +8,7 @@ import pytest
 from svhier.frontends import Request, Root
 from svhier.libsearch import LibraryIndex, LibrarySearch
 from svhier.parser import parse_files
-from svhier.slang_frontend import SlangFrontend
+from svhier.slang_frontend import SlangFrontend, files_in_command_files
 
 _SOURCE = """\
 module m #(parameter int COUNT) ();
@@ -215,3 +215,75 @@ def test_tool_and_library_are_injected(tmp_path):
     assert tool.parsed == [["a.sv"]]  # units() doesn't search -y.
     frontend._parse(files, ["Mod"])  # pylint: disable=protected-access
     assert tool.parsed[-1] == ["a.sv", str(tmp_path / "lib.sv")]
+
+
+def _configured(*command_files: tuple[str, str]) -> SlangFrontend:
+    frontend = SlangFrontend()
+    frontend.configure(Namespace(paths=[], recursive=False, ignore=None, defines=[], include_dirs=[], command_files=list(command_files), libdirs=None))
+    return frontend
+
+
+def test_command_file_vhdl_goes_to_whoever_reads_it(tmp_path):
+    (tmp_path / "top.sv").write_text("module top; endmodule\n")
+    (tmp_path / "leaf.vhd").write_text("-- entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("# a.vhd\n// b.vhd\n/* c.vhd */\nleaf.vhd\ntop.sv\n+incdir+inc.vhd\n")
+    frontend = _configured(("-F", str(tmp_path / "list.f")))
+    assert frontend.foreign_files() == [str(tmp_path / "leaf.vhd")]
+    assert frontend.extra_inputs() == ["1 command file(s)"]
+    result = frontend.elaborate([], Request(auto=True))
+    assert not result["has_errors"], result["diagnostics"]
+    assert [f["file_name"] for f in result["files"]] == [str(tmp_path / "top.sv")]
+
+
+def test_command_file_entries_are_read_like_slang_does(tmp_path, monkeypatch):
+    """Ask for .sv entries, which slang reads too, and compare."""
+    monkeypatch.setenv("SVHIER_TEST_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "sub/deep").mkdir(parents=True)
+    for index, name in enumerate(("a", "b", "c", "rel", "eq", "stuck", "sub/here", "sub/has space", "sub/other", "sub/deep/low")):
+        (tmp_path / f"{name}.sv").write_text(f"module m{index}; endmodule\n")
+    (tmp_path / "list.f").write_text(
+        "// comment.sv\n# hash.sv\n/* block\n more.sv */\n"
+        "${SVHIER_TEST_DIR}/a.sv $SVHIER_TEST_DIR/b.sv $(SVHIER_TEST_DIR)/c.sv rel.sv // trailing.sv\n"
+        "+incdir+.\n-F sub/inner.f\n-f=eq.f\n-fstuck.f\n")
+    (tmp_path / "eq.f").write_text("eq.sv\n")
+    (tmp_path / "stuck.f").write_text("stuck.sv\n")
+    (tmp_path / "sub/inner.f").write_text('here.sv\n"has space.sv"\n-f other.f\n')
+    (tmp_path / "sub/other.f").write_text("other.sv\n-F deep/deeper.f\n")
+    (tmp_path / "sub/deep/deeper.f").write_text("low.sv\n")
+    command_files = [("-f", "list.f")]
+    slang = {str(Path(f["file_name"]).resolve()) for f in parse_files([], command_files=command_files)["files"]}
+    assert {str(Path(f).resolve()) for f in files_in_command_files(command_files, {".sv"})} == slang
+    assert len(slang) == 10
+
+
+def test_command_file_reader_leaves_what_it_cannot_read_to_slang(tmp_path):
+    (tmp_path / "quote.f").write_text("it's.vhd\n")
+    (tmp_path / "empty_token.f").write_text('""\n-f\n')
+    (tmp_path / "cycle.f").write_text(f"-f {tmp_path / 'cycle.f'}\nx.vhd\n")
+    assert files_in_command_files([("-f", str(tmp_path / "quote.f"))], {".vhd"}) == []
+    assert files_in_command_files([("-f", str(tmp_path / "empty_token.f"))], {".vhd"}) == []
+    assert files_in_command_files([("-f", str(tmp_path / "gone.f"))], {".vhd"}) == []
+    assert files_in_command_files([("-f", str(tmp_path / "cycle.f"))], {".vhd"}) == ["x.vhd"]
+
+
+def test_command_file_missing_sv_is_still_reported(tmp_path):
+    (tmp_path / "list.f").write_text("leaf.vhd\nmissing.sv\n")
+    frontend = _configured(("-F", str(tmp_path / "list.f")))
+    assert frontend.extra_inputs() == ["1 command file(s)"]
+    with pytest.raises(ValueError, match="slang rejected"):
+        frontend.elaborate([], Request(auto=True))
+
+
+def test_command_file_with_only_vhdl_gives_slang_nothing_to_do(tmp_path):
+    (tmp_path / "leaf.vhdl").write_text("-- entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("leaf.vhdl\n")
+    frontend = _configured(("-F", str(tmp_path / "list.f")))
+    assert frontend.foreign_files() == [str(tmp_path / "leaf.vhdl")]
+    assert frontend.extra_inputs() == []
+
+
+def test_command_file_without_vhdl_is_left_to_slang(tmp_path):
+    frontend = _configured(("-f", str(tmp_path / "does_not_exist.f")))
+    assert frontend.foreign_files() == []
+    assert frontend.extra_inputs() == ["1 command file(s)"]

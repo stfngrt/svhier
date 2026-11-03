@@ -47,7 +47,8 @@ uv run --no-sync svhier plugins/svhier-ghdl/tests/mixed --top sv_top
 `uv sync` removes both packages again, so use `uv run --no-sync` afterwards.
 
 Without pyGHDL, svhier still reads SystemVerilog. It warns that the plugin is
-disabled and skips `.vhd` and `.vhdl` files.
+disabled and skips `.vhd` and `.vhdl` files, including those listed in a command
+file.
 
 Only Linux is tested, with the GHDL 6.0.0 wheels for Python 3.11, 3.12 and 3.13.
 Windows and macOS aren't supported: the plugin's library path fix is Linux-only, and
@@ -55,9 +56,9 @@ GHDL publishes no macOS wheel.
 
 ## Usage
 
-`.vhd` and `.vhdl` files are read from the same paths as other sources, and
-`--top` can name a module or an entity. SystemVerilog-only options such as
-`-f` and `-I` don't apply to VHDL.
+`.vhd` and `.vhdl` files are read from the same paths as other sources, and from
+{ref}`command files <command-files>`, and `--top` can name a module or an
+entity. SystemVerilog-only options such as `-I` and `+incdir+` don't apply to VHDL.
 
 | Option | Meaning | Default |
 |--------|---------|---------|
