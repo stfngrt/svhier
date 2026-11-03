@@ -57,7 +57,7 @@ def collect_source_files(paths: list[str], recursive: bool, suffixes: tuple[str,
     for raw in paths:
         p = Path(raw)
         if p.is_file():
-            if not is_ignored(p, ign):
+            if not is_ignored(p, p.parent, ign):
                 result.append(p)
         elif p.is_dir():
             result.extend(glob_files(p, recursive, tuple(f"*{suffix}" for suffix in suffixes), ign))
@@ -132,6 +132,13 @@ _MISSING_LABELS = {
 }
 
 
+def _first_and_more(files: list[str]) -> str:
+    """Return the base name of the first of *files*, followed by how many others there are."""
+    if not files:
+        return ""
+    return Path(files[0]).name + (f" (+{len(files) - 1} more)" if len(files) > 1 else "")
+
+
 def _print_missing(hierarchy: dict) -> None:
     """Print a table of everything that could not be found to stderr.
 
@@ -148,10 +155,7 @@ def _print_missing(hierarchy: dict) -> None:
     table.add_column("Referenced in", style="dim", overflow="fold")
     for kind, label in _MISSING_LABELS.items():
         for name, files in missing.get(kind, {}).items():
-            where = Path(files[0]).name if files else ""
-            if len(files) > 1:
-                where += f" (+{len(files) - 1} more)"
-            table.add_row(label, name, where)
+            table.add_row(label, name, _first_and_more(files))
     _err.print(table)
 
 
@@ -167,10 +171,7 @@ def _print_duplicates(hierarchy: dict) -> None:
     table.add_column("Ignored", style="dim", overflow="fold")
     for dup in duplicates:
         ignored = [f for f in dup["files"] if f != dup["used"]]
-        shown = Path(ignored[0]).name if ignored else ""
-        if len(ignored) > 1:
-            shown += f" (+{len(ignored) - 1} more)"
-        table.add_row(dup["name"], dup["kind"], dup["used"], shown)
+        table.add_row(dup["name"], dup["kind"], dup["used"], _first_and_more(ignored))
     _err.print(table)
 
 
@@ -204,12 +205,19 @@ def build_tree(hierarchy: dict, tops: list[str] | None = None) -> list[Tree]:
     trees = []
     for top in tops:
         if top not in defs:
-            _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
             continue
         tree = Tree(f"[bold]{top}[/bold]")
         add_children(tree, top, (top,))
         trees.append(tree)
     return trees
+
+
+def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
+    """Warn about each of the requested *tops* that no input file defines."""
+    defined = {d["mod_name"] for f in hierarchy["files"] for d in f["defs"]}
+    for top in tops:
+        if top not in defined:
+            _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
 
 
 def _print_tree(hierarchy: dict, tops: list[str] | None) -> None:
@@ -238,7 +246,11 @@ def _write_to(content: str, dest: str, label: str) -> None:
     if dest == "-":
         sys.stdout.write(content)
     else:
-        Path(dest).write_text(content, encoding="utf-8")
+        try:
+            Path(dest).write_text(content, encoding="utf-8")
+        except OSError as exc:
+            _err.print(f"[red]error:[/red] cannot write {label} to [bold]{dest}[/bold]: {exc.strerror}")
+            sys.exit(1)
         _err.print(f"[green]✓[/green] {label} written to [bold]{dest}[/bold]")
 
 
@@ -343,10 +355,11 @@ def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentP
     parser.add_argument(
         "-x", "--ignore",
         action="append",
-        metavar="NAME",
+        metavar="PATTERN",
         default=None,
         dest="ignore",
-        help="Ignore files or directories whose name matches NAME. Repeatable.",
+        help="Skip files and directories whose whole name matches PATTERN, a name or a quoted glob "
+             "(case-insensitive). Only names below the given paths count. Applies to -y too. Repeatable.",
     )
     parser.add_argument(
         "-y", "--libdir",
@@ -416,6 +429,7 @@ def _report(hierarchy: dict, args) -> None:
     _print_missing(hierarchy)
     for note in hierarchy.get("frontend_notes", []):
         _err.print(f"[yellow]note:[/yellow] {note}")
+    _warn_unknown_tops(hierarchy, hierarchy["tops"] or args.tops)
 
 
 def _write_outputs(hierarchy: dict, args) -> None:

@@ -373,7 +373,13 @@ def _trimmed_files(driver: Driver, depfile: Path) -> set[str]:
     The driver must have been given ``--top``, ``--depfile-trim`` and ``--Mmodule <depfile>``.
     slang's trimming follows module, interface, package and class references, so it is the
     authority on which files a top needs.
+
+    Writing the depfile warns directly on stderr about every name without a source file,
+    including names only used in untaken generate branches.  Real gaps are in ``missing``
+    and a bad ``--top`` is an elaboration error, so those warnings are switched off here.
+    Warnings about the command line itself were already printed by then.
     """
+    driver.diagEngine.setWarningOptions(["no-command-line"])
     driver.optionallyWriteDepFiles()
     if not depfile.exists():
         return set()
@@ -610,7 +616,7 @@ def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
         "inc_dirs": _include_dirs(driver.syntaxTrees, sm),
         "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
         "has_errors": has_errors or bool(load_errors),
-        "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
+        "missing": _collect_missing(compilation, sm, {c: f for f, c in pairs}),
         "blackbox_params": walk.blackbox_params,
         "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
         "parameter_names": {d.name: _parameter_names(d) for defs in tables.modules.values() for d in defs},

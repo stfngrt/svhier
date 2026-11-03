@@ -776,3 +776,20 @@ def test_tops_limit_elaboration(tmp_path):
     assert not only_top["has_errors"]
     insts = {d["mod_name"]: d["insts"] for d in only_top["files"][0]["defs"]}
     assert insts["top"] == [{"mod_name": "leaf", "inst_name": "u_leaf"}]
+
+
+def test_top_trimming_does_not_print_slang_warnings(tmp_path, capfd):
+    """Names only used in untaken generate branches are not worth reporting."""
+    src = tmp_path / "t.sv"
+    src.write_text("module top; if (0) begin ghost u(); end endmodule\n", encoding="utf-8")
+    result = parse_files([str(src)], tops=["top"])
+    assert not result["has_errors"]
+    assert result["needed"] == [str(src)]
+    assert "not found in any source file" not in capfd.readouterr().err
+
+
+def test_top_trimming_keeps_earlier_command_line_warnings(tmp_path, capfd):
+    src = tmp_path / "t.sv"
+    src.write_text("module top; endmodule\n", encoding="utf-8")
+    parse_files([str(src)], [str(tmp_path / "no_such_dir")], tops=["top"])
+    assert "no_such_dir" in capfd.readouterr().err

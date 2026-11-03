@@ -80,3 +80,18 @@ def test_any_case_lookup_keeps_exact_lookup_strict(tmp_path):
     index = LibraryIndex([str(tmp_path)])
     assert not index.find_definition("top_cell")
     assert index.find("top_cell") == ([tmp_path / "Top_Cell.sv"], 0)
+
+
+def test_library_index_ignore_matches_whole_names_below_the_library_dir(tmp_path):
+    lib = tmp_path / "tb_vendor" / "lib"
+    (lib / "tb").mkdir(parents=True)
+    (lib / "btb.sv").write_text("module btb; endmodule\n", encoding="utf-8")
+    (lib / "tb" / "bench.sv").write_text("module bench; endmodule\n", encoding="utf-8")
+    (lib / "tb" / "bench.svh").write_text("", encoding="utf-8")
+    (lib / "regs.svh").write_text("", encoding="utf-8")
+
+    index = LibraryIndex([str(lib)], {"tb"})
+
+    assert index.find_definition("btb") == [lib / "btb.sv"]
+    assert not index.find_definition("bench")
+    assert index.headers == [lib / "regs.svh"]

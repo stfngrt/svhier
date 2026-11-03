@@ -74,7 +74,7 @@ def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None 
         if p.is_dir():
             headers.extend(glob_files(p, recursive, ("*.svh", "*.vh"), ign))
             sources.extend(glob_files(p, recursive, ("*.sv", "*.v"), ign))
-        elif p.is_file() and not is_ignored(p, ign):
+        elif p.is_file() and not is_ignored(p, p.parent, ign):
             sources.append(p)
             headers.extend(glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
 

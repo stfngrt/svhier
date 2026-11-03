@@ -71,6 +71,7 @@ copy being used. Fix this table first, then judge the errors.
 - **Pass the missing files or directories** as extra paths.
 - **Let svhier find them** with [library directories](libdirs.md) (`-y`).
 - **Exclude what you don't need.** If only testbenches want a missing
-  module, skip them with `-x tb`.
+  module, skip them by directory or file name, as in `-x tb` or
+  `-x '*_tb.sv'`.
 - **For duplicates, use the project's filelist** (`-f`). It usually picks one
   variant per name. See {ref}`command-files`.

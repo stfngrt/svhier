@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from svhier.cli import collect_source_files, _write_filelist, main
 from svhier.slang_frontend import collect_inc_dirs
 
@@ -331,3 +333,114 @@ def test_duplicates_table(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Defined more than once" in err
     assert "cfg" in err and "b.sv" in err
+
+
+# ---------------------------------------------------------------------------
+# -x / --ignore
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(name="ignore_tree")
+def fixture_ignore_tree(tmp_path):
+    """A design below a parent directory whose name contains ``tb`` and ``test``."""
+    root = tmp_path / "test_tb_project" / "rtl"
+    for rel in ("btb.sv", "latest.sv", "skip_me.sv", "tb/bench.sv", "TEST/stim.sv", "sub/tb/deep.sv", "sub/keep.sv"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    for rel in ("tb/bench.svh", "inc/regs.svh", "inc_tb/other.svh"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    return root
+
+
+def _names(paths):
+    return sorted(Path(p).name for p in paths)
+
+
+def _collect(paths, recursive, ignore):
+    return collect_source_files(paths, recursive, (".sv", ".v"), ignore)
+
+
+def test_ignore_matches_whole_names_only(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"tb"})
+    assert _names(result) == ["btb.sv", "keep.sv", "latest.sv", "skip_me.sv", "stim.sv"]
+
+
+def test_ignore_is_case_insensitive(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"test"})
+    assert "stim.sv" not in _names(result)
+    assert "latest.sv" in _names(result)
+
+
+def test_ignore_matches_file_name_with_extension(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"skip_me.sv"})
+    assert "skip_me.sv" not in _names(result)
+    assert _collect([str(ignore_tree / "skip_me.sv")], recursive=False, ignore={"skip_me.sv"}) == []
+
+
+def test_ignore_skips_parents_of_the_given_path(ignore_tree):
+    """Only components below the given path count."""
+    parents = {ignore_tree.parent.name, ignore_tree.parent.parent.name}
+    result = _collect([str(ignore_tree)], recursive=True, ignore=parents)
+    assert len(result) == 7
+
+
+def test_ignore_does_not_apply_to_the_given_directory_itself(ignore_tree):
+    result = _collect([str(ignore_tree / "tb")], recursive=True, ignore={"tb"})
+    assert _names(result) == ["bench.sv"]
+
+
+def test_ignore_explicit_file_checks_only_its_own_name(ignore_tree):
+    path = str(ignore_tree / "tb" / "bench.sv")
+    assert _collect([path], recursive=False, ignore={"tb"}) == [path]
+
+
+def test_ignore_applies_to_include_dirs(ignore_tree):
+    result = collect_inc_dirs([str(ignore_tree)], recursive=True, ignore={"tb"})
+    assert sorted(Path(d).name for d in result) == ["inc", "inc_tb"]
+
+
+def test_ignore_accepts_glob_patterns(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"*_me.sv", "t?"})
+    assert _names(result) == ["btb.sv", "keep.sv", "latest.sv", "stim.sv"]
+
+
+def test_ignore_glob_only_looks_below_the_given_path(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"test_*"})
+    assert len(result) == 7
+
+
+def test_main_ignore_pattern_is_case_insensitive(ignore_tree, monkeypatch, capsys):
+    (ignore_tree / "FIFO_TB.SV").write_text("", encoding="utf-8")
+    (ignore_tree / "top_tb.sv").write_text("module top_tb; endmodule\n", encoding="utf-8")
+    (ignore_tree / "keep_top.sv").write_text("module keep_top; endmodule\n", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["svhier", str(ignore_tree), "-x", "*_TB.sv", "--filelist"])
+    main()
+    out = capsys.readouterr().out
+    assert "keep_top.sv" in out
+    assert "top_tb.sv" not in out
+
+
+# ---------------------------------------------------------------------------
+# Output files that cannot be written
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--yaml", "--filelist"])
+def test_main_reports_unwritable_output_cleanly(flag, tmp_path, monkeypatch, capsys):
+    dest = tmp_path / "no_such_dir" / "out"
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), flag, str(dest)])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    err = " ".join(capsys.readouterr().err.split())
+    assert "error:" in err
+    assert "cannot write" in err
+
+
+def test_main_warns_about_unknown_top_without_tree(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), "--top", "nosuch", "--no-tree"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    assert "top module 'nosuch' not found" in capsys.readouterr().err

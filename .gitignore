@@ -4,3 +4,6 @@ docs/_build/
 # third-party test repos (cloned locally, not yet submodules)
 external/
 .DS_Store
+
+# per-machine Claude Code settings
+.claude/settings.local.json
