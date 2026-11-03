@@ -17,6 +17,9 @@ uv run pytest tests/test_parser.py::test_module_with_instances -v
 # Lint
 uv run pylint src/svhier/
 
+# Type check
+uv run mypy src/svhier tests
+
 # Run the CLI
 uv run svhier verilog/test.sv --yaml
 uv run svhier -r verilog/ --yaml out.yaml --filelist out.f

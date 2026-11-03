@@ -23,22 +23,24 @@ import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
     Compilation,
     DefinitionKind,
     DefinitionSymbol,
+    ExplicitImportSymbol,
     InstanceBodySymbol,
     InstanceSymbol,
     SymbolKind,
+    WildcardImportSymbol,
 )
 from pyslang.driver import Driver
-from pyslang.syntax import SyntaxKind, SyntaxTree
+from pyslang.syntax import ModuleDeclarationSyntax, SyntaxKind, SyntaxTree
 
 from svhier.filelist import compute_filelist  # noqa: F401  pylint: disable=unused-import
 
-_IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 # Scopes that can hold module instances without being a module themselves.
 _CONTAINER_KINDS = (SymbolKind.GenerateBlock, SymbolKind.GenerateBlockArray, SymbolKind.InstanceArray)
 _COMMAND_FILE_FLAGS = ("-f", "-F")
@@ -73,7 +75,8 @@ def _definitions_by_file(compilation: Compilation, sm: SourceManager, kind) -> d
     """Return canonical file -> ``DefinitionSymbol`` s of *kind* defined there (``getDefinitions`` order)."""
     by_file: dict[str, list[DefinitionSymbol]] = {}
     for defn in compilation.getDefinitions():
-        if defn.definitionKind == kind:
+        # This also returns primitives and config blocks, which have no definition kind.
+        if isinstance(defn, DefinitionSymbol) and defn.definitionKind == kind:
             by_file.setdefault(_canon(sm, defn.location), []).append(defn)
     return by_file
 
@@ -120,7 +123,7 @@ def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     """Return deduplicated package names imported by an instance body."""
     imports: list[str] = []
     for child in body:
-        if child.kind in _IMPORT_KINDS:
+        if isinstance(child, (WildcardImportSymbol, ExplicitImportSymbol)):
             pkg = child.packageName
             if pkg and pkg not in imports:
                 imports.append(pkg)
@@ -201,7 +204,7 @@ def _blackbox_params(inst) -> dict:
 
 def _parameter_names(defn: DefinitionSymbol) -> list[str]:
     """Return the parameters of *defn* that can be overridden.  Works without elaborating it."""
-    syntax = defn.syntax
+    syntax = cast(ModuleDeclarationSyntax, defn.syntax)
     declarations = list(syntax.header.parameters.declarations) if syntax.header.parameters is not None else []
     declarations += [m.parameter for m in syntax.members if hasattr(m, "parameter")]
     names = []
@@ -424,7 +427,8 @@ def _build_tables(compilation: Compilation, sm: SourceManager) -> _Tables:
     for table, kind in ((modules, "module"), (ifaces, "interface")):
         for defs in table.values():
             for defn in defs:
-                found = compilation.tryGetDefinition(defn.name, root).definition
+                # The binding converts a root symbol to the Scope it asks for; the stubs don't say so.
+                found = compilation.tryGetDefinition(defn.name, root).definition  # type: ignore[arg-type]
                 if found is not None:
                     used[(kind, defn.name)] = _canon(sm, found.location)
     for names in pkgs.values():

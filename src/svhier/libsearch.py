@@ -14,7 +14,7 @@ import re
 from collections.abc import Callable
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Protocol
+from typing import Generic, Protocol, TypeVar
 
 _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:automatic|static)\s+)?(\w+)", re.M)
 
@@ -55,10 +55,13 @@ class Library(Protocol):
 LibraryFactory = Callable[[list[str], set[str]], Library]
 
 
-class LibrarySearch:
+L = TypeVar("L", bound=Library)
+
+
+class LibrarySearch(Generic[L]):
     """Pulls files from a :class:`Library` into a compilation, and records what it pulled."""
 
-    def __init__(self, library: Library | None = None) -> None:
+    def __init__(self, library: L | None = None) -> None:
         self.library = library
         self.pulled: list[tuple[str, Path, int]] = []
 

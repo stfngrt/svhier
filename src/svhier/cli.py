@@ -237,7 +237,6 @@ def _make_yaml() -> YAML:
     """Return a configured ruamel.yaml instance."""
     yaml = YAML()
     yaml.default_flow_style = False
-    yaml.best_sequence_indent = 2
     return yaml
 
 

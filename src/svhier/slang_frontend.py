@@ -11,10 +11,11 @@ without it.
 import argparse
 import importlib.util
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from svhier.frontends import Request, Root, empty_fragment
-from svhier.libsearch import LibraryFactory, LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
+from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
 _MAX_LIB_ROUNDS = 20
@@ -169,10 +170,10 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     suffixes = (".sv", ".v")
     catch_all = True
 
-    def __init__(self, tool: PyslangTool | None = None, library_factory: LibraryFactory = LibraryIndex) -> None:
+    def __init__(self, tool: PyslangTool | None = None, library_factory: Callable[[list[str], set[str]], LibraryIndex] = LibraryIndex) -> None:
         self.tool = tool or PyslangTool()
         self._library_factory = library_factory
-        self.search = LibrarySearch()
+        self.search: LibrarySearch[LibraryIndex] = LibrarySearch()
         self.defines: list[str] = []
         self.inc_dirs: list[str] = []
         self.command_files: list = []
@@ -268,12 +269,13 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
 
     def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
         """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define."""
-        if not self.search:
+        library = self.search.library
+        if not library:
             return False
         missing = hierarchy["missing"]
         wanted = {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}
         loaded = [f["file_name"] for f in hierarchy["files"]]
-        found, incs = resolve_missing(wanted, self.search.library, loaded, self.inc_dirs)
+        found, incs = resolve_missing(wanted, library, loaded, self.inc_dirs)
         for name, (path, others) in found.items():
             if str(path) not in files:
                 files.append(str(path))
@@ -331,7 +333,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         rejected = set(self._parse(files, plain)["invalid_tops"]) & set(plain) if plain else set()
         if set_elsewhere - set(plain):
             tops = [t for t in result["elaborated_tops"] if t not in set_elsewhere or t in plain]
-            result = self._parse(files, tops) if tops else None
+            return (self._parse(files, tops) if tops else None), rejected
         return result, rejected
 
     def _elaborate_plain(self, files: list[str], roots: list[Root], plain: list[str]) -> tuple[dict | None, set[str]]:

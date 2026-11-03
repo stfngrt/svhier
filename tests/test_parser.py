@@ -793,3 +793,21 @@ def test_top_trimming_keeps_earlier_command_line_warnings(tmp_path, capfd):
     src.write_text("module top; endmodule\n", encoding="utf-8")
     parse_files([str(src)], [str(tmp_path / "no_such_dir")], tops=["top"])
     assert "no_such_dir" in capfd.readouterr().err
+
+
+def test_udp_primitive_does_not_break_parsing(tmp_path):
+    """getDefinitions() also returns primitives, which have no definition kind."""
+    src = tmp_path / "udp.sv"
+    src.write_text("""\
+primitive my_and(output y, input a, input b);
+  table
+    1 1 : 1;
+    0 ? : 0;
+    ? 0 : 0;
+  endtable
+endprimitive
+module top; wire y; my_and u(y, 1'b1, 1'b0); endmodule
+""", encoding="utf-8")
+    result = parse_files([str(src)])
+    assert not result["has_errors"]
+    assert [d["mod_name"] for f in result["files"] for d in f["defs"]] == ["top"]

@@ -15,6 +15,7 @@ import ctypes
 import json
 import sys
 from ctypes import c_bool, c_int32, c_void_p
+from typing import Any
 
 import pyGHDL.libghdl as lg
 from pyGHDL.libghdl import errorout_console, files_map, flags, libghdl, libraries, name_table
@@ -24,6 +25,9 @@ from pyGHDL.libghdl.vhdl import nodes, sem_lib
 _MARKER = "@@svhier-order "
 # Date_Valid'First in GHDL; analysis dates count up from here.
 _FIRST_DATE = 10
+# ctypes variables, which pyGHDL annotates as the type of their value.
+_WORK_LIBRARY: Any = libraries.Work_Library
+_LIBRARY_LOCATION: Any = libraries.Library_Location
 
 
 class _AdaBounds(ctypes.Structure):  # pylint: disable=too-few-public-methods
@@ -56,7 +60,7 @@ def _setup(std: str, work: str) -> None:
         raise RuntimeError("libghdl failed to initialize")
 
 
-def _name(identifier: int) -> str:
+def _name(identifier: Any) -> str:
     return name_table.Get_Name_Ptr(identifier).lower()
 
 
@@ -95,7 +99,7 @@ def _scan(files: list[str]) -> dict[str, dict]:
                kinds.Configuration_Declaration, kinds.Context_Declaration)
     result: dict[str, dict] = {}
     for path in files:
-        entry = {"units": [], "entities": [], "arch_of": [], "libs": []}
+        entry: dict[str, list] = {"units": [], "entities": [], "arch_of": [], "libs": []}
         named: set[tuple[str, str]] = set()
         components: set[tuple[str, str]] = set()
         for unit in _design_units(path):
@@ -132,15 +136,15 @@ def _load(files: list[str], assigned: dict[str, str], work: str) -> None:
     most recently analyzed one.  Loading uses the current work library, and analysis later
     takes ``work`` to mean the library of the file being analyzed.
     """
-    default = libraries.Work_Library.value
+    default = _WORK_LIBRARY.value
     add_unit = _bind("libraries__add_design_unit_into_library", None, c_int32, c_bool)
     date = _FIRST_DATE
     for path in files:
         name = assigned.get(path, work)
         # GHDL answers the work library's own name with whichever library is current, so that
         # one can't be looked up.  Force: create the others, since they only exist in memory.
-        libraries.Work_Library.value = (
-            default if name == work else libraries.Get_Library(name_table.Get_Identifier(name), libraries.Library_Location.value, True))
+        _WORK_LIBRARY.value = (
+            default if name == work else libraries.Get_Library(name_table.Get_Identifier(name), _LIBRARY_LOCATION.value, True))
         for unit in _design_units(path):
             nodes.Set_Chain(unit, 0)
             kind = nodes.Get_Kind(nodes.Get_Library_Unit(unit))
@@ -148,7 +152,7 @@ def _load(files: list[str], assigned: dict[str, str], work: str) -> None:
             if kind == nodes.Iir_Kind.Architecture_Body:
                 date += 1
                 nodes.Set_Date(unit, date)
-    libraries.Work_Library.value = default
+    _WORK_LIBRARY.value = default
 
 
 def _ada_string(text: str, keep: list):
