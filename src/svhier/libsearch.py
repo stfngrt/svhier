@@ -45,6 +45,7 @@ class Library(Protocol):
         """
 
 
+#: Builds a :class:`Library` from the ``-y`` directories and the lowercase names to ignore.
 LibraryFactory = Callable[[list[str], set[str]], Library]
 
 

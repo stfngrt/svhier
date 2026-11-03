@@ -73,9 +73,9 @@ uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for the full architecture reference
-(two-phase elaboration model, helper functions, output dict shape, filelist ordering,
-CLI flags, and pylint configuration).
+See [docs/architecture.md](docs/architecture.md) for the parsing flow and how the code is
+structured. [docs/dev/](docs/dev/index.md) has the developer documentation: the result
+format, writing a plugin, and an API reference generated with autodoc.
 
 ```bash
 # Install docs dependencies
