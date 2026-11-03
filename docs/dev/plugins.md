@@ -43,6 +43,9 @@ this order:
 - **Handle `request.auto`.** It means there's no `--top`, so also find your own roots.
   Without it, elaborate only `request.roots`.
 - **Set `needed`.** With `--top`, list the files the roots need. With `auto`, use `None`.
+- **`insts` is enough for the tree.** If your compiler can tell parameter settings apart,
+  add {ref}`variants <children-per-setting>` so that each instance shows only its own
+  children. Without them, every instance shows the merged `insts`.
 
 An empty root list without `auto` is normal: it means `--top` only named other languages'
 units so far. Return an empty fragment.

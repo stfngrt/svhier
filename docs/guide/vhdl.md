@@ -78,9 +78,10 @@ Both directions evaluate the value where it's set:
   else uses the VHDL default, with a note.
 
 A module that VHDL instantiates with different values lists the children of
-every setting under each instance, as SystemVerilog modules with several
-settings already do. Each setting is one more slang compilation, so many
-distinct values slow down large designs.
+every setting under each of those instances, because the VHDL results don't say
+which setting an instance uses. The same applies to a VHDL entity with different
+generics. An instance in SystemVerilog shows just its own setting. Each setting
+is one more slang compilation, so many distinct values slow down large designs.
 
 ## Libraries
 

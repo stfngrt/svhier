@@ -102,6 +102,15 @@ def _add_unique(target: list, items: list) -> None:
     target.extend(item for item in items if item not in target)
 
 
+def _merge_variants(base: dict, other: dict) -> None:
+    """Add the settings another compilation found.  The first compilation is the plain one, so its top wins."""
+    if "variants" in other:
+        for sig, children in other["variants"].items():
+            base.setdefault("variants", {}).setdefault(sig, children)
+    if "top_variant" in other:
+        base.setdefault("top_variant", other["top_variant"])
+
+
 def _merge_files(base: list[dict], other: list[dict]) -> None:
     """Add the instances another compilation of the same sources found."""
     entries = {entry["file_name"]: entry for entry in base}
@@ -114,6 +123,7 @@ def _merge_files(base: list[dict], other: list[dict]) -> None:
             if unit["mod_name"] in defs:
                 _add_unique(defs[unit["mod_name"]]["insts"], unit["insts"])
                 _add_unique(defs[unit["mod_name"]]["pkg_imports"], unit["pkg_imports"])
+                _merge_variants(defs[unit["mod_name"]], unit)
             else:
                 entries[entry["file_name"]]["defs"].append(unit)
 
@@ -141,6 +151,8 @@ def _nothing_elaborated(result: dict) -> dict:
     for entry in result["files"]:
         for unit in entry["defs"]:
             unit["insts"] = []
+            unit.pop("variants", None)
+            unit.pop("top_variant", None)
     result["blackbox_params"] = {}
     result["missing"]["modules"] = {}
     return result

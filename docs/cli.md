@@ -7,8 +7,8 @@
    :prog: svhier
 ```
 
-Options and paths can be given in any order. Data (tree, `--yaml -`,
-`--filelist -`) goes to **stdout**; the spinner, tables and diagnostics go to
+Options and paths can be given in any order. Data (`--yaml -`, `--filelist -`,
+then the tree) goes to **stdout**; the spinner, tables and diagnostics go to
 **stderr**.
 
 Language plugins add their own options: `-f`, `-I` and `-D` come from the

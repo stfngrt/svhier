@@ -13,6 +13,7 @@ and filelist don't need to know which language a definition came from.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
+from itertools import chain
 from typing import Protocol
 
 #: The entry point group plugins register in.
@@ -63,6 +64,9 @@ class Frontend(Protocol):
       :class:`Root`'s notation; ``unresolved`` describes the ones that have no such form.
     * ``rejected_roots`` — roots that can't be elaborated with what is known about them.
     * ``notes`` — remarks for the user.
+
+    Definitions may also have ``variants``, for a tree that is exact per parameter setting;
+    see the result format in the developer docs.  Without them, the tree uses ``insts``.
     """
 
     name: str
@@ -210,7 +214,7 @@ class _Stitcher:  # pylint: disable=too-few-public-methods
         names = {d["mod_name"].lower(): d["mod_name"] for f in merged["files"] for d in f["defs"]}
         for entry in merged["files"]:
             for unit in entry["defs"]:
-                for inst in unit["insts"]:
+                for inst in chain(unit["insts"], *unit.get("variants", {}).values()):
                     inst["mod_name"] = names.get(inst["mod_name"].lower(), inst["mod_name"])
         merged["tops"] = [names.get(t.lower(), t) for t in self.tops]
         merged["has_errors"] = any(d["severity"] == "error" for d in merged["diagnostics"])

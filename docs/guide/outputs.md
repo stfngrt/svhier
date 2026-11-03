@@ -87,4 +87,7 @@ files:
   `g_loop[0].u_core`.
 - `insts` can contain modules that have no definition
   ([blackboxes](missing.md)).
+- `insts` lists the children of every parameter setting a module is used with,
+  so it can hold more than any one instance has. The {ref}`tree <tree-parameters>`
+  shows each instance's own children.
 - Modules that are never instantiated still appear in `defs`.

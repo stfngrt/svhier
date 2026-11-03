@@ -11,8 +11,9 @@ Elaboration works in two phases:
 2. **Elaboration phase** — ``compilation.getRoot().topInstances`` seeds a depth-first walk
    (:func:`_walk_instances`) that visits every unique (definition, parameter values) pair
    once.  Definitions are keyed by ``(name, file)``, so duplicate module names in
-   different files stay apart.  Child lists are merged per definition, so a module whose
-   generate branches depend on its parameters lists the children of every setting.
+   different files stay apart.  ``insts`` merges the children per definition, so a module
+   whose generate branches depend on its parameters lists the children of every setting.
+   ``variants`` keeps them per setting, which is what the instance tree is built from.
 
 Modules that are defined but never instantiated are unreachable via ``topInstances``
 and appear in the output with an empty ``insts`` list.
@@ -23,7 +24,7 @@ import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
@@ -60,6 +61,8 @@ MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
 
 #: (name, canonical file) — identifies one definition even when the name is reused.
 DefKey = tuple[str, str]
+#: The parameter values of an instance as strings — identifies one setting of a definition.
+ParamSig = tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +157,7 @@ def _iter_module_instances(scope, *, blackboxes: bool = False) -> Iterator:
             yield from _iter_module_instances(child, blackboxes=blackboxes)
 
 
-def _param_signature(body: InstanceBodySymbol) -> tuple[str, ...]:
+def _param_signature(body: InstanceBodySymbol) -> ParamSig:
     """Return the parameter values of *body* as strings, used to spot repeated settings."""
     sig = []
     for param in body.parameters:
@@ -170,7 +173,10 @@ class _Walk:
     """Result of walking the elaborated tree, keyed by :data:`DefKey`."""
 
     sm: SourceManager
-    insts: dict[DefKey, list[InstanceSymbol]] = field(default_factory=dict)
+    # The instance visited for each setting, with its children and their settings.  Blackboxes have none.
+    insts: dict[DefKey, dict[ParamSig, InstanceSymbol]] = field(default_factory=dict)
+    children: dict[tuple[DefKey, ParamSig], list[tuple[Any, ParamSig | None]]] = field(default_factory=dict)
+    top_variants: dict[DefKey, ParamSig] = field(default_factory=dict)
     imports: dict[DefKey, list[str]] = field(default_factory=dict)
     blackbox_params: dict[str, list[dict]] = field(default_factory=dict)
 
@@ -218,30 +224,34 @@ def _walk_instances(tops, sm: SourceManager) -> _Walk:
     """Depth-first walk of the elaborated instance tree below *tops*.
 
     Every unique (definition, parameter values) pair is visited once; its instance is
-    appended to ``walk.insts[key]`` and its imports merged into ``walk.imports[key]``.
-    Instances with parameters already seen are skipped, since they elaborate the same
-    way.  Iterative, so deep hierarchies cannot hit Python's recursion limit.
+    stored in ``walk.insts[key][sig]``, its children in ``walk.children[key, sig]``, and its
+    imports merged into ``walk.imports[key]``.  Instances with parameters already seen are
+    skipped, since they elaborate the same way.  Iterative, so deep hierarchies cannot hit
+    Python's recursion limit.
     """
     walk = _Walk(sm)
-    seen: set[tuple[DefKey, tuple[str, ...]]] = set()
-    stack: list[InstanceSymbol] = list(reversed(list(tops)))
+    stack: list[tuple[InstanceSymbol, ParamSig]] = [(top, _param_signature(top.body)) for top in reversed(list(tops))]
+    for top, sig in stack:
+        walk.top_variants.setdefault(walk.key(top.definition), sig)
     while stack:
-        inst = stack.pop()
+        inst, sig = stack.pop()
         key = walk.key(inst.definition)
-        sig = (key, _param_signature(inst.body))
-        if sig in seen:
+        if (key, sig) in walk.children:
             continue
-        seen.add(sig)
-        walk.insts.setdefault(key, []).append(inst)
+        walk.insts.setdefault(key, {})[sig] = inst
         imports = walk.imports.setdefault(key, [])
         imports.extend(p for p in _collect_imports(inst.body) if p not in imports)
-        stack.extend(reversed(list(_iter_module_instances(inst.body))))
+        children = walk.children[key, sig] = []
         for child in _iter_module_instances(inst.body, blackboxes=True):
             if child.kind == SymbolKind.UninstantiatedDef:
+                children.append((child, None))
                 uses = walk.blackbox_params.setdefault(child.definitionName, [])
                 use = _blackbox_params(child)
                 if use not in uses:
                     uses.append(use)
+            else:
+                children.append((child, _param_signature(child.body)))
+        stack.extend((child, child_sig) for child, child_sig in reversed(children) if child_sig is not None)
     return walk
 
 
@@ -296,30 +306,39 @@ def _collect_diagnostics(
     return diag_list, engine.numErrors > 0
 
 
+def _relative_name(child, parent_path: str) -> str:
+    """Return the path of the instance *child* relative to the instance at *parent_path*."""
+    path = child.hierarchicalPath
+    return path[len(parent_path) + 1:] if path.startswith(parent_path + ".") else child.name
+
+
 def _build_def_entry(defn: DefinitionSymbol, walk: _Walk) -> dict:
     """Build the output dict for a single module definition.
 
     ``inst_name`` is the child's hierarchical path relative to the parent module,
     so instances inside generate blocks or instance arrays get names like
-    ``g_loop[0].u_core`` or ``u_arr[1]``.  Children of every walked parameter
-    setting are merged, first seen first, without repeats.
+    ``g_loop[0].u_core`` or ``u_arr[1]``.  ``insts`` merges the children of every walked
+    parameter setting, first seen first, without repeats.  ``variants`` has them per
+    setting, each child naming the setting it uses in turn.
     """
     key = walk.key(defn)
     insts: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for parent in walk.insts.get(key, []):
-        prefix = parent.hierarchicalPath + "."
-        for child in _iter_module_instances(parent.body, blackboxes=True):
-            path = child.hierarchicalPath
-            inst_name = path[len(prefix):] if path.startswith(prefix) else child.name
-            if child.kind == SymbolKind.UninstantiatedDef:
-                mod_name = child.definitionName
-            else:
-                mod_name = child.definition.name
+    variants: dict[ParamSig, list[dict]] = {}
+    for sig, parent in walk.insts.get(key, {}).items():
+        parent_path = parent.hierarchicalPath
+        children = variants[sig] = []
+        for child, child_sig in walk.children[key, sig]:
+            inst_name = _relative_name(child, parent_path)
+            mod_name = child.definition.name if child_sig is not None else child.definitionName
+            children.append({"mod_name": mod_name, "inst_name": inst_name, "variant": child_sig})
             if (mod_name, inst_name) not in seen:
                 seen.add((mod_name, inst_name))
                 insts.append({"mod_name": mod_name, "inst_name": inst_name})
-    return {"mod_name": defn.name, "pkg_imports": walk.imports.get(key, []), "insts": insts}
+    entry = {"mod_name": defn.name, "pkg_imports": walk.imports.get(key, []), "insts": insts, "variants": variants}
+    if key in walk.top_variants:
+        entry["top_variant"] = walk.top_variants[key]
+    return entry
 
 
 def _quote(arg: str) -> str:
@@ -553,7 +572,9 @@ def parse_files(  # pylint: disable=too-many-arguments
         * ``defs`` — list of module definitions, each with ``mod_name``,
           ``pkg_imports`` (omitted from YAML when empty), and ``insts``
           (list of ``{"mod_name": str, "inst_name": str}``).  A shadowed copy of a
-          module is not elaborated and has no ``insts``.
+          module is not elaborated and has no ``insts``.  With *frontend_info*, also
+          ``variants`` and, for tops, ``top_variant``: the children per parameter
+          setting, for the instance tree (see :func:`_build_def_entry`).
 
     ``duplicates``
         One ``{"name", "kind", "files", "used"}`` dict per module, interface or package
@@ -594,6 +615,10 @@ def parse_files(  # pylint: disable=too-many-arguments
     if not frontend_info:  # These are for svhier.slang_frontend.
         for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
             del result[key]
+        for entry in result["files"]:
+            for unit in entry["defs"]:
+                del unit["variants"]
+                unit.pop("top_variant", None)
     return result
 
 
