@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Stefan Engert
 
-"""SPIKE: every source language is a plugin; this module knows none of them.
+"""Every source language is a plugin; this module knows none of them.
 
 A frontend is an object registered in the ``svhier.frontends`` entry point group, including
 the bundled slang one.  :func:`stitch` runs the frontends in turn: whatever one can't

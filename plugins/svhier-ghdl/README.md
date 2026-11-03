@@ -1,4 +1,4 @@
-# svhier-ghdl (spike)
+# svhier-ghdl
 
 Lets svhier elaborate VHDL with GHDL, so one tree can cross between SystemVerilog and VHDL.
 GHDL is not a dependency and isn't bundled. Install it separately, and the plugin finds it

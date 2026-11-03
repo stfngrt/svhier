@@ -55,6 +55,7 @@ uv run sphinx-build -W -b html docs docs/_build/html    # docs, failing on warni
 | `tests/test_parser.py` | The hierarchy walk and results | pyslang |
 | `tests/test_libsearch.py` | The `-y` index and search | Nothing |
 | `tests/test_cli.py` | The command line, end to end | pyslang |
+| `tests/test_docs.py` | The example plugin in [Writing a plugin](plugins.md) | pyslang |
 | `tests/test_cva6.py` | The CVA6 core | `SVHIER_CVA6_DIR`, otherwise skipped |
 | `plugins/svhier-ghdl/tests/` | The GHDL plugin | pyGHDL, otherwise skipped; some also need the `ghdl` program |
 

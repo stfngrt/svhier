@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""SPIKE: svhier frontend that elaborates VHDL with GHDL through pyGHDL.
+"""svhier frontend that elaborates VHDL with GHDL through pyGHDL.
 
 GHDL is not a dependency and isn't bundled: the plugin looks for an installed pyGHDL at
 runtime and reports what's missing if there is none.

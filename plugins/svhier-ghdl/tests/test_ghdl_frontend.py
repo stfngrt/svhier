@@ -1,4 +1,4 @@
-"""SPIKE: the plugin against real GHDL and slang.  Skipped when pyGHDL isn't installed."""
+"""The plugin against real GHDL and slang.  Skipped when pyGHDL isn't installed."""
 
 import importlib.util
 import subprocess

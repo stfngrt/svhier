@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "svhier-ghdl"
 version = "0.0.1"
-description = "SPIKE: elaborate VHDL for svhier with GHDL through pyGHDL"
+description = "Elaborate VHDL for svhier with GHDL through pyGHDL"
 requires-python = ">=3.11"
 # pyGHDL is deliberately not a dependency: GHDL is installed separately and found at runtime.
 dependencies = ["svhier"]
