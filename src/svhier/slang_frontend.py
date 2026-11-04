@@ -10,12 +10,14 @@ without it.
 
 import argparse
 import importlib.util
+import os
 import re
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from svhier.frontends import Request, Root, empty_fragment
+from svhier.frontends import KNOWN_SUFFIXES, Request, Root, empty_fragment
 from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
@@ -23,17 +25,22 @@ _MAX_LIB_ROUNDS = 20
 
 
 _INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
+# Files that are only ever included, but aren't headers whose directory is always searched.
+_OTHER_INCLUDES = ("*.svi", "*.vi", "*.inc", "*.def")
+# What slang's command file parser skips, and how it spells environment variables.
+_COMMAND_FILE_COMMENT = re.compile(r"(?:^|(?<=\s))(?:#[^\n]*|//[^\n]*|/\*.*?\*/)", re.M | re.S)
+_COMMAND_FILE_VAR = re.compile(r"\$(?:\{(\w+)\}|\((\w+)\)|(\w+))")
+_COMMAND_FILE_FLAG = re.compile(r"-([fF])=?(.*)")
 
 
-def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
-    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
+def _include_base_dirs(sources: list[Path], includable: list[Path]) -> list[Path]:
+    """Return the base dirs needed by `` `include`` directives in *sources*.
 
-    For every include path with a directory component, each known header whose path
-    ends with that include path contributes the directory it must be resolved from,
-    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
+    Each known file whose path ends with an include path contributes the directory it must
+    be resolved from, e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
     """
     by_name: dict[str, list[Path]] = {}
-    for hdr in headers:
+    for hdr in includable:
         by_name.setdefault(hdr.name, []).append(hdr)
 
     bases: list[Path] = []
@@ -44,8 +51,10 @@ def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
             continue
         for inc in _INCLUDE_RE.findall(text):
             parts = Path(inc).parts
-            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
+            if not parts or Path(inc).is_absolute() or ".." in parts:
                 continue
+            if len(parts) == 1 and (src.parent / inc).exists():
+                continue  # Resolves next to the file including it, with no search path.
             for hdr in by_name.get(parts[-1], []):
                 if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
                     bases.append(hdr.parents[len(parts) - 1])
@@ -60,8 +69,8 @@ def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None 
     format expected by VCS, Questa, and Xcelium.
 
     Every directory that contains a header is returned.  In addition, when a source
-    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
-    the directory that include path is relative to is returned too.
+    or header includes a file that exists, such as `` `include "sub/dir/file.svh"`` or
+    `` `include "defines.sv"``, the directory that include path is relative to is returned too.
 
     For directory inputs the search respects the *recursive* flag.
     For explicit file inputs the parent directory is checked for headers.
@@ -70,19 +79,21 @@ def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None 
     ign = ignore or set()
     headers: list[Path] = []
     sources: list[Path] = []
+    other_includes: list[Path] = []
 
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
             headers.extend(glob_files(p, recursive, ("*.svh", "*.vh"), ign))
             sources.extend(glob_files(p, recursive, ("*.sv", "*.v"), ign))
+            other_includes.extend(glob_files(p, recursive, _OTHER_INCLUDES, ign))
         elif p.is_file() and not is_ignored(p, p.parent, ign):
             sources.append(p)
             headers.extend(glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
 
     seen: set[Path] = set()
     result: list[str] = []
-    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
+    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers + sources + other_includes):
         resolved = d.resolve()
         if resolved not in seen:
             seen.add(resolved)
@@ -97,6 +108,38 @@ class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-met
         items = list(getattr(namespace, self.dest) or [])
         items.append((option_string, values))
         setattr(namespace, self.dest, items)
+
+
+def files_in_command_files(command_files: list[tuple[str, str]], suffixes: set[str]) -> list[str]:
+    """Return the entries of ``(flag, path)`` command files whose suffix is in *suffixes*.
+
+    slang has no way to list what it read, so this follows ``-f``/``-F``, comments, quotes and
+    environment variables the same way.  A command file that can't be read is left for slang
+    to report.
+    """
+    found: list[str] = []
+    seen: set[Path] = set()
+
+    def read(path: Path, base: Path) -> None:
+        if path.resolve() in seen:
+            return
+        seen.add(path.resolve())
+        try:
+            text = _COMMAND_FILE_COMMENT.sub("", path.read_text(encoding="utf-8", errors="replace"))
+            tokens = iter(shlex.split(_COMMAND_FILE_VAR.sub(lambda m: os.environ.get(m[1] or m[2] or m[3], ""), text)))
+        except (OSError, ValueError):
+            return
+        for token in tokens:
+            flag = _COMMAND_FILE_FLAG.fullmatch(token)
+            if flag:
+                nested = base / (flag[2] or next(tokens, ""))
+                read(nested, nested.parent if flag[1] == "F" else base)
+            elif not token.startswith(("+", "-")) and Path(token).suffix.lower() in suffixes:
+                found.append(str(base / token))
+
+    for flag, name in command_files:
+        read(Path(name), Path(name).parent if flag == "-F" else Path())
+    return found
 
 
 def _add_unique(target: list, items: list) -> None:
@@ -172,6 +215,12 @@ class PyslangTool:
 
         return parse_files(files, inc_dirs, **options)
 
+    def has_sources(self, command_files: list[tuple[str, str]], exclude_exts: list[str]) -> bool:
+        """Return whether *command_files* name any source, apart from *exclude_exts*."""
+        from svhier.parser import command_files_have_sources  # pylint: disable=import-outside-toplevel
+
+        return command_files_have_sources(command_files, exclude_exts)
+
 
 class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     """Elaborate SystemVerilog with slang, including ``-f``, ``-I``, ``-D`` and ``-y``.
@@ -190,6 +239,9 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         self.defines: list[str] = []
         self.inc_dirs: list[str] = []
         self.command_files: list = []
+        # Entries of the command files for other languages, and their suffixes as slang sees them.
+        self._foreign: list[str] = []
+        self._exclude_exts: list[str] = []
         self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
         # {lowercase module name: (module name, its parameter names)}
@@ -232,7 +284,19 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         found = collect_inc_dirs(args.paths, args.recursive, ignore)
         self.inc_dirs = list(dict.fromkeys(args.include_dirs + found))
         self.command_files = args.command_files
+        self._read_foreign_entries()
         self.search = LibrarySearch(self._library_factory(args.libdirs, ignore) if args.libdirs else None)
+
+    def _read_foreign_entries(self) -> None:
+        """Keep entries other languages read away from slang, which would parse them as SV."""
+        self._foreign = files_in_command_files(self.command_files, set(KNOWN_SUFFIXES) - set(self.suffixes))
+        self._exclude_exts = sorted({Path(f).suffix[1:] for f in self._foreign})
+        if not self._foreign or self.unavailable_reason():
+            return
+        # An entry slang would read counts even if the file is missing, so slang reports that.
+        listed = files_in_command_files(self.command_files, set(self.suffixes))
+        if not listed and not self.tool.has_sources(self.command_files, self._exclude_exts):
+            self.command_files = []
 
     def unavailable_reason(self) -> str | None:
         """Report why slang can't be used; None if it can."""
@@ -241,6 +305,10 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
     def extra_inputs(self) -> list[str]:
         """Command files are inputs too."""
         return [f"{len(self.command_files)} command file(s)"] if self.command_files else []
+
+    def foreign_files(self) -> list[str]:
+        """Return the command files' entries that another language reads."""
+        return self._foreign
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return the modules the inputs define.  With no tops, ``-y`` would serve unused modules too."""
@@ -272,7 +340,8 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
 
         *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
-        options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files, "frontend_info": True}
+        options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files,
+                                   "exclude_exts": self._exclude_exts, "frontend_info": True}
         if library and self.search.library:
             # Only the last round is returned in full, so earlier ones just report what is missing.
             options |= {"pull": lambda loaded: self._pull_missing(loaded, files), "max_pulls": _MAX_LIB_ROUNDS}
@@ -284,7 +353,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         *hierarchy* needs only ``files`` (with their ``file_name``) and ``missing``.
         """
         library = self.search.library
-        if not library:
+        if library is None:  # Not "if not": a directory with only an include has nothing it counts.
             return False
         missing = hierarchy["missing"]
         wanted = {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}

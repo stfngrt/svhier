@@ -21,6 +21,7 @@ from svhier.frontends import Request, empty_fragment
 from svhier.libsearch import Library, LibraryFactory, LibrarySearch, glob_files
 
 _MARKER = "@@svhier-order "
+_UNSET_MARKER = "@@svhier-unset "
 _TIMEOUT_S = 120
 _INSTALL_HINT = "install GHDL's pyGHDL wheel from https://github.com/ghdl/ghdl/releases"
 
@@ -38,6 +39,9 @@ _COMMENT = re.compile(r"--.*$", re.M)
 _PRIMARY_UNIT = re.compile(r"^\s*(?:entity|package|context|configuration\s+\w+\s+of)\s+(\w+)\s+is\b", re.I | re.M)
 _SECONDARY_UNIT = re.compile(r"^\s*(?:architecture\s+\w+\s+of|package\s+body)\s+(\w+)\s+is\b", re.I | re.M)
 _BUILTIN_LIBRARIES = {"std", "ieee"}
+_ERROR_TOP = re.compile(r"^ghdl: [^:]+: ")
+_ERROR_LOCATION = re.compile(r"^.+:\d+:\d+:error:")
+_UNIT_NOT_FOUND = re.compile(r'^(.+):\d+:\d+:error: unit "(\w+)" not found in library "(\w+)"')
 
 
 @dataclass
@@ -60,6 +64,8 @@ class Elaboration:
     file_deps: dict[str, list[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Generics with no value.  If it failed, those may be why: only a parent can set them.
+    unset: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -310,6 +316,22 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     return list(defs.values())
 
 
+def _read_output(stdout: str, by_abs: dict[str, str]) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """Split what the worker printed into file dependencies, unset generics and hierarchy lines."""
+    file_deps: dict[str, list[str]] = {}
+    unset: list[str] = []
+    body: list[str] = []
+    for line in stdout.splitlines():
+        if line.startswith(_MARKER):
+            raw = json.loads(line[len(_MARKER):])
+            file_deps = {by_abs[f]: [by_abs[n] for n in needs] for f, needs in raw.items()}
+        elif line.startswith(_UNSET_MARKER):
+            unset = json.loads(line[len(_UNSET_MARKER):])
+        else:
+            body.append(line)
+    return file_deps, unset, body
+
+
 class GhdlWorkerTool:
     """Everything the frontend needs from pyGHDL, which :mod:`svhier_ghdl.worker` does for it."""
 
@@ -351,6 +373,8 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         self._definers: dict[str, list[str]] = {}
         self._libraries: dict[str, str] = {}
         self._notes: list[str] = []
+        # Only about the latest elaboration: a later round may reach what this one didn't.
+        self._alone_notes: list[str] = []
         self._cache: dict[tuple, Elaboration] = {}
         self._scan: dict[str, dict] = {}
 
@@ -373,6 +397,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
 
     def extra_inputs(self) -> list[str]:
         """Only files count."""
+        return []
+
+    def foreign_files(self) -> list[str]:
+        """The plugin's options name no files."""
         return []
 
     def _worker(self, request: dict) -> subprocess.CompletedProcess:
@@ -451,14 +479,17 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
             defs, file_deps, errors = self._elaborate_all(files, request)
             unbound = {i["mod_name"] for d in defs.values() for i in d.insts} - set(defs) - request.defined_elsewhere
             if not self._pull_needed(sorted(unbound), files):
-                return self._fragment(defs, file_deps, errors, auto=request.auto)
+                fragment = self._fragment(defs, file_deps, errors, auto=request.auto)
+                known = self.units(files)
+                fragment["failed_tops"] = [r.name for r in request.roots if r.requested and r.name.lower() in known and r.name.lower() not in defs]
+                return fragment
 
     def _elaborate_all(self, files: list[str], request: Request) -> tuple[dict[str, ForeignDef], dict[str, list[str]], list[str]]:
         """Run the worker for every root, and merge what the runs report."""
         defs: dict[str, ForeignDef] = {}
         file_deps: dict[str, list[str]] = {}
         errors: list[str] = []
-        soft: dict[str, list[str]] = {}
+        soft: dict[str, Elaboration] = {}
 
         def run(top: str, generics: dict[str, str], is_soft: bool) -> None:
             key = (top.lower(), tuple(sorted(generics.items())))
@@ -476,7 +507,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                 have_deps = file_deps.setdefault(fname, [])
                 have_deps.extend(n for n in needs if n not in have_deps)
             if is_soft:
-                soft[top.lower()] = result.errors
+                soft[top.lower()] = result
             else:
                 errors.extend(e for e in result.errors if e not in errors)
 
@@ -488,9 +519,16 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                     run(unit, {}, True)
         # An entity that fails alone may only need the generics its parent passes.
         reached = {i["mod_name"].lower() for d in defs.values() for i in d.insts}
-        for unit, unit_errors in soft.items():
-            if unit not in reached:
-                errors.extend(e for e in unit_errors if e not in errors)
+        self._alone_notes = []
+        for unit, result in soft.items():
+            if unit in reached or not result.errors:
+                continue
+            if result.unset:
+                unset = ", ".join(result.unset)
+                self._alone_notes.append(f"{unit}: no default for generics {unset}, so it can't be elaborated on its own and its children aren't shown")
+                defs.setdefault(unit, ForeignDef(unit, self.units(files).get(unit)))
+            else:
+                errors.extend(e for e in result.errors if e not in errors)
         return defs, file_deps, errors
 
     def _fragment(self, defs: dict[str, ForeignDef], file_deps: dict[str, list[str]], errors: list[str], *, auto: bool) -> dict:
@@ -520,12 +558,49 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                 if unit.file and name not in defs:
                     known = result["unresolved"].setdefault(name, [])
                     known.extend(u for u in uses if u not in known)
+        result["duplicates"] = self._duplicates()
+        errors = self._report_errors(errors, result)
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
-        result["notes"] = list(self._notes)
+        result["notes"] = self._notes + self._alone_notes + result["notes"]
         result["pulled"] = self.search.pulled
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
+
+    def _report_errors(self, errors: list[str], result: dict) -> list[str]:
+        """Return *errors* without repeats, and add to *result* what they say is missing or to blame.
+
+        Each top reports the problems of the files it needs, so with no ``--top``, one bad file
+        would be listed once per entity using it.  Without a location, such as a crash, an
+        error is about its top.
+        """
+        names = {str(Path(f).resolve()): f for f in self._scan}
+        unique: dict[str, str] = {}
+        for error in errors:
+            text = _ERROR_TOP.sub("", error)
+            unique.setdefault(text if _ERROR_LOCATION.match(text) else error, error)
+        for text in unique:
+            match = _UNIT_NOT_FOUND.match(text)
+            if match:
+                path, unit, library = match.groups()
+                users = result["missing"]["units"].setdefault(unit if library == self.work.lower() else f"{library}.{unit}", [])
+                if names.get(path, path) not in users:
+                    users.append(names.get(path, path))
+        for dup in result["duplicates"]:
+            used = Path(dup["used"])
+            if any(text.startswith(f"{used.resolve()}:") for text in unique):
+                result["notes"].append(f"{dup['name']}: {used} has errors and other files define it too; -x {used.name} would use another one")
+        return list(unique.values())
+
+    def _duplicates(self) -> list[dict]:
+        """Report units defined by several files of one library.  GHDL uses what it loads last."""
+        where: dict[tuple[str, str], list[str]] = {}
+        for path, entry in self._scan.items():
+            library = self._libraries.get(path, self.work.lower())
+            for name in dict.fromkeys(entry["units"]):
+                where.setdefault((library, name), []).append(path)
+        return [{"name": name, "kind": "entity" if name in self._definers else "unit", "files": paths, "used": paths[-1]}
+                for (_, name), paths in where.items() if len(paths) > 1]
 
     def drop_resolved(self, fragment: dict, names: set[str]) -> None:
         """Forget names another language defines."""
@@ -552,17 +627,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                     notes.append(f"{top}: couldn't read generics, so SV modules below it use their defaults")
         except subprocess.TimeoutExpired:
             return Elaboration(errors=[f"ghdl: elaborating {top} timed out after {_TIMEOUT_S} s"])
-        file_deps: dict[str, list[str]] = {}
-        body: list[str] = []
-        for line in proc.stdout.splitlines():
-            if line.startswith(_MARKER):
-                raw = json.loads(line[len(_MARKER):])
-                file_deps = {by_abs[f]: [by_abs[n] for n in needs] for f, needs in raw.items()}
-            else:
-                body.append(line)
+        file_deps, unset, body = _read_output(proc.stdout, by_abs)
         if proc.returncode != 0:
             detail = [ln for ln in proc.stderr.splitlines() if ":error:" in ln or ln.startswith("error:") or "raised " in ln]
-            return Elaboration(errors=[f"ghdl: {top}: {d}" for d in detail] or [f"ghdl: {top}: worker exited with code {proc.returncode}"])
+            return Elaboration(errors=[f"ghdl: {top}: {d}" for d in detail] or [f"ghdl: {top}: worker exited with code {proc.returncode}"], unset=unset)
         # Of several files defining a name, the design used the one in its dependencies.
         located = {name: next((p for p in paths if p in file_deps), paths[0]) for name, paths in self._definers.items()}
         return Elaboration(defs=tree_to_defs(parse_tree("\n".join(body)), located), file_deps=file_deps, notes=notes)

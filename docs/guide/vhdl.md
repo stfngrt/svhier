@@ -47,7 +47,8 @@ uv run --no-sync svhier plugins/svhier-ghdl/tests/mixed --top sv_top
 `uv sync` removes both packages again, so use `uv run --no-sync` afterwards.
 
 Without pyGHDL, svhier still reads SystemVerilog. It warns that the plugin is
-disabled and skips `.vhd` and `.vhdl` files.
+disabled and skips `.vhd` and `.vhdl` files, including those listed in a command
+file.
 
 Only Linux is tested, with the GHDL 6.0.0 wheels for Python 3.11, 3.12 and 3.13.
 Windows and macOS aren't supported: the plugin's library path fix is Linux-only, and
@@ -55,9 +56,9 @@ GHDL publishes no macOS wheel.
 
 ## Usage
 
-`.vhd` and `.vhdl` files are read from the same paths as other sources, and
-`--top` can name a module or an entity. SystemVerilog-only options such as
-`-f` and `-I` don't apply to VHDL.
+`.vhd` and `.vhdl` files are read from the same paths as other sources, and from
+{ref}`command files <command-files>`, and `--top` can name a module or an
+entity. SystemVerilog-only options such as `-I` and `+incdir+` don't apply to VHDL.
 
 | Option | Meaning | Default |
 |--------|---------|---------|
@@ -98,6 +99,34 @@ YAML reports it as `library`:
 
 The filelist has no way to say which library a file belongs to, so compiling a
 design with several libraries needs the YAML too.
+
+If several files define a unit in the same library, as with simulation and FPGA
+variants of an entity, GHDL uses the last file it reads. The
+{ref}`Defined more than once <duplicates>` table shows which one that is. Skip the
+others with `-x`.
+
+## When elaboration fails
+
+GHDL can't continue past a unit it can't analyze, so a `--top` that needs one shows
+no tree, and its filelist is empty. svhier reports what stopped it:
+
+- Errors in a file are listed once with `-E`, however many entities need that file.
+- A library or package that doesn't exist appears in the **Not found** table as a
+  `unit`, such as `unisim.vcomponents`, or `git` for a generated file.
+- If the file with errors is one of several defining a unit, a note names the `-x`
+  that uses another one:
+
+```text
+$ svhier . --top core
+note: multiply: xilinx-mult.vhdl has errors and other files define it too; -x xilinx-mult.vhdl would use another one
+error: top module 'core' could not be elaborated, so nothing below it is shown
+```
+
+Without `--top`, each entity is elaborated on its own, so the tree still shows every
+entity that works. An entity with generics that have no default may only work with
+values from a parent. If nothing instantiates it and it fails on its own, that isn't
+an error: it appears without children, with a note. Errors in its code are still
+errors, and `--top` on it reports the failure as usual.
 
 ## Known limits
 

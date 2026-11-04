@@ -132,6 +132,7 @@ _MISSING_LABELS = {
     "modules": "blackbox module",
     "interfaces": "interface",
     "packages": "package",
+    "units": "unit",
     "includes": "include",
     "macros": "macro",
 }
@@ -318,10 +319,13 @@ def render_tree_line(line: TreeLine, style: TreeStyle = TreeStyle()) -> str:
 
 
 def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
-    """Warn about each of the requested *tops* that no input file defines."""
+    """Report each of the requested *tops* that shows no hierarchy: it failed, or nothing defines it."""
     defined = {d["mod_name"] for f in hierarchy["files"] for d in f["defs"]}
+    failed = {t.lower() for t in hierarchy.get("failed_tops", [])}
     for top in tops:
-        if top not in defined:
+        if top.lower() in failed:
+            _err.print(f"[red]error:[/red] top module {top!r} could not be elaborated, so nothing below it is shown")
+        elif top not in defined:
             _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
 
 
@@ -573,12 +577,13 @@ def main():
     args = parser.parse_intermixed_args()
     for frontend in frontends:
         frontend.configure(args)
-    if not args.paths and not any(f.extra_inputs() for f in frontends):
+    foreign = [path for frontend in frontends for path in frontend.foreign_files()]
+    if not args.paths and not foreign and not any(f.extra_inputs() for f in frontends):
         parser.error("give at least one PATH or an input option such as -f (see --help)")
 
     ignore = {n.lower() for n in args.ignore} if args.ignore else set()
     suffixes = tuple(suffix for frontend in frontends for suffix in frontend.suffixes)
-    inputs = _route_files(frontends, collect_source_files(args.paths, args.recursive, suffixes, ignore))
+    inputs = _route_files(frontends, collect_source_files(args.paths + foreign, args.recursive, suffixes, ignore))
     if not inputs:
         _err.print("[red]error:[/red] no source files found")
         sys.exit(1)

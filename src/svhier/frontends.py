@@ -19,7 +19,7 @@ from typing import Protocol
 #: The entry point group plugins register in.
 ENTRY_POINT_GROUP = "svhier.frontends"
 _MAX_ROUNDS = 20
-_MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
+_MISSING_KINDS = ("modules", "interfaces", "packages", "units", "includes", "macros")
 #: Suffix -> what to install, for files no enabled frontend reads.
 KNOWN_SUFFIXES = {".vhd": "svhier-ghdl", ".vhdl": "svhier-ghdl", ".sv": "pyslang", ".v": "pyslang"}
 
@@ -64,6 +64,7 @@ class Frontend(Protocol):
       :class:`Root`'s notation; ``unresolved`` describes the ones that have no such form.
     * ``rejected_roots`` — roots that can't be elaborated with what is known about them.
     * ``notes`` — remarks for the user.
+    * ``failed_tops`` — optional: requested roots it defines but couldn't elaborate.
 
     Definitions may also have ``variants``, for a tree that is exact per parameter setting;
     see the result format in the developer docs.  Without them, the tree uses ``insts``.
@@ -84,6 +85,9 @@ class Frontend(Protocol):
 
     def extra_inputs(self) -> list[str]:
         """Describe inputs other than files, from the plugin's own options, such as ``2 command file(s)``."""
+
+    def foreign_files(self) -> list[str]:
+        """Return files the plugin's own inputs name that another language reads, for core to route."""
 
     def units(self, files: list[str]) -> dict[str, str]:
         """Return ``{lowercase unit name: file}`` for what the inputs define, not searching ``-y``."""
@@ -117,7 +121,7 @@ def empty_fragment() -> dict:
     """Return an elaboration result with nothing in it."""
     return {
         "files": [], "duplicates": [], "tops": [], "needed": None, "defines": [], "inc_dirs": [],
-        "diagnostics": [], "has_errors": False, "unresolved": {}, "rejected_roots": [], "notes": [],
+        "diagnostics": [], "has_errors": False, "unresolved": {}, "rejected_roots": [], "notes": [], "failed_tops": [],
         "missing": {kind: {} for kind in _MISSING_KINDS},
     }
 
@@ -204,9 +208,10 @@ class _Stitcher:  # pylint: disable=too-few-public-methods
             for name in fragment["rejected_roots"]:
                 _add_unique(self.notes, [f"{name}: its parameters aren't known from the instantiating language, so its children aren't shown"])
             for kind in _MISSING_KINDS:
-                for name, users in fragment["missing"][kind].items():
+                for name, users in fragment["missing"].get(kind, {}).items():
                     _add_unique(merged["missing"][kind].setdefault(name, []), users)
             merged.setdefault("pulled", []).extend(fragment.get("pulled", []))
+            merged["failed_tops"].extend(fragment.get("failed_tops", []))
             if self.tops:
                 merged["needed"] = (merged["needed"] or []) + list(fragment["needed"] or [])
 

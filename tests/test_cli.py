@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from svhier.cli import collect_source_files, _write_filelist, main
-from svhier.slang_frontend import collect_inc_dirs
+from svhier.slang_frontend import SlangFrontend, collect_inc_dirs
 
 SV_SUFFIXES = (".sv", ".v")
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
@@ -444,3 +444,56 @@ def test_main_warns_about_unknown_top_without_tree(monkeypatch, capsys):
         main()
     assert exc.value.code == 1
     assert "top module 'nosuch' not found" in capsys.readouterr().err
+
+
+def _no_plugins(monkeypatch) -> None:
+    """Run as if only the bundled slang plugin were installed."""
+    monkeypatch.setattr("svhier.cli.discover_frontends", lambda on_error=None: [SlangFrontend()])
+
+
+def test_command_file_vhdl_without_a_vhdl_plugin(monkeypatch, tmp_path, capsys):
+    _no_plugins(monkeypatch)
+    (tmp_path / "top.sv").write_text("module top; endmodule\n")
+    (tmp_path / "leaf.vhd").write_text("entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("leaf.vhd\ntop.sv\n")
+    monkeypatch.setenv("COLUMNS", "500")
+    monkeypatch.setattr("sys.argv", ["svhier", "-F", str(tmp_path / "list.f"), "--top", "top"])
+    main()
+    out = capsys.readouterr()
+    assert "install and enable svhier-ghdl" in out.err
+    assert "top" in out.out
+
+
+def test_command_file_with_only_vhdl_without_a_vhdl_plugin(monkeypatch, tmp_path, capsys):
+    _no_plugins(monkeypatch)
+    (tmp_path / "leaf.vhd").write_text("entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("leaf.vhd\n")
+    monkeypatch.setenv("COLUMNS", "500")
+    monkeypatch.setattr("sys.argv", ["svhier", "-F", str(tmp_path / "list.f")])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "install and enable svhier-ghdl" in err
+    assert "no source files found" in err
+
+
+def test_collect_inc_dirs_finds_included_sources(tmp_path):
+    """Only as far as something includes them: other source directories stay out."""
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n`include "consts.vi"\n`include "gone.sv"\n')
+    (tmp_path / "lib/defs.sv").write_text("`define A\n")
+    (tmp_path / "lib/consts.vi").write_text("`define B\n")
+    (tmp_path / "other/unrelated.sv").write_text("module unrelated; endmodule\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == [str(tmp_path / "lib")]
+
+
+def test_collect_inc_dirs_leaves_out_what_resolves_next_to_the_includer(tmp_path):
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n')
+    (tmp_path / "rtl/defs.sv").write_text("`define A\n")
+    (tmp_path / "other/defs.sv").write_text("`define A\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == []

@@ -374,12 +374,15 @@ class _Inputs:
     tops: list[str]
     command_files: list[tuple[str, str]]
     params: dict[str, str] = field(default_factory=dict)
+    exclude_exts: list[str] = field(default_factory=list)
 
     def args(self) -> list[str]:
         """Return the slang command line (without the program name)."""
+        # slang only applies an exclusion to the files named after it.
+        args = [arg for ext in self.exclude_exts for arg in ("--exclude-ext", ext)]
         # Defaults matching a plain ``Compilation``: a fixed default timescale, and a
         # top module with interface ports (a sub-design parsed alone) is not an error.
-        args = ["--timescale", "1ns/1ns", "--allow-toplevel-iface-ports", *self.files]
+        args += ["--timescale", "1ns/1ns", "--allow-toplevel-iface-ports", *self.files]
         for flag, values in (("-I", self.inc_dirs), ("-D", self.defines), ("--top", self.tops)):
             for value in values:
                 args += [flag, value]
@@ -405,6 +408,17 @@ def _run_driver(inputs: _Inputs, extra: list[str] | None = None) -> tuple[Driver
         raise ValueError("slang rejected the inputs (see messages above)")
     load_errors = [] if driver.parseAllSources() else list(driver.sourceLoader.errors)
     return driver, driver.createCompilation(), load_errors
+
+
+def command_files_have_sources(command_files: list[tuple[str, str]], exclude_exts: list[str]) -> bool:
+    """Return whether slang would read any source from *command_files*, apart from *exclude_exts*.
+
+    A command line slang rejects counts as having sources, so that it gets to report why.
+    """
+    driver = Driver()
+    driver.addStandardArgs()
+    args = _Inputs([], [], [], [], command_files, exclude_exts=exclude_exts).args()
+    return not driver.parseCommandLine(" ".join(_quote(a) for a in ["svhier", *args])) or driver.sourceLoader.hasFiles
 
 
 def _trimmed_files(driver: Driver, depfile: Path) -> set[str]:
@@ -551,6 +565,7 @@ def parse_files(  # pylint: disable=too-many-arguments
     tops: list[str] | None = None,
     command_files: list[tuple[str, str]] | None = None,
     params: dict[str, str] | None = None,
+    exclude_exts: list[str] | None = None,
     frontend_info: bool = False,
     pull: Callable[[dict], bool] | None = None,
     max_pulls: int = 0,
@@ -575,6 +590,8 @@ def parse_files(  # pylint: disable=too-many-arguments
       true it has added to *file_paths* or *inc_dirs*, which are read again, and the sources
       are reloaded.  Only the last load is walked and returned in full, so a caller that
       searches library directories doesn't pay for the hierarchy of every round.
+    * *exclude_exts* — suffixes without the dot; slang skips files with these, wherever
+      they're named.
 
     See the module docstring for the elaboration model.  Raises ``ValueError`` if slang
     rejects the inputs (for example a missing command file).
@@ -638,7 +655,7 @@ def parse_files(  # pylint: disable=too-many-arguments
 
     def current() -> _Inputs:
         return _Inputs(list(file_paths), list(include_dirs), list(defines or []),
-                       list(tops or []), list(command_files or []), dict(params or {}))
+                       list(tops or []), list(command_files or []), dict(params or {}), list(exclude_exts or []))
 
     with tempfile.TemporaryDirectory() as tmp:
         result = _elaborate(current, Path(tmp) / "modules.d", pull, max_pulls)

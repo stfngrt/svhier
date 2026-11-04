@@ -16,7 +16,7 @@ an empty one.
 | `defines`, `inc_dirs` | Macros and include directories, for the filelist | No |
 | `diagnostics` | `{severity, file, message}` dicts | No |
 | `has_errors` | Whether any diagnostic is an error, which makes the exit code 1 | No |
-| `missing` | `{kind: {name: [referencing files]}}`, with kinds `modules`, `interfaces`, `packages`, `includes` and `macros` | No |
+| `missing` | `{kind: {name: [referencing files]}}`, with kinds `modules`, `interfaces`, `packages`, `units` (VHDL units, as `library.unit` outside the work library), `includes` and `macros` | No |
 
 ## Keys only plugins and stitching use
 
@@ -25,6 +25,7 @@ an empty one.
 | `unresolved` | Plugin | `{name: [{"generics": {...}, "unresolved": [text]}]}` for names it has no definition for. `generics` holds the values in {class}`~svhier.frontends.Root`'s notation, and `unresolved` describes values with no such form |
 | `rejected_roots` | Plugin | Roots it can't elaborate with what's known about them |
 | `notes` | Plugin | Remarks for the user |
+| `failed_tops` | Plugin | Optional. Requested roots it defines but couldn't elaborate, so they aren't reported as not found |
 | `pulled` | Plugin | `(name, path, other candidates)` for each file taken from `-y` |
 | `frontend_notes` | Stitching | All notes, printed at the end |
 
