@@ -9,11 +9,16 @@ in a child process, a library of what ``-y`` holds, and a frontend that takes bo
 """
 
 import importlib.util
+import io
 import json
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
+import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -310,15 +315,101 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     return list(defs.values())
 
 
+class _ServerFailed(Exception):
+    """The serving worker died, as opposed to the child running one request."""
+
+
+def _stop_server(process: subprocess.Popen, descriptors: tuple[int, ...]) -> None:
+    for descriptor in descriptors:
+        os.close(descriptor)
+    try:  # The group holds the server and any child elaborating.
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+class _WorkerServer:
+    """A worker that has loaded one set of sources, and forks a child for each request.
+
+    Starting Python and libghdl and reading the sources takes most of the time of a run, and
+    without ``--top`` there is a run per entity.  A forked child starts from the state a new
+    process has after loading, so it gives the same answer, and a crash only ends the child.
+    """
+
+    def __init__(self, env: dict[str, str]) -> None:
+        request_read, self._requests = os.pipe()
+        self._replies, reply_write = os.pipe()
+        self.command = [sys.executable, "-m", "svhier_ghdl.worker", "--serve", str(request_read), str(reply_write)]
+        # In a session of its own, to kill a hanging child with it.  Stdin stays inherited, as with a process per run.
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
+            self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            pass_fds=(request_read, reply_write), start_new_session=True)
+        os.close(request_read)
+        os.close(reply_write)
+        self.pid = process.pid
+        self.close = weakref.finalize(self, _stop_server, process, (self._requests, self._replies))
+        self._poll = select.poll()
+        self._poll.register(self._replies, select.POLLIN)
+        self._buffer = bytearray()
+
+    def load(self, sources: dict, deadline: float) -> None:
+        """Have the server load *sources*, and wait until it has."""
+        self._send(sources)
+        self._read_line(deadline)
+
+    def _send(self, message: dict) -> None:
+        data = json.dumps(message).encode() + b"\n"
+        try:
+            while data:
+                data = data[os.write(self._requests, data):]
+        except OSError as error:
+            raise _ServerFailed from error
+
+    def _read_more(self, deadline: float) -> None:
+        if not self._poll.poll(max(0.0, deadline - time.monotonic()) * 1000):
+            raise subprocess.TimeoutExpired(self.command, _TIMEOUT_S)
+        data = os.read(self._replies, 1 << 16)
+        if not data:
+            raise _ServerFailed
+        self._buffer += data
+
+    def _read_line(self, deadline: float) -> bytes:
+        while (end := self._buffer.find(b"\n")) < 0:
+            self._read_more(deadline)
+        line = bytes(self._buffer[:end])
+        del self._buffer[:end + 1]
+        return line
+
+    def _read_text(self, size: int, deadline: float) -> str:
+        while len(self._buffer) < size:
+            self._read_more(deadline)
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return io.TextIOWrapper(io.BytesIO(data)).read()  # Decoded as subprocess's text mode does.
+
+    def request(self, request: dict, deadline: float) -> subprocess.CompletedProcess:
+        """Run one elaboration request."""
+        self._send(request)
+        header = json.loads(self._read_line(deadline))
+        stdout = self._read_text(header["stdout"], deadline)
+        stderr = self._read_text(header["stderr"], deadline)
+        return subprocess.CompletedProcess(self.command, header["returncode"], stdout, stderr)
+
+
 class GhdlWorkerTool:
     """Everything the frontend needs from pyGHDL, which :mod:`svhier_ghdl.worker` does for it."""
+
+    def __init__(self) -> None:
+        self._server: _WorkerServer | None = None
+        self._sources: dict | None = None
+        self._failed_sources: dict | None = None
 
     def unavailable_reason(self) -> str | None:
         """Report if pyGHDL is missing."""
         return None if importlib.util.find_spec("pyGHDL") else f"pyGHDL is not installed; {_INSTALL_HINT}"
 
-    def run(self, request: dict) -> subprocess.CompletedProcess:
-        """Run one worker request."""
+    def _environment(self) -> dict[str, str]:
         spec = importlib.util.find_spec("pyGHDL")
         if spec is None or spec.origin is None:
             raise ValueError(f"pyGHDL is not installed; {_INSTALL_HINT}")
@@ -326,8 +417,50 @@ class GhdlWorkerTool:
         # The wheel bundles libgnat, but the loader only finds it through this path.
         lib_dir = Path(spec.origin).parent / "lib"
         env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [str(lib_dir), env.get("LD_LIBRARY_PATH", "")]))
+        return env
+
+    def run_once(self, request: dict) -> subprocess.CompletedProcess:
+        """Run one worker request in a process of its own."""
         return subprocess.run([sys.executable, "-m", "svhier_ghdl.worker", json.dumps(request)],
-                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=env, check=False)
+                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=self._environment(), check=False)
+
+    def run(self, request: dict) -> subprocess.CompletedProcess:
+        """Run one worker request, in the server for its sources if it's an elaboration.
+
+        Whatever stops the server, a process per request gives the answer it would have given.
+        """
+        if request["op"] != "elaborate":
+            return self.run_once(request)
+        sources = {key: request[key] for key in ("std", "work", "files", "libraries")}
+        if sources != self._failed_sources:
+            try:
+                return self._serve(sources, request)
+            except _ServerFailed:
+                self._failed_sources = sources
+                self.close()
+            except subprocess.TimeoutExpired:
+                self.close()
+                raise
+        return self.run_once(request)
+
+    def _serve(self, sources: dict, request: dict) -> subprocess.CompletedProcess:
+        deadline = time.monotonic() + _TIMEOUT_S
+        if self._server is None or sources != self._sources:
+            self.close()
+            self._server = _WorkerServer(self._environment())
+            self._server.load(sources, deadline)
+            self._sources = sources
+        return self._server.request(request, deadline)
+
+    def server_pid(self) -> int | None:
+        """Return the process serving elaborations, if there is one."""
+        return self._server.pid if self._server else None
+
+    def close(self) -> None:
+        """Stop the server, if there is one.  It also stops when the program exits."""
+        if self._server:
+            self._server.close()
+            self._server = None
 
 
 class GhdlFrontend:  # pylint: disable=too-many-instance-attributes

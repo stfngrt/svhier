@@ -5,6 +5,11 @@ Run as ``python -m svhier_ghdl.worker``.  It has to be a separate process becaus
 keeps global state, an Ada assertion aborts the whole process, and the wheel's bundled
 ``libgnat`` only loads if ``LD_LIBRARY_PATH`` is set before Python starts.
 
+Elaborating twice in one process doesn't work: the second run stops on an assertion, and
+``libghdl__finalize`` followed by a new setup ends in a storage error.  With ``--serve``, one
+process therefore loads the sources and forks a child for each elaboration, so that each
+starts from the same state without paying for Python and libghdl again.
+
 pyGHDL wraps parsing, analysis and the node accessors, and those are used as they are.
 It has no wrapper for the elaboration calls, so :func:`_elaborate` binds them by symbol
 name.  They are GHDL internals, not a stable API, so expect them to change between
@@ -12,7 +17,9 @@ versions.  Same call sequence as GHDL's own ``ghdl_synth_configure``.
 """
 
 import ctypes
+import gc
 import json
+import os
 import sys
 from ctypes import c_bool, c_int32, c_void_p
 from typing import Any
@@ -237,8 +244,73 @@ def _elaborate(request: dict) -> int:
     return 0
 
 
+def _output_files() -> list[Any]:
+    """Return in-memory files for the output of a stage: stdout, then stderr.
+
+    A full disk can't cut them short, which a child would have no way to report.
+    """
+    return [os.fdopen(os.memfd_create(name), "w+b", buffering=0) for name in ("stdout", "stderr")]
+
+
+def _redirect_output(files: list[Any]) -> None:
+    for descriptor, file in enumerate(files, start=1):
+        os.dup2(file.fileno(), descriptor)
+
+
+def _read_all(file: Any) -> bytes:
+    file.seek(0)
+    return file.read()
+
+
+def _serve(requests: Any, replies: Any) -> int:
+    """Load the sources, then answer each elaboration request from a forked child.
+
+    The first line of *requests* holds ``{std, work, files, libraries}``, and ``ready`` on
+    *replies* says they loaded.  If they don't, this process dies and the caller does without.
+    Each later line is a request.  Each reply is a line ``{returncode, stdout, stderr}`` with
+    the sizes of the output that follows.  What loading printed starts every output, as it
+    does when one process both loads and elaborates.
+    """
+    sources = json.loads(requests.readline())
+    loading = _output_files()
+    _redirect_output(loading)
+    _setup(sources["std"], sources["work"])
+    _load(sources["files"], sources["libraries"], sources["work"].lower())
+    sys.stdout.flush()
+    sys.stderr.flush()
+    ctypes.CDLL(None).fflush(None)  # Or each child would write what libghdl has buffered again.
+    loaded = [_read_all(file) for file in loading]
+    replies.write(b"ready\n")
+    replies.flush()
+    gc.freeze()  # Keep garbage collection in the children from copying these pages.
+    for line in requests:
+        outputs = _output_files()
+        for file, text in zip(outputs, loaded):
+            file.write(text)
+        pid = os.fork()
+        if pid == 0:
+            requests.close()
+            replies.close()
+            _redirect_output(outputs)
+            sys.exit(_elaborate(json.loads(line)))
+        code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        stdout, stderr = (_read_all(file) for file in outputs)
+        for file in outputs:
+            file.close()
+        header = {"returncode": code, "stdout": len(stdout), "stderr": len(stderr)}
+        replies.write(json.dumps(header).encode() + b"\n" + stdout + stderr)
+        replies.flush()
+    return 0
+
+
 def main() -> int:
-    """Read a JSON request from argv: ``{op, files, std, work, top, top_library, generics, libraries, objects}``."""
+    """Run the request in argv: JSON ``{op, files, std, work, top, top_library, generics, libraries, objects}``.
+
+    Or with ``--serve REQUEST_FD REPLY_FD``, answer the requests on those pipes.
+    """
+    if sys.argv[1] == "--serve":
+        with os.fdopen(int(sys.argv[2]), "rb") as requests, os.fdopen(int(sys.argv[3]), "wb") as replies:
+            return _serve(requests, replies)
     request = json.loads(sys.argv[1])
     _setup(request["std"], request["work"])
     if request["op"] == "scan":
