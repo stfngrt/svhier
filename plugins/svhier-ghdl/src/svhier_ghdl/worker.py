@@ -5,6 +5,11 @@ Run as ``python -m svhier_ghdl.worker``.  It has to be a separate process becaus
 keeps global state, an Ada assertion aborts the whole process, and the wheel's bundled
 ``libgnat`` only loads if ``LD_LIBRARY_PATH`` is set before Python starts.
 
+Elaborating twice in one process doesn't work: the second run stops on an assertion, and
+``libghdl__finalize`` followed by a new setup ends in a storage error.  With ``--serve``, one
+process therefore loads the sources and forks a child for each elaboration, so that each
+starts from the same state without paying for Python and libghdl again.
+
 pyGHDL wraps parsing, analysis and the node accessors, and those are used as they are.
 It has no wrapper for the elaboration calls, so :func:`_elaborate` binds them by symbol
 name.  They are GHDL internals, not a stable API, so expect them to change between
@@ -12,8 +17,12 @@ versions.  Same call sequence as GHDL's own ``ghdl_synth_configure``.
 """
 
 import ctypes
+import gc
 import json
+import os
+import signal
 import sys
+import time
 from ctypes import c_bool, c_int32, c_void_p
 from typing import Any
 
@@ -246,8 +255,102 @@ def _elaborate(request: dict) -> int:
     return 0
 
 
+def _output_files() -> list[Any]:
+    """Return in-memory files for the output of a stage: stdout, then stderr.
+
+    A full disk can't cut them short, which a child would have no way to report.
+    """
+    return [os.fdopen(os.memfd_create(name), "w+b", buffering=0) for name in ("stdout", "stderr")]
+
+
+def _redirect_output(files: list[Any]) -> None:
+    for descriptor, file in enumerate(files, start=1):
+        os.dup2(file.fileno(), descriptor)
+
+
+def _read_all(file: Any) -> bytes:
+    file.seek(0)
+    return file.read()
+
+
+def _wait_for(pid: int, timeout: float) -> tuple[int, bool]:
+    """Wait for child *pid*, killing it after *timeout* seconds.  Returns ``(exit code, timed out)``.
+
+    It has ended and been reaped on return, which nothing outside this process can wait for.
+    SIGCHLD is blocked, so it stays pending if the child ends before the wait starts.  One left
+    from an earlier child only means another pass.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status), False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            os.kill(pid, signal.SIGKILL)
+            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), True
+        signal.sigtimedwait([signal.SIGCHLD], remaining)
+
+
+def _load_quietly(sources: dict) -> list[bytes]:
+    """Set up and load *sources*, and return what that printed: stdout, then stderr."""
+    loading = _output_files()
+    _redirect_output(loading)
+    _setup(sources["std"], sources["work"])
+    _load(sources["files"], sources["libraries"], sources["work"].lower())
+    sys.stdout.flush()
+    sys.stderr.flush()
+    ctypes.CDLL(None).fflush(None)  # Or each child would write what libghdl has buffered again.
+    return [_read_all(file) for file in loading]
+
+
+def _serve(requests: Any, replies: Any) -> int:
+    """Load the sources, then answer each elaboration request from a forked child.
+
+    The first line of *requests* holds ``{std, work, files, libraries}``, and ``ready`` on
+    *replies* says they loaded.  If they don't, this process dies and the caller does without.
+    Each later line is ``{request, timeout}``.  Each reply is a line ``{returncode, timed_out,
+    stdout, stderr}`` with the sizes of the output that follows.  What loading printed starts
+    every output, as it does when one process both loads and elaborates.
+
+    If the caller is gone, the next read or write ends this process, so a killed program
+    leaves nothing behind for longer than a request's timeout.
+    """
+    loaded = _load_quietly(json.loads(requests.readline()))
+    replies.write(b"ready\n")
+    replies.flush()
+    gc.freeze()  # Keep garbage collection in the children from copying these pages.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCHLD])
+    for line in requests:
+        message = json.loads(line)
+        outputs = _output_files()
+        for file, text in zip(outputs, loaded):
+            file.write(text)
+        pid = os.fork()
+        if pid == 0:
+            requests.close()
+            replies.close()
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            _redirect_output(outputs)
+            sys.exit(_elaborate(message["request"]))
+        code, timed_out = _wait_for(pid, message["timeout"])
+        stdout, stderr = (_read_all(file) for file in outputs)
+        for file in outputs:
+            file.close()
+        header = {"returncode": code, "timed_out": timed_out, "stdout": len(stdout), "stderr": len(stderr)}
+        replies.write(json.dumps(header).encode() + b"\n" + stdout + stderr)
+        replies.flush()
+    return 0
+
+
 def main() -> int:
-    """Read a JSON request from argv: ``{op, files, std, work, top, top_library, generics, libraries, objects}``."""
+    """Run the request in argv: JSON ``{op, files, std, work, top, top_library, generics, libraries, objects}``.
+
+    Or with ``--serve REQUEST_FD REPLY_FD``, answer the requests on those pipes.
+    """
+    if sys.argv[1] == "--serve":
+        with os.fdopen(int(sys.argv[2]), "rb") as requests, os.fdopen(int(sys.argv[3]), "wb") as replies:
+            return _serve(requests, replies)
     request = json.loads(sys.argv[1])
     _setup(request["std"], request["work"])
     if request["op"] == "scan":
