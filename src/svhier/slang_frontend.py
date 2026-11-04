@@ -342,7 +342,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         """
         options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files,
                                    "exclude_exts": self._exclude_exts, "frontend_info": True}
-        if library and self.search.library:
+        if library and self.search.library is not None:  # Not "if not": see _pull_missing.
             # Only the last round is returned in full, so earlier ones just report what is missing.
             options |= {"pull": lambda loaded: self._pull_missing(loaded, files), "max_pulls": _MAX_LIB_ROUNDS}
         return self.tool.parse(files, self.inc_dirs, **options)

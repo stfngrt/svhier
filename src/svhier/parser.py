@@ -553,6 +553,16 @@ def _build_file_entries(walk: _Walk, tables: _Tables, files: list[tuple[str, str
     return entries
 
 
+def _strip_frontend_info(result: dict) -> None:
+    """Remove from *result* what is only for :mod:`svhier.slang_frontend`."""
+    for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
+        del result[key]
+    for entry in result["files"]:
+        for unit in entry["defs"]:
+            del unit["variants"]
+            unit.pop("top_variant", None)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -659,13 +669,8 @@ def parse_files(  # pylint: disable=too-many-arguments
 
     with tempfile.TemporaryDirectory() as tmp:
         result = _elaborate(current, Path(tmp) / "modules.d", pull, max_pulls)
-    if not frontend_info:  # These are for svhier.slang_frontend.
-        for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
-            del result[key]
-        for entry in result["files"]:
-            for unit in entry["defs"]:
-                del unit["variants"]
-                unit.pop("top_variant", None)
+    if not frontend_info:
+        _strip_frontend_info(result)
     return result
 
 
