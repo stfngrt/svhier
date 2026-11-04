@@ -168,3 +168,25 @@ def test_tool_and_library_are_injected(tmp_path):
     result = frontend.elaborate([path], Request(roots=[Root("top", requested=True)]))
     assert result["unresolved"] == {"other": [{"generics": {}, "unresolved": []}]}
     assert {r["std"] for r in tool.requests} == {"93"}
+
+
+def test_ignore_matches_whole_names_and_globs_in_vhdl_inputs_and_libraries(tmp_path):
+    """-x treats VHDL like SV: btb.vhd survives -x tb, and globs reach -y directories."""
+    root = tmp_path / "tb_parent"
+    _write(root / "rtl/top.sv", "module top; btb u_b (); lib_cell u_l (); endmodule\n")
+    _write(root / "rtl/btb.vhd", _ENTITY.format("btb"))
+    _write(root / "rtl/tb/bench.vhd", _ENTITY.format("bench"))
+    _write(root / "rtl/fifo_tb.vhd", _ENTITY.format("fifo_tb"))
+    _write(root / "lib/lib_cell.vhd", _ENTITY.format("lib_cell"))
+    _write(root / "lib/lib_cell_tb.vhd", _ENTITY.format("lib_cell_tb"))
+    _write(root / "lib/tb/lib_cell.vhd", _ENTITY.format("lib_cell"))
+
+    library = VhdlLibrary([str(root / "lib")], {"tb", "*_tb.vhd"})
+    assert library.find("lib_cell") == ([root / "lib/lib_cell.vhd"], 0)
+    assert library.find("lib_cell_tb") == ([], 0)
+
+    proc = _svhier("-r", str(root / "rtl"), "-x", "tb", "-x", "*_tb.vhd", "--no-tree", "--filelist", "-")
+    names = [Path(line).name for line in proc.stdout.splitlines() if not line.startswith(("//", "+"))]
+    assert "btb.vhd" in names
+    assert "bench.vhd" not in names
+    assert "fifo_tb.vhd" not in names

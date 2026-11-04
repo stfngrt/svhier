@@ -29,6 +29,8 @@ uv pip install https://github.com/ghdl/ghdl/releases/download/v6.0.0/pyghdl-6.0.
 uv run pytest tests/ -v                     # core and slang
 uv run --no-sync pytest plugins/svhier-ghdl/tests/ -v   # the GHDL plugin
 uv run pylint src/svhier/                   # lint
+uv run mypy src/svhier tests                # type check
+uv run --no-sync mypy plugins/svhier-ghdl/src/svhier_ghdl plugins/svhier-ghdl/tests   # type check the plugin
 uv run sphinx-build -W -b html docs docs/_build/html    # docs, failing on warnings
 ```
 

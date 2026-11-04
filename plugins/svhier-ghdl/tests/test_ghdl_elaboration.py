@@ -15,8 +15,8 @@ from ruamel.yaml import YAML
 from test_ghdl_generics import _AWKWARD_DECLARATIONS
 
 TESTS = Path(__file__).parent
-GHDL = os.environ.get("SVHIER_GHDL_BIN") or shutil.which("ghdl")
-pytestmark = pytest.mark.skipif(GHDL is None or importlib.util.find_spec("pyGHDL") is None,
+GHDL = os.environ.get("SVHIER_GHDL_BIN") or shutil.which("ghdl") or ""
+pytestmark = pytest.mark.skipif(not GHDL or importlib.util.find_spec("pyGHDL") is None,
                                 reason="needs the ghdl program and pyGHDL")
 
 

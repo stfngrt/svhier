@@ -12,8 +12,8 @@ cd cva6
 ## 1. Look at the tree
 
 Point svhier at the RTL and tell it which module is the top. `-r` searches
-directories recursively. `-x` skips any path containing that name, here the
-testbenches.
+directories recursively. `-x` skips files and directories with that name
+(globs work too), here the testbench directories.
 
 ```bash
 svhier -r core -x test -x tb --top cva6

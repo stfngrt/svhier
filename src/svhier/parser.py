@@ -23,22 +23,24 @@ import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
     Compilation,
     DefinitionKind,
     DefinitionSymbol,
+    ExplicitImportSymbol,
     InstanceBodySymbol,
     InstanceSymbol,
     SymbolKind,
+    WildcardImportSymbol,
 )
 from pyslang.driver import Driver
-from pyslang.syntax import SyntaxKind, SyntaxTree
+from pyslang.syntax import ModuleDeclarationSyntax, SyntaxKind, SyntaxTree
 
 from svhier.filelist import compute_filelist  # noqa: F401  pylint: disable=unused-import
 
-_IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
 # Scopes that can hold module instances without being a module themselves.
 _CONTAINER_KINDS = (SymbolKind.GenerateBlock, SymbolKind.GenerateBlockArray, SymbolKind.InstanceArray)
 _COMMAND_FILE_FLAGS = ("-f", "-F")
@@ -73,7 +75,8 @@ def _definitions_by_file(compilation: Compilation, sm: SourceManager, kind) -> d
     """Return canonical file -> ``DefinitionSymbol`` s of *kind* defined there (``getDefinitions`` order)."""
     by_file: dict[str, list[DefinitionSymbol]] = {}
     for defn in compilation.getDefinitions():
-        if defn.definitionKind == kind:
+        # This also returns primitives and config blocks, which have no definition kind.
+        if isinstance(defn, DefinitionSymbol) and defn.definitionKind == kind:
             by_file.setdefault(_canon(sm, defn.location), []).append(defn)
     return by_file
 
@@ -120,7 +123,7 @@ def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     """Return deduplicated package names imported by an instance body."""
     imports: list[str] = []
     for child in body:
-        if child.kind in _IMPORT_KINDS:
+        if isinstance(child, (WildcardImportSymbol, ExplicitImportSymbol)):
             pkg = child.packageName
             if pkg and pkg not in imports:
                 imports.append(pkg)
@@ -201,7 +204,7 @@ def _blackbox_params(inst) -> dict:
 
 def _parameter_names(defn: DefinitionSymbol) -> list[str]:
     """Return the parameters of *defn* that can be overridden.  Works without elaborating it."""
-    syntax = defn.syntax
+    syntax = cast(ModuleDeclarationSyntax, defn.syntax)
     declarations = list(syntax.header.parameters.declarations) if syntax.header.parameters is not None else []
     declarations += [m.parameter for m in syntax.members if hasattr(m, "parameter")]
     names = []
@@ -373,7 +376,13 @@ def _trimmed_files(driver: Driver, depfile: Path) -> set[str]:
     The driver must have been given ``--top``, ``--depfile-trim`` and ``--Mmodule <depfile>``.
     slang's trimming follows module, interface, package and class references, so it is the
     authority on which files a top needs.
+
+    Writing the depfile warns directly on stderr about every name without a source file,
+    including names only used in untaken generate branches.  Real gaps are in ``missing``
+    and a bad ``--top`` is an elaboration error, so those warnings are switched off here.
+    Warnings about the command line itself were already printed by then.
     """
+    driver.diagEngine.setWarningOptions(["no-command-line"])
     driver.optionallyWriteDepFiles()
     if not depfile.exists():
         return set()
@@ -418,7 +427,8 @@ def _build_tables(compilation: Compilation, sm: SourceManager) -> _Tables:
     for table, kind in ((modules, "module"), (ifaces, "interface")):
         for defs in table.values():
             for defn in defs:
-                found = compilation.tryGetDefinition(defn.name, root).definition
+                # The binding converts a root symbol to the Scope it asks for; the stubs don't say so.
+                found = compilation.tryGetDefinition(defn.name, root).definition  # type: ignore[arg-type]
                 if found is not None:
                     used[(kind, defn.name)] = _canon(sm, found.location)
     for names in pkgs.values():
@@ -610,7 +620,7 @@ def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
         "inc_dirs": _include_dirs(driver.syntaxTrees, sm),
         "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
         "has_errors": has_errors or bool(load_errors),
-        "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
+        "missing": _collect_missing(compilation, sm, {c: f for f, c in pairs}),
         "blackbox_params": walk.blackbox_params,
         "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
         "parameter_names": {d.name: _parameter_names(d) for defs in tables.modules.values() for d in defs},

@@ -32,12 +32,21 @@ contains `.svh`/`.vh` headers is added to the include path automatically.
 
 With the [VHDL plugin](vhdl.md), `.vhd` and `.vhdl` files count too.
 
-`-x NAME` skips any file or directory with a path component that contains
-`NAME` (case-insensitive). It can be repeated, and applies to library
-directories too:
+`-x PATTERN` skips any file or directory below the paths you pass whose whole
+name matches `PATTERN` (case-insensitive). `PATTERN` is a name or a glob:
+
+| Option | Skips | Keeps |
+|--------|-------|-------|
+| `-x tb` | `rtl/tb/` and everything in it | `rtl/btb.sv`, `rtl/fifo_tb.sv` |
+| `-x fifo_tb.sv` | `rtl/fifo_tb.sv` | `rtl/fifo.sv` |
+| `-x '*_tb.sv'` | `rtl/fifo_tb.sv`, `rtl/sub/ram_tb.sv` | `rtl/btb.sv` |
+
+Quote globs so the shell doesn't expand them. Directories above or named by a
+path you pass never match, and a file you pass directly is only checked by its
+own name. `-x` can be repeated, and applies to library directories too:
 
 ```bash
-svhier -r rtl/ -x test -x tb -x xilinx
+svhier -r rtl/ -x test -x tb -x '*_tb.sv' -x xilinx
 ```
 
 (command-files)=

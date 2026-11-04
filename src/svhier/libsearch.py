@@ -12,8 +12,9 @@ are found under.
 
 import re
 from collections.abc import Callable
+from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Protocol
+from typing import Generic, Protocol, TypeVar
 
 _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:automatic|static)\s+)?(\w+)", re.M)
 
@@ -21,15 +22,20 @@ _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:auto
 _DEF_KINDS = ("modules", "interfaces", "packages")
 
 
-def is_ignored(p: Path, ignore: set[str]) -> bool:
-    """Return whether any component of *p* contains one of the lowercase names in *ignore*."""
-    return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
+def is_ignored(p: Path, root: Path, ignore: set[str]) -> bool:
+    """Return whether a component of *p* below *root* matches one of the lowercase patterns in *ignore*.
+
+    A pattern matches a whole file or directory name, either literally or as a glob
+    (``*_tb.sv``).  *root* and the directories above it never match, so where a design is
+    checked out does not change which of its files are skipped.  Matching is case-insensitive.
+    """
+    return any(fnmatchcase(part.lower(), pattern) for part in p.relative_to(root).parts for pattern in ignore)
 
 
 def glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
     """Return the files in directory *p* matching the patterns *exts*, leaving out ignored ones."""
     prefix = "**/" if recursive else ""
-    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, ignore)]
+    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, p, ignore)]
 
 
 class Library(Protocol):
@@ -49,10 +55,13 @@ class Library(Protocol):
 LibraryFactory = Callable[[list[str], set[str]], Library]
 
 
-class LibrarySearch:
+L = TypeVar("L", bound=Library)
+
+
+class LibrarySearch(Generic[L]):
     """Pulls files from a :class:`Library` into a compilation, and records what it pulled."""
 
-    def __init__(self, library: Library | None = None) -> None:
+    def __init__(self, library: L | None = None) -> None:
         self.library = library
         self.pulled: list[tuple[str, Path, int]] = []
 
@@ -90,7 +99,7 @@ class LibraryIndex:
             root = Path(d)
             for ext in ("*.sv", "*.v"):
                 for f in sorted(root.glob(f"**/{ext}")):
-                    if is_ignored(f, ign):
+                    if is_ignored(f, root, ign):
                         continue
                     try:
                         text = f.read_text(encoding="utf-8", errors="replace")
@@ -99,7 +108,7 @@ class LibraryIndex:
                     for name in dict.fromkeys(_DEF_RE.findall(text)):
                         self.defs.setdefault(name, []).append(f)
             for ext in ("*.svh", "*.vh"):
-                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not is_ignored(f, ign))
+                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not is_ignored(f, root, ign))
 
     @staticmethod
     def _rank(name: str, path: Path) -> tuple:

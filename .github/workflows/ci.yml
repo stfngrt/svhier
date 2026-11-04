@@ -27,6 +27,9 @@ jobs:
       - name: Lint
         run: uv run pylint src/svhier/
 
+      - name: Type check
+        run: uv run mypy src/svhier tests
+
       - name: Test
         run: uv run pytest tests/ -v
 
@@ -87,6 +90,9 @@ jobs:
 
       - name: Lint
         run: uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/
+
+      - name: Type check
+        run: uv run --no-sync mypy plugins/svhier-ghdl/src/svhier_ghdl plugins/svhier-ghdl/tests
 
       - name: Test
         run: uv run --no-sync pytest tests/ plugins/svhier-ghdl/tests/ -v

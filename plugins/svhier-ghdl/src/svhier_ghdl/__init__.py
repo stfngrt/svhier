@@ -18,13 +18,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from svhier.frontends import Request, empty_fragment
-from svhier.libsearch import LibraryFactory, LibrarySearch, glob_files
+from svhier.libsearch import Library, LibraryFactory, LibrarySearch, glob_files
 
 _MARKER = "@@svhier-order "
 _TIMEOUT_S = 120
 _INSTALL_HINT = "install GHDL's pyGHDL wheel from https://github.com/ghdl/ghdl/releases"
 
-_LINE = re.compile(r"^( *)(.*)$")
 _ARCH = re.compile(r"^architecture (\w+) of (\w+)$")
 _INSTANCE = re.compile(r"^(\w+): (component|entity|configuration) (\w+)(\(\w+\))?( \[not bound\])?$")
 _FOR = re.compile(r"^(\w+): for-generate \((-?\d+) (to|downto) (-?\d+)\)$")
@@ -227,7 +226,8 @@ def parse_tree(text: str) -> _Node:
     for line in text.splitlines():
         if not line.strip():
             continue
-        indent, body = _LINE.match(line).groups()
+        body = line.lstrip(" ")
+        indent = line[:len(line) - len(body)]
         if not _is_structure(body):
             match = _GENERIC.match(body)
             if match and _INSTANCE.match(last.text) and stack[-1] == (len(indent), last):
@@ -288,7 +288,9 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     defs: dict[str, ForeignDef] = {}
 
     def visit(arch: _Node) -> str:
-        entity = _ARCH.match(arch.text).group(2).lower()
+        match = _ARCH.match(arch.text)
+        assert match is not None  # Only architecture nodes get here.
+        entity = match.group(2).lower()
         unit = defs.setdefault(entity, ForeignDef(entity, files.get(entity)))
         found: list[tuple[str, str, _Node | None, dict]] = []
         _scan(arch.children, "", found)
@@ -318,6 +320,8 @@ class GhdlWorkerTool:
     def run(self, request: dict) -> subprocess.CompletedProcess:
         """Run one worker request."""
         spec = importlib.util.find_spec("pyGHDL")
+        if spec is None or spec.origin is None:
+            raise ValueError(f"pyGHDL is not installed; {_INSTALL_HINT}")
         env = dict(os.environ)
         # The wheel bundles libgnat, but the loader only finds it through this path.
         lib_dir = Path(spec.origin).parent / "lib"
@@ -339,7 +343,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
     def __init__(self, tool: GhdlWorkerTool | None = None, library_factory: LibraryFactory = VhdlLibrary) -> None:
         self.tool = tool or GhdlWorkerTool()
         self._library_factory = library_factory
-        self.search = LibrarySearch()
+        self.search: LibrarySearch[Library] = LibrarySearch()
         self.std = "08"
         self.work = "work"
         self._units: dict[str, str] | None = None
@@ -479,7 +483,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         for root in request.roots:
             run(root.name, dict(root.generics), False)
         if request.auto:
-            for unit in self._units:
+            for unit in self.units(files):
                 if unit not in defs:
                     run(unit, {}, True)
         # An entity that fails alone may only need the generics its parent passes.

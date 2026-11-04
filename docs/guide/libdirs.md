@@ -57,8 +57,9 @@ svhier -r rtl/ -y vendor/ -x xilinx
 ```
 
 :::{note}
-`-x` applies to library directories too. Any path with a component that
-contains the given name (case-insensitive) is skipped.
+`-x` applies to library directories too. Any file or directory below the
+library directory whose whole name matches the given name or glob
+(case-insensitive) is skipped.
 :::
 
 ## Mixed designs
