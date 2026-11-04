@@ -104,6 +104,26 @@ variants of an entity, GHDL uses the last file it reads. The
 {ref}`Defined more than once <duplicates>` table shows which one that is. Skip the
 others with `-x`.
 
+## When elaboration fails
+
+GHDL can't continue past a unit it can't analyze, so a `--top` that needs one shows
+no tree, and its filelist is empty. svhier reports what stopped it:
+
+- Errors in a file are listed once with `-E`, however many entities need that file.
+- A library or package that doesn't exist appears in the **Not found** table as a
+  `unit`, such as `unisim.vcomponents`, or `git` for a generated file.
+- If the file with errors is one of several defining a unit, a note names the `-x`
+  that uses another one:
+
+```text
+$ svhier . --top core
+note: multiply: xilinx-mult.vhdl has errors and other files define it too; -x xilinx-mult.vhdl would use another one
+error: top module 'core' could not be elaborated, so nothing below it is shown
+```
+
+Without `--top`, each entity is elaborated on its own, so the tree still shows every
+entity that works.
+
 ## Known limits
 
 - A design using entities with the same name from two libraries shows them as

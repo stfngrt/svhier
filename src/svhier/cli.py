@@ -127,6 +127,7 @@ _MISSING_LABELS = {
     "modules": "blackbox module",
     "interfaces": "interface",
     "packages": "package",
+    "units": "unit",
     "includes": "include",
     "macros": "macro",
 }
@@ -213,10 +214,13 @@ def build_tree(hierarchy: dict, tops: list[str] | None = None) -> list[Tree]:
 
 
 def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
-    """Warn about each of the requested *tops* that no input file defines."""
+    """Report each of the requested *tops* that shows no hierarchy: it failed, or nothing defines it."""
     defined = {d["mod_name"] for f in hierarchy["files"] for d in f["defs"]}
+    failed = {t.lower() for t in hierarchy.get("failed_tops", [])}
     for top in tops:
-        if top not in defined:
+        if top.lower() in failed:
+            _err.print(f"[red]error:[/red] top module {top!r} could not be elaborated, so nothing below it is shown")
+        elif top not in defined:
             _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
 
 

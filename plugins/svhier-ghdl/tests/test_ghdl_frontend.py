@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from svhier_ghdl import parse_tree, tree_to_defs
+from svhier.frontends import empty_fragment
+from svhier_ghdl import GhdlFrontend, parse_tree, tree_to_defs
 
 MIXED = Path(__file__).parent / "mixed"
 needs_ghdl = pytest.mark.skipif(importlib.util.find_spec("pyGHDL") is None, reason="pyGHDL is not installed")
@@ -176,3 +177,56 @@ def test_package_defined_twice_is_reported(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "Defined more than once" in proc.stderr
     assert "common_pkg" in proc.stderr
+
+
+@needs_ghdl
+def test_top_that_fails_is_not_called_missing(tmp_path):
+    (tmp_path / "top.vhd").write_text(
+        "library gone;\nuse gone.stuff.all;\nuse work.not_there.all;\n" + _entity("top"))
+    proc = _wide_svhier(str(tmp_path / "top.vhd"), "--top", "top")
+    assert proc.returncode == 1
+    assert "top module 'top' not found" not in proc.stderr
+    assert "top module 'top' could not be elaborated" in proc.stderr
+    rows = [line.split("│")[1:4] for line in proc.stderr.splitlines() if line.startswith("│") and " unit " in line]
+    assert [[cell.strip() for cell in row] for row in rows] == [
+        ["unit", "gone.stuff", "top.vhd"], ["unit", "not_there", "top.vhd"]]
+
+
+@needs_ghdl
+def test_top_nothing_defines_is_still_called_missing(tmp_path):
+    (tmp_path / "leaf.vhd").write_text(_entity("leaf"))
+    proc = _wide_svhier(str(tmp_path / "leaf.vhd"), "--top", "nowhere")
+    assert proc.returncode == 1
+    assert "top module 'nowhere' not found" in proc.stderr
+    assert "could not be elaborated" not in proc.stderr
+
+
+@needs_ghdl
+def test_failing_variant_points_at_the_way_out(tmp_path):
+    (tmp_path / "a_sim.vhd").write_text(_entity("leaf"))
+    (tmp_path / "b_fpga.vhd").write_text("library gone;\nuse gone.prims.all;\n" + _entity("leaf"))
+    (tmp_path / "top.vhd").write_text("entity top is end;\narchitecture rtl of top is begin\n  u_leaf: entity work.leaf;\nend;\n")
+    proc = _wide_svhier(str(tmp_path), "--top", "top")
+    assert proc.returncode == 1
+    assert "-x b_fpga.vhd" in proc.stderr
+    proc = _wide_svhier(str(tmp_path), "--top", "top", "-x", "b_fpga.vhd")
+    assert proc.returncode == 0, proc.stderr
+    assert "u_leaf (leaf)" in proc.stdout
+
+
+@needs_ghdl
+def test_error_in_a_shared_file_is_listed_once(tmp_path):
+    """Without --top every entity is a root, so one bad file would be reported once per entity."""
+    (tmp_path / "pkg.vhd").write_text("library gone;\nuse gone.stuff.all;\npackage bad_pkg is end;\n")
+    for name in ("one", "two", "three"):
+        (tmp_path / f"{name}.vhd").write_text("use work.bad_pkg.all;\n" + _entity(name))
+    proc = _wide_svhier(str(tmp_path), "-E")
+    assert proc.returncode == 1
+    lines = [line for line in proc.stderr.splitlines() if line.startswith("error:") and 'unit "stuff" not found' in line]
+    assert len(lines) == 1, proc.stderr
+
+
+def test_only_errors_with_a_location_are_the_same_error_for_every_top():
+    errors = ["ghdl: a: /f.vhd:1:2:error: bad", "ghdl: b: /f.vhd:1:2:error: bad", "ghdl: a: raised OOPS", "ghdl: b: raised OOPS"]
+    kept = GhdlFrontend()._report_errors(errors, empty_fragment())  # pylint: disable=protected-access
+    assert kept == ["ghdl: a: /f.vhd:1:2:error: bad", "ghdl: a: raised OOPS", "ghdl: b: raised OOPS"]

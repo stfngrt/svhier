@@ -38,6 +38,9 @@ _COMMENT = re.compile(r"--.*$", re.M)
 _PRIMARY_UNIT = re.compile(r"^\s*(?:entity|package|context|configuration\s+\w+\s+of)\s+(\w+)\s+is\b", re.I | re.M)
 _SECONDARY_UNIT = re.compile(r"^\s*(?:architecture\s+\w+\s+of|package\s+body)\s+(\w+)\s+is\b", re.I | re.M)
 _BUILTIN_LIBRARIES = {"std", "ieee"}
+_ERROR_TOP = re.compile(r"^ghdl: [^:]+: ")
+_ERROR_LOCATION = re.compile(r"^.+:\d+:\d+:error:")
+_UNIT_NOT_FOUND = re.compile(r'^(.+):\d+:\d+:error: unit "(\w+)" not found in library "(\w+)"')
 
 
 @dataclass
@@ -455,7 +458,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
             defs, file_deps, errors = self._elaborate_all(files, request)
             unbound = {i["mod_name"] for d in defs.values() for i in d.insts} - set(defs) - request.defined_elsewhere
             if not self._pull_needed(sorted(unbound), files):
-                return self._fragment(defs, file_deps, errors, auto=request.auto)
+                fragment = self._fragment(defs, file_deps, errors, auto=request.auto)
+                known = self.units(files)
+                fragment["failed_tops"] = [r.name for r in request.roots if r.requested and r.name.lower() in known and r.name.lower() not in defs]
+                return fragment
 
     def _elaborate_all(self, files: list[str], request: Request) -> tuple[dict[str, ForeignDef], dict[str, list[str]], list[str]]:
         """Run the worker for every root, and merge what the runs report."""
@@ -524,13 +530,39 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                 if unit.file and name not in defs:
                     known = result["unresolved"].setdefault(name, [])
                     known.extend(u for u in uses if u not in known)
+        result["duplicates"] = self._duplicates()
+        errors = self._report_errors(errors, result)
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
-        result["notes"] = list(self._notes)
-        result["duplicates"] = self._duplicates()
+        result["notes"] = list(self._notes) + result["notes"]
         result["pulled"] = self.search.pulled
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
+
+    def _report_errors(self, errors: list[str], result: dict) -> list[str]:
+        """Return *errors* without repeats, and add to *result* what they say is missing or to blame.
+
+        Each top reports the problems of the files it needs, so with no ``--top``, one bad file
+        would be listed once per entity using it.  Without a location, such as a crash, an
+        error is about its top.
+        """
+        names = {str(Path(f).resolve()): f for f in self._scan}
+        unique: dict[str, str] = {}
+        for error in errors:
+            text = _ERROR_TOP.sub("", error)
+            unique.setdefault(text if _ERROR_LOCATION.match(text) else error, error)
+        for text in unique:
+            match = _UNIT_NOT_FOUND.match(text)
+            if match:
+                path, unit, library = match.groups()
+                users = result["missing"]["units"].setdefault(unit if library == self.work.lower() else f"{library}.{unit}", [])
+                if names.get(path, path) not in users:
+                    users.append(names.get(path, path))
+        for dup in result["duplicates"]:
+            used = Path(dup["used"])
+            if any(text.startswith(f"{used.resolve()}:") for text in unique):
+                result["notes"].append(f"{dup['name']}: {used} has errors and other files define it too; -x {used.name} would use another one")
+        return list(unique.values())
 
     def _duplicates(self) -> list[dict]:
         """Report units defined by several files of one library.  GHDL uses what it loads last."""
