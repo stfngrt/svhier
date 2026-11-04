@@ -208,7 +208,8 @@ pyGHDL has no elaboration API, so the worker binds GHDL internals by symbol name
 that in a child process limits the damage from a crash or from a GHDL release that
 changes them. libghdl can't elaborate twice in one process, so each setting gets a child
 forked from a worker holding the loaded files. Without `--top` that's one per entity, and
-forking saves starting Python and libghdl for each.
+forking saves starting Python and libghdl for each. Where the platform can't do this, or
+that worker fails, each setting gets a process of its own instead, with the same results.
 
 ## The result
 

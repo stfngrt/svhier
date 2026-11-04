@@ -20,7 +20,9 @@ import ctypes
 import gc
 import json
 import os
+import signal
 import sys
+import time
 from ctypes import c_bool, c_int32, c_void_p
 from typing import Any
 
@@ -262,16 +264,27 @@ def _read_all(file: Any) -> bytes:
     return file.read()
 
 
-def _serve(requests: Any, replies: Any) -> int:
-    """Load the sources, then answer each elaboration request from a forked child.
+def _wait_for(pid: int, timeout: float) -> tuple[int, bool]:
+    """Wait for child *pid*, killing it after *timeout* seconds.  Returns ``(exit code, timed out)``.
 
-    The first line of *requests* holds ``{std, work, files, libraries}``, and ``ready`` on
-    *replies* says they loaded.  If they don't, this process dies and the caller does without.
-    Each later line is a request.  Each reply is a line ``{returncode, stdout, stderr}`` with
-    the sizes of the output that follows.  What loading printed starts every output, as it
-    does when one process both loads and elaborates.
+    It has ended and been reaped on return, which nothing outside this process can wait for.
+    SIGCHLD is blocked, so it stays pending if the child ends before the wait starts.  One left
+    from an earlier child only means another pass.
     """
-    sources = json.loads(requests.readline())
+    deadline = time.monotonic() + timeout
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status), False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            os.kill(pid, signal.SIGKILL)
+            return os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), True
+        signal.sigtimedwait([signal.SIGCHLD], remaining)
+
+
+def _load_quietly(sources: dict) -> list[bytes]:
+    """Set up and load *sources*, and return what that printed: stdout, then stderr."""
     loading = _output_files()
     _redirect_output(loading)
     _setup(sources["std"], sources["work"])
@@ -279,11 +292,28 @@ def _serve(requests: Any, replies: Any) -> int:
     sys.stdout.flush()
     sys.stderr.flush()
     ctypes.CDLL(None).fflush(None)  # Or each child would write what libghdl has buffered again.
-    loaded = [_read_all(file) for file in loading]
+    return [_read_all(file) for file in loading]
+
+
+def _serve(requests: Any, replies: Any) -> int:
+    """Load the sources, then answer each elaboration request from a forked child.
+
+    The first line of *requests* holds ``{std, work, files, libraries}``, and ``ready`` on
+    *replies* says they loaded.  If they don't, this process dies and the caller does without.
+    Each later line is ``{request, timeout}``.  Each reply is a line ``{returncode, timed_out,
+    stdout, stderr}`` with the sizes of the output that follows.  What loading printed starts
+    every output, as it does when one process both loads and elaborates.
+
+    If the caller is gone, the next read or write ends this process, so a killed program
+    leaves nothing behind for longer than a request's timeout.
+    """
+    loaded = _load_quietly(json.loads(requests.readline()))
     replies.write(b"ready\n")
     replies.flush()
     gc.freeze()  # Keep garbage collection in the children from copying these pages.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCHLD])
     for line in requests:
+        message = json.loads(line)
         outputs = _output_files()
         for file, text in zip(outputs, loaded):
             file.write(text)
@@ -291,13 +321,14 @@ def _serve(requests: Any, replies: Any) -> int:
         if pid == 0:
             requests.close()
             replies.close()
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             _redirect_output(outputs)
-            sys.exit(_elaborate(json.loads(line)))
-        code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+            sys.exit(_elaborate(message["request"]))
+        code, timed_out = _wait_for(pid, message["timeout"])
         stdout, stderr = (_read_all(file) for file in outputs)
         for file in outputs:
             file.close()
-        header = {"returncode": code, "stdout": len(stdout), "stderr": len(stderr)}
+        header = {"returncode": code, "timed_out": timed_out, "stdout": len(stdout), "stderr": len(stderr)}
         replies.write(json.dumps(header).encode() + b"\n" + stdout + stderr)
         replies.flush()
     return 0

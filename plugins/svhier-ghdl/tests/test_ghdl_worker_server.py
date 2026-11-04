@@ -3,9 +3,12 @@
 import importlib.util
 import json
 import os
+import select
 import signal
 import subprocess
+import sys
 import time
+import uuid
 from argparse import Namespace
 from pathlib import Path
 
@@ -17,6 +20,7 @@ from svhier_ghdl import GhdlFrontend, GhdlWorkerTool
 
 MIXED = Path(__file__).parent / "mixed"
 needs_ghdl = pytest.mark.skipif(importlib.util.find_spec("pyGHDL") is None, reason="pyGHDL is not installed")
+needs_proc = pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="needs /proc to find processes")
 
 _DESIGN = """\
 entity leaf is end entity;
@@ -69,16 +73,31 @@ def _answer(proc: subprocess.CompletedProcess) -> tuple:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _group_ends(group: int) -> bool:
-    """Wait for a killed process group to vanish.  A killed child must first be reaped by init."""
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(group, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.01)
-    return False
+def _group_members(group: int) -> list[int]:
+    """Return every process in a group, zombies included, as a signal to the group would reach them."""
+    members = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            except OSError:
+                continue
+            if int(fields[2]) == group:
+                members.append(int(entry.name))
+    return members
+
+
+def _marked_processes(marker: str) -> list[str]:
+    """Return what is still running with *marker* in its environment, as all worker processes inherit it."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                if marker.encode() in (entry / "environ").read_bytes():
+                    found.append((entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+            except OSError:
+                continue
+    return found
 
 
 @pytest.fixture(name="design")
@@ -150,6 +169,21 @@ def test_output_is_decoded_as_subprocess_text_mode_does(tmp_path, tool):
 
 
 @needs_ghdl
+def test_output_that_is_not_valid_text_fails_as_it_does_in_subprocess_text_mode(tmp_path, tool):
+    path = tmp_path / "latin.vhd"
+    path.write_bytes(b"entity latin is\nend entity;\narchitecture a of latin is\nbegin\n  caf\xe9 caf\xe9;\nend architecture;\n")
+    request = _request([path], "latin")
+    with pytest.raises(UnicodeDecodeError):
+        tool.run_once(request)
+    with pytest.raises(UnicodeDecodeError):
+        tool.run(request)
+    other = tmp_path / "other.vhd"  # The answer was read whole, so the next one still lines up.
+    other.write_text("entity other is end entity;\narchitecture a of other is begin end architecture;\n")
+    next_request = _request([other], "other")
+    assert _answer(tool.run(next_request)) == _answer(tool.run_once(next_request))
+
+
+@needs_ghdl
 def test_failing_while_loading_falls_back_to_one_process_per_request(design, tmp_path, tool, monkeypatch):
     request = _request([design, tmp_path / "missing.vhd"], "leaf")
     want = _answer(tool.run_once(request))
@@ -169,19 +203,54 @@ def test_a_dead_server_falls_back_without_changing_the_answer(design, tool):
 
 
 @needs_ghdl
-def test_a_timeout_kills_the_elaboration_and_the_next_request_still_works(design, tmp_path, tool, monkeypatch):
+@needs_proc
+def test_a_timeout_has_ended_the_elaboration_when_it_is_reported(design, tmp_path, tool, monkeypatch):
+    """The child is already reaped, not merely signalled, and the server carries on without loading again."""
     hangs = tmp_path / "hangs.vhd"
     hangs.write_text(_HANGS)
     files = [design, hangs]
     assert tool.run(_request(files, "leaf")).returncode == 0
-    group = tool.server_pid()
+    server = tool.server_pid()
     monkeypatch.setattr(svhier_ghdl, "_TIMEOUT_S", 1)
-    with pytest.raises(subprocess.TimeoutExpired):
-        tool.run(_request(files, "hangs"))
-    assert _group_ends(group)  # Nothing is left of the server or its child.
+    for _ in range(3):  # Each check is at the very moment the timeout is reported, so must not depend on luck.
+        with pytest.raises(subprocess.TimeoutExpired):
+            tool.run(_request(files, "hangs"))
+        assert _group_members(server) == [server]
     monkeypatch.setattr(svhier_ghdl, "_TIMEOUT_S", 120)
     request = _request(files, "sized")
     assert _answer(tool.run(request)) == _answer(tool.run_once(request))
+    assert tool.server_pid() == server
+
+
+@needs_ghdl
+def test_a_timeout_is_reported_as_a_separate_process_reports_it(tmp_path, tool, monkeypatch):
+    hangs = tmp_path / "hangs.vhd"
+    hangs.write_text(_HANGS)
+    (tmp_path / "leaf.vhd").write_text("entity leaf is end entity;\narchitecture a of leaf is begin end architecture;\n")
+    files = [hangs, tmp_path / "leaf.vhd"]
+    assert tool.run(_request(files, "leaf")).returncode == 0  # So the short limit below only meets the elaboration.
+    server = tool.server_pid()
+    monkeypatch.setattr(svhier_ghdl, "_TIMEOUT_S", 1)
+    with pytest.raises(subprocess.TimeoutExpired) as served:
+        tool.run(_request(files, "hangs"))
+    assert tool.server_pid() == server
+    with pytest.raises(subprocess.TimeoutExpired) as alone:
+        tool.run_once(_request([hangs], "hangs"))
+    assert served.value.timeout == alone.value.timeout == 1
+
+
+@needs_ghdl
+@needs_proc
+def test_a_stuck_server_is_killed_and_the_request_answered_without_it(design, tool, monkeypatch):
+    request = _request([design], "sized", {"N": "3"})
+    want = _answer(tool.run(request))
+    server = tool.server_pid()
+    os.kill(server, signal.SIGSTOP)  # It can't answer, however long it's given.
+    # Give up on it a second in.  The request on its own still gets its full time.
+    monkeypatch.setattr(svhier_ghdl, "_SERVER_GRACE_S", 1 - svhier_ghdl._TIMEOUT_S)
+    assert _answer(tool.run(request)) == want
+    assert not _group_members(server)
+    assert tool.server_pid() is None
 
 
 @needs_ghdl
@@ -190,7 +259,7 @@ def test_a_timeout_while_loading_leaves_no_server_behind(design, tool, monkeypat
     monkeypatch.setattr(svhier_ghdl, "_TIMEOUT_S", 0)
     with pytest.raises(subprocess.TimeoutExpired):
         tool.run(_request([design], "leaf"))
-    assert len(started) == 1
+    assert len(started) == 2  # The server, then the request alone, which times out as it always did.
     assert started[0].poll() is not None
     assert tool.server_pid() is None
 
@@ -203,7 +272,7 @@ def test_changed_sources_get_a_new_server_and_the_old_one_stops(design, tmp_path
     first = tool.server_pid()
     assert "architecture a of other" in tool.run(_request([design, other], "sized", {"N": "3"})).stdout
     assert tool.server_pid() != first
-    assert _group_ends(first)
+    assert not _group_members(first)
 
 
 @needs_ghdl
@@ -211,7 +280,7 @@ def test_closing_stops_the_server(design, tool):
     tool.run(_request([design], "leaf"))
     group = tool.server_pid()
     tool.close()
-    assert _group_ends(group)
+    assert not _group_members(group)
 
 
 def _count_worker_processes(monkeypatch) -> list[subprocess.Popen]:
@@ -243,6 +312,164 @@ def test_auto_mode_starts_one_process_however_many_entities_it_elaborates(tmp_pa
     assert sorted(d["mod_name"] for f in result["files"] for d in f["defs"]) == names
     assert not result["has_errors"]
     assert len(started) == 2  # The scan, then a server for all six elaborations.
+
+
+_SERVER_NEEDS = [(os, "fork"), (os, "memfd_create"), (os, "killpg"), (os, "setsid"), (select, "poll"),
+                 (signal, "sigtimedwait"), (signal, "pthread_sigmask")]
+
+
+@pytest.mark.parametrize("module, name", _SERVER_NEEDS, ids=[name for _, name in _SERVER_NEEDS])
+def test_without_what_the_server_needs_each_request_gets_a_process(module, name, monkeypatch):
+    """Windows has none of these and macOS has no memfd_create.  None may surface as AttributeError."""
+    tool = GhdlWorkerTool()
+    once = subprocess.CompletedProcess([], 0, "alone", "")
+    monkeypatch.setattr(tool, "run_once", lambda request: once)
+    monkeypatch.delattr(module, name)
+    started = _count_worker_processes(monkeypatch)
+    assert tool.run(_request([Path("x.vhd")], "top")) is once
+    assert not started
+    assert tool.server_pid() is None
+
+
+@needs_ghdl
+@pytest.mark.parametrize("module, name", _SERVER_NEEDS, ids=[name for _, name in _SERVER_NEEDS])
+def test_real_requests_without_what_the_server_needs_match(design, tool, module, name, monkeypatch):
+    request = _request([design], "sized", {"N": "3"})
+    want = _answer(tool.run_once(request))
+    monkeypatch.delattr(module, name)
+    started = _count_worker_processes(monkeypatch)
+    assert _answer(tool.run(request)) == want
+    assert len(started) == 1
+    assert "--serve" not in started[0].args
+
+
+def _site(tmp_path: Path, code: str) -> dict[str, str]:
+    """Return an environment where Python runs *code* first, in the CLI and in every worker."""
+    site = tmp_path / "site"
+    site.mkdir(exist_ok=True)
+    (site / "sitecustomize.py").write_text(code)
+    return {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(site), os.environ.get("PYTHONPATH")]))}
+
+
+def _cli(*args: str, env: dict[str, str] | None = None, cwd: Path = MIXED) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-c", "from svhier.cli import main; main()", *args],
+                          capture_output=True, text=True, cwd=cwd, check=False, env=env)
+
+
+@needs_ghdl
+def test_the_cli_on_a_platform_without_memfd_create_gives_the_same_output(tmp_path):
+    """macOS, as near as this can get: both the CLI and the workers lack it."""
+    want = _cli(".", "--yaml", "-", "--no-tree")
+    got = _cli(".", "--yaml", "-", "--no-tree", env=_site(tmp_path, "import os\ndel os.memfd_create\n"))
+    assert (got.returncode, got.stdout, got.stderr) == (want.returncode, want.stdout, want.stderr)
+    assert want.returncode == 0
+
+
+@needs_ghdl
+def test_a_call_that_exists_but_fails_in_the_server_falls_back(design, tmp_path, tool, monkeypatch):
+    """A kernel or sandbox may refuse what Python offers.  The server dies, and nothing else changes."""
+    request = _request([design], "sized", {"N": "3"})
+    want = _answer(tool.run_once(request))
+    code = "import os\ndef refuse(*_):\n    raise OSError(38, 'refused')\nos.memfd_create = refuse\n"
+    monkeypatch.setenv("PYTHONPATH", _site(tmp_path, code)["PYTHONPATH"])
+    started = _count_worker_processes(monkeypatch)
+    assert _answer(tool.run(request)) == want
+    assert _answer(tool.run(request)) == want
+    assert len(started) == 3  # One failed server, not tried again for these sources, and two requests alone.
+
+
+@needs_ghdl
+def test_a_server_that_cannot_start_falls_back(design, tool, monkeypatch):
+    request = _request([design], "leaf")
+    want = _answer(tool.run_once(request))
+    real = svhier_ghdl.subprocess.Popen
+
+    def no_server(args, *rest, **kwargs):
+        if "--serve" in args:
+            raise OSError(11, "no more processes")
+        return real(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", no_server)
+    assert _answer(tool.run(request)) == want
+
+
+def _cli_with_short_elaborations(*args: str) -> list[str]:
+    """Run the CLI with each served elaboration limited to a second, and everything else as usual."""
+    code = """
+import time
+import svhier_ghdl
+real = svhier_ghdl._WorkerServer.request
+svhier_ghdl._WorkerServer.request = lambda self, request, deadline: real(self, request, time.monotonic() + 1)
+from svhier.cli import main
+main()
+"""
+    return [sys.executable, "-c", code, *args]
+
+
+def _cli_leaving_mid_request(signum: signal.Signals) -> list[str]:
+    """Run the CLI until it has sent a request limited to a second, then have it get *signum* before any answer."""
+    code = f"""
+import os, time
+import svhier_ghdl
+def leave(self, request, deadline):
+    self._send({{"request": request, "timeout": 1}})
+    os.kill(os.getpid(), {int(signum)})
+    time.sleep(120)
+svhier_ghdl._WorkerServer.request = leave
+from svhier.cli import main
+main()
+"""
+    return [sys.executable, "-c", code, ".", "--no-tree"]
+
+
+@needs_ghdl
+@needs_proc
+def test_nothing_is_left_after_a_normal_exit():
+    marker = uuid.uuid4().hex
+    proc = _cli(".", "--no-tree", env={**os.environ, "SVHIER_TEST_MARKER": marker})
+    assert proc.returncode == 0, proc.stderr
+    assert not _marked_processes(marker)
+
+
+@needs_ghdl
+@needs_proc
+def test_nothing_is_left_after_an_error_exit(tmp_path):
+    (tmp_path / "broken.vhd").write_text(_BROKEN)
+    (tmp_path / "good.vhd").write_text("entity good is end entity;\narchitecture a of good is begin end architecture;\n")
+    marker = uuid.uuid4().hex
+    proc = _cli(".", "--no-tree", env={**os.environ, "SVHIER_TEST_MARKER": marker}, cwd=tmp_path)
+    assert proc.returncode == 1, proc.stderr  # Through sys.exit.
+    assert not _marked_processes(marker)
+
+
+@needs_ghdl
+@needs_proc
+def test_nothing_is_left_after_a_timeout_in_the_cli(tmp_path):
+    (tmp_path / "hangs.vhd").write_text(_HANGS)
+    (tmp_path / "good.vhd").write_text("entity good is end entity;\narchitecture a of good is begin end architecture;\n")
+    marker = uuid.uuid4().hex
+    proc = subprocess.run(_cli_with_short_elaborations(".", "--no-tree", "-E"), capture_output=True, text=True, cwd=tmp_path, check=False,
+                          env={**os.environ, "SVHIER_TEST_MARKER": marker, "COLUMNS": "200"})
+    assert proc.returncode == 1
+    assert "elaborating hangs timed out" in " ".join(proc.stderr.split())
+    assert not _marked_processes(marker)
+
+
+@needs_ghdl
+@needs_proc
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGKILL], ids=lambda s: s.name)
+def test_nothing_outlives_a_killed_cli_even_mid_elaboration(tmp_path, signum):
+    """Only SIGINT lets the program clean up.  Otherwise the server's own timeout ends the child, then the server."""
+    (tmp_path / "hangs.vhd").write_text(_HANGS)
+    marker = uuid.uuid4().hex
+    proc = subprocess.run(_cli_leaving_mid_request(signum), capture_output=True, cwd=tmp_path, check=False, timeout=120,
+                          env={**os.environ, "SVHIER_TEST_MARKER": marker})
+    assert proc.returncode != 0
+    # The only wait here is on purpose: once the program is gone, nothing waits for what it left to end.
+    deadline = time.monotonic() + 60
+    while _marked_processes(marker) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _marked_processes(marker)
 
 
 class _TreeTool:
