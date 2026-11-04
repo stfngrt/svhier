@@ -36,7 +36,7 @@ the [developer documentation](dev/index.md).
  └────────────┬────────────┘
               ▼
  ┌─────────────────────────┐
- │ 6. Report and write     │  tree, tables, YAML, filelist, exit code
+ │ 6. Report and write     │  tables, YAML, filelist, tree, exit code
  └─────────────────────────┘
 ```
 
@@ -47,7 +47,7 @@ the [developer documentation](dev/index.md).
 | 3. Route to plugins | Give each file to the plugin for its suffix. A plugin whose tool isn't installed is disabled, with a warning. | {func}`~svhier.cli._route_files` |
 | 4. Elaborate and stitch | Run the plugins in turn until no plugin finds anything new. | {func}`~svhier.frontends.stitch` |
 | 5. Merged result | Combine what the plugins report into one dict. | {meth}`~svhier.frontends._Stitcher._merge` |
-| 6. Report and write | Print the tables to stderr, and the tree, YAML and filelist to stdout or files. Exit 1 if any error was reported. | {func}`~svhier.cli.main` |
+| 6. Report and write | Print the tables to stderr, write the YAML and filelist to files or stdout, then print the tree to stdout. Exit 1 if any error was reported. | {func}`~svhier.cli.main` |
 
 Stages 1 to 3 and 6 know nothing about any language. All language knowledge sits behind
 the plugin interface, including the options `-f`, `-I` and `-D`, which the slang plugin
@@ -185,9 +185,12 @@ reports what is missing and which files are loaded. Everything else waits until 
 pulls nothing new: the definitions, the file entries with their references, the duplicates,
 the diagnostics and the trimmed file list. So the diagnostics describe the final load only.
 
-The walk visits each unique pair of definition and parameter values once. A module whose
-generate branches depend on its parameters therefore lists the children of every setting
-it's used with.
+The walk visits each unique pair of definition and parameter values once, and records the
+children of that pair, each with the parameter values it uses in turn. That table is what
+the instance tree follows, so a design's tree costs one step per real instance however
+often its modules repeat. `insts` merges the children per definition, so there a module
+whose generate branches depend on its parameters lists those of every setting it's used
+with.
 
 ### The GHDL plugin
 
@@ -221,7 +224,7 @@ language:
 
 | Output | Built from | Code |
 |--------|-----------|------|
-| Instance tree | `files[].defs[].insts`, starting from the tops | {func}`~svhier.cli.build_tree` |
+| Instance tree | `files[].defs[].variants`, or `insts` for a plugin without them, starting from the tops | {func}`~svhier.cli.iter_tree` |
 | "Not found" table | `missing` | {func}`~svhier.cli._print_missing` |
 | "Defined more than once" table | `duplicates` | {func}`~svhier.cli._print_duplicates` |
 | "Pulled in from -y" table | `pulled` | {func}`~svhier.cli._print_pulled` |
@@ -229,6 +232,11 @@ language:
 | Filelist | a graph of file dependencies, plus `inc_dirs` and `defines` | {func}`~svhier.filelist.compute_filelist` |
 
 The keys are described in [Result format](dev/result-format.md).
+
+The tree follows parameter settings rather than `insts` because expanding merged lists at
+every level multiplies them. On OpenTitan's `top_earlgrey` that gave 77,753,919 lines, where
+the elaborated design has 38,350 module instances. It's also why the tree is printed last,
+one line at a time and without Rich, whose `Tree` took 62 seconds to render 500,000 nodes.
 
 ## Design rules
 

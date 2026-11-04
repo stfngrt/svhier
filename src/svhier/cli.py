@@ -4,15 +4,17 @@
 """Command-line interface for svhier: parse SV hierarchies and emit YAML."""
 
 import argparse
+import os
 import sys
+from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
+from typing import NamedTuple
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
-from rich.tree import Tree
 from ruamel.yaml import YAML
 
 from svhier.filelist import compute_filelist
@@ -24,19 +26,22 @@ _err = Console(stderr=True)
 
 # Per-file keys returned by parse_files that are bookkeeping only, not YAML output.
 _INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs", "shadowed", "depends_on"}
+# Likewise per definition: the children per parameter setting, which only the tree uses.
+_INTERNAL_DEF_KEYS = {"variants", "top_variant"}
 
 
 def _prepare_for_yaml(hierarchy: dict) -> dict:
     """Return a copy of *hierarchy* with internal-only keys removed.
 
     Strips the ``pkgs``, ``ifaces``, ``refs`` and ``shadowed`` keys from each file entry (bookkeeping only) and
-    omits ``pkg_imports`` from module defs when the list is empty.
+    the ``variants`` and ``top_variant`` keys from module defs, and omits ``pkg_imports`` from module defs when
+    the list is empty.
     """
     files = []
     for entry in hierarchy["files"]:
         defs = []
         for d in entry["defs"]:
-            def_out = {k: v for k, v in d.items() if not (k == "pkg_imports" and not v)}
+            def_out = {k: v for k, v in d.items() if k not in _INTERNAL_DEF_KEYS and not (k == "pkg_imports" and not v)}
             defs.append(def_out)
         file_out = {k: v for k, v in entry.items() if k not in _INTERNAL_FILE_KEYS}
         file_out["defs"] = defs
@@ -179,37 +184,137 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
-def build_tree(hierarchy: dict, tops: list[str] | None = None) -> list[Tree]:
-    """Return one Rich ``Tree`` per top-level module of *hierarchy*.
+class TreeLine(NamedTuple):
+    """One line of the instance tree."""
 
-    When *tops* is omitted, the roots are all modules that no other module
-    instantiates.  Instances of modules without a definition are marked as
-    ``(blackbox)``; recursive instantiation is cut off and marked ``(cycle)``.
+    guide: str  # What to draw left of the name; empty for a root.
+    name: str  # The top's name, or the instance path relative to the parent.
+    module: str | None = None  # None for a root.
+    marker: str | None = None  # "blackbox" or "cycle".
+
+
+class _Level(NamedTuple):
+    """A module being expanded, as the walk through the tree goes through its children."""
+
+    key: tuple[str, object]  # (module, setting); the setting is None for the merged children.
+    children: Iterator[tuple[int, dict]]
+    last: int
+    indent: str
+
+
+class TreeGuides(NamedTuple):
+    """What to draw for a child and its last sibling, and below each of them."""
+
+    tee: str = "├── "
+    elbow: str = "└── "
+    pipe: str = "│   "
+    gap: str = "    "
+
+
+_ASCII_GUIDES = TreeGuides("+-- ", "`-- ", "|   ")
+
+
+def _select_children(unit: dict, variant: object) -> tuple[object, list[dict]]:
+    """Return which setting of the definition *unit* to show, and its children.
+
+    An instance that doesn't say which setting it uses can only be exact if there is just
+    one.  Otherwise, or for a plugin with no ``variants``, it gets the merged ``insts``, and
+    the setting returned is ``None``.
+    """
+    variants = unit.get("variants", {})
+    if variant is None and len(variants) == 1:
+        variant = next(iter(variants))
+    return (variant, variants[variant]) if variant in variants else (None, unit["insts"])
+
+
+def _iter_subtree(defs: dict[str, dict], top: str, guides: TreeGuides) -> Iterator[TreeLine]:
+    """Yield the lines below *top*, walking with a stack so that depth doesn't matter."""
+
+    def level(name: str, variant: object, indent: str) -> _Level:
+        variant, children = _select_children(defs[name], variant)
+        return _Level((name, variant), iter(enumerate(children)), len(children) - 1, indent)
+
+    stack = [level(top, defs[top].get("top_variant"), "")]
+    expanding = {stack[0].key}
+    while stack:
+        current = stack[-1]
+        for pos, inst in current.children:
+            child = inst["mod_name"]
+            is_last = pos == current.last
+            guide = current.indent + (guides.elbow if is_last else guides.tee)
+            if child not in defs:
+                yield TreeLine(guide, inst["inst_name"], child, "blackbox")
+                continue
+            below = level(child, inst.get("variant"), current.indent + (guides.gap if is_last else guides.pipe))
+            if below.key in expanding:
+                yield TreeLine(guide, inst["inst_name"], child, "cycle")
+                continue
+            yield TreeLine(guide, inst["inst_name"], child)
+            expanding.add(below.key)
+            stack.append(below)
+            break
+        else:
+            expanding.remove(current.key)
+            stack.pop()
+
+
+def iter_tree(hierarchy: dict, tops: list[str] | None = None, guides: TreeGuides = TreeGuides()) -> Iterator[TreeLine]:
+    """Yield the instance tree of *hierarchy* line by line, one tree per top-level module.
+
+    When *tops* is omitted, the roots are all modules that no other module instantiates.
+    Each instance shows the children of its own parameter setting (see
+    :func:`_select_children` for when that isn't known).  Instances of modules without a
+    definition are marked ``blackbox``; an instance of what it's already inside of, with
+    the same setting, is cut off and marked ``cycle``.
+
+    It costs one step per instance in the tree and builds nothing up front, so a large
+    design starts printing at once.
     """
     defs = {d["mod_name"]: d for f in hierarchy["files"] for d in f["defs"]}
     if tops is None:
         instantiated = {i["mod_name"] for d in defs.values() for i in d["insts"]}
         tops = [name for name in defs if name not in instantiated]
-
-    def add_children(node: Tree, mod_name: str, path: tuple[str, ...]) -> None:
-        for inst in defs[mod_name]["insts"]:
-            child = inst["mod_name"]
-            label = f"{inst['inst_name']} [dim]({child})[/dim]"
-            if child not in defs:
-                node.add(f"{label} [yellow](blackbox)[/yellow]")
-            elif child in path:
-                node.add(f"{label} [red](cycle)[/red]")
-            else:
-                add_children(node.add(label), child, path + (child,))
-
-    trees = []
     for top in tops:
-        if top not in defs:
-            continue
-        tree = Tree(f"[bold]{top}[/bold]")
-        add_children(tree, top, (top,))
-        trees.append(tree)
-    return trees
+        if top in defs:
+            yield TreeLine("", top)
+            yield from _iter_subtree(defs, top, guides)
+
+
+class TreeStyle(NamedTuple):
+    """How to draw the tree: the guides, and the ANSI codes around each part of a line."""
+
+    guides: TreeGuides = TreeGuides()
+    root: str = ""
+    module: str = ""
+    blackbox: str = ""
+    cycle: str = ""
+    end: str = ""
+
+
+def tree_style() -> TreeStyle:
+    """Return the style for stdout.
+
+    Rich decides what the output can show, so ``NO_COLOR``, ``FORCE_COLOR``, ``TERM=dumb``,
+    pipes and encodings other than UTF-8 work like in the tables on stderr.
+    """
+    console = Console()
+    guides = _ASCII_GUIDES if console.options.ascii_only else TreeGuides()
+    if console.color_system in (None, "windows"):  # "windows" draws through the console API, not with codes.
+        return TreeStyle(guides)
+    colours = ("", "") if console.no_color else ("\x1b[33m", "\x1b[31m")
+    return TreeStyle(guides, "\x1b[1m", "\x1b[2m", *colours, "\x1b[0m")
+
+
+def render_tree_line(line: TreeLine, style: TreeStyle = TreeStyle()) -> str:
+    """Return *line* as text in *style*: ``guides inst (module) (marker)``, without a line end."""
+    end = style.end
+    if line.module is None:
+        return f"{style.root}{line.name}{end}"
+    text = f"{line.guide}{line.name} {style.module}({line.module}){end}"
+    if line.marker:
+        code = style.blackbox if line.marker == "blackbox" else style.cycle
+        text += f" {code}({line.marker}){end}" if code else f" ({line.marker})"
+    return text
 
 
 def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
@@ -221,16 +326,22 @@ def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
 
 
 def _print_tree(hierarchy: dict, tops: list[str] | None) -> None:
-    """Print the instance tree(s) to stdout.
+    """Print the instance tree(s) to stdout as they are walked, so a large tree shows up at once.
 
-    In a terminal, long lines wrap to the terminal width.  When piped, the width is
-    unbounded so no line is wrapped or cut off.
+    Rich's ``Tree`` takes minutes on hundreds of thousands of nodes, so this writes plain
+    lines.  They are never wrapped or cut off here; a terminal wraps long ones itself.  A
+    reader that goes away, such as ``head``, ends the program like it does for Rich: with
+    exit code 1 and no traceback.
     """
-    out = Console(highlight=False)
-    if not out.is_terminal:
-        out = Console(highlight=False, width=100_000)
-    for tree in build_tree(hierarchy, tops):
-        out.print(tree)
+    style = tree_style()
+    try:
+        for line in iter_tree(hierarchy, tops, style.guides):
+            sys.stdout.write(render_tree_line(line, style) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Python flushes stdout on exit too, which would complain about the same closed pipe.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
 
 
 def _make_yaml() -> YAML:
@@ -432,19 +543,22 @@ def _report(hierarchy: dict, args) -> None:
 
 
 def _write_outputs(hierarchy: dict, args) -> None:
-    """Print the tree, and write the requested YAML and filelist."""
-    show_tree = args.tree
-    if show_tree is None:
-        show_tree = "-" not in (args.yaml, args.filelist)
-    if show_tree:
-        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
+    """Write the requested YAML and filelist, then print the tree.
 
+    The tree comes last so that a large tree, or stopping it, can't cost the files.
+    """
     if args.yaml is not None:
         _write_yaml(hierarchy, args.yaml)
 
     if args.filelist is not None:
         ordered = compute_filelist(hierarchy)
         _write_filelist(ordered, _dedupe(hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
+
+    show_tree = args.tree
+    if show_tree is None:
+        show_tree = "-" not in (args.yaml, args.filelist)
+    if show_tree:
+        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
 
 
 def main():
