@@ -127,3 +127,52 @@ def test_command_file_mixing_languages(tmp_path):
     assert "u_leaf (leaf)" in proc.stdout
     assert "(blackbox)" not in proc.stdout
     assert str(tmp_path / "leaf.vhd") in proc.stdout
+
+
+def _wide_svhier(*args: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "COLUMNS": "400"}
+    return subprocess.run([sys.executable, "-c", "from svhier.cli import main; main()", *args], capture_output=True, text=True, check=False, env=env)
+
+
+def _entity(name: str) -> str:
+    return f"entity {name} is end;\narchitecture rtl of {name} is begin end;\n"
+
+
+@needs_ghdl
+def test_entity_defined_twice_is_reported_with_the_copy_ghdl_uses(tmp_path):
+    (tmp_path / "a_variant.vhd").write_text(_entity("leaf"))
+    (tmp_path / "b_variant.vhd").write_text(_entity("leaf"))
+    (tmp_path / "top.vhd").write_text("entity top is end;\narchitecture rtl of top is begin\n  u_leaf: entity work.leaf;\nend;\n")
+    proc = _wide_svhier(str(tmp_path), "--top", "top", "--filelist", "-", "--tree")
+    assert proc.returncode == 0, proc.stderr
+    assert "Defined more than once" in proc.stderr
+    row = next(line for line in proc.stderr.splitlines() if "leaf" in line and "entity" in line)
+    assert row.index("b_variant.vhd") < row.index("a_variant.vhd")
+    assert "b_variant.vhd" in proc.stdout
+    assert "a_variant.vhd" not in proc.stdout
+
+
+@needs_ghdl
+def test_same_name_in_two_libraries_is_not_a_duplicate(tmp_path):
+    (tmp_path / "lib_a").mkdir()
+    (tmp_path / "lib_b").mkdir()
+    (tmp_path / "lib_a/leaf.vhd").write_text(_entity("leaf"))
+    (tmp_path / "lib_b/leaf.vhd").write_text(_entity("leaf"))
+    (tmp_path / "top.vhd").write_text(
+        "library lib_a, lib_b;\nentity top is end;\narchitecture rtl of top is begin\n"
+        "  u_a: entity lib_a.leaf;\n  u_b: entity lib_b.leaf;\nend;\n")
+    proc = _wide_svhier("-r", str(tmp_path), "--top", "top")
+    assert proc.returncode == 0, proc.stderr
+    assert "Defined more than once" not in proc.stderr
+
+
+@needs_ghdl
+def test_package_defined_twice_is_reported(tmp_path):
+    pkg = "package common_pkg is end;\n"
+    (tmp_path / "a.vhd").write_text(pkg)
+    (tmp_path / "b.vhd").write_text(pkg)
+    (tmp_path / "top.vhd").write_text("use work.common_pkg.all;\n" + _entity("top"))
+    proc = _wide_svhier(str(tmp_path), "--top", "top")
+    assert proc.returncode == 0, proc.stderr
+    assert "Defined more than once" in proc.stderr
+    assert "common_pkg" in proc.stderr

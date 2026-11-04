@@ -99,6 +99,11 @@ YAML reports it as `library`:
 The filelist has no way to say which library a file belongs to, so compiling a
 design with several libraries needs the YAML too.
 
+If several files define a unit in the same library, as with simulation and FPGA
+variants of an entity, GHDL uses the last file it reads. The
+{ref}`Defined more than once <duplicates>` table shows which one that is. Skip the
+others with `-x`.
+
 ## Known limits
 
 - A design using entities with the same name from two libraries shows them as

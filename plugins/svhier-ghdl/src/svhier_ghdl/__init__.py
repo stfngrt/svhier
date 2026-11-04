@@ -527,9 +527,20 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
         result["notes"] = list(self._notes)
+        result["duplicates"] = self._duplicates()
         result["pulled"] = self.search.pulled
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
+
+    def _duplicates(self) -> list[dict]:
+        """Report units defined by several files of one library.  GHDL uses what it loads last."""
+        where: dict[tuple[str, str], list[str]] = {}
+        for path, entry in self._scan.items():
+            library = self._libraries.get(path, self.work.lower())
+            for name in dict.fromkeys(entry["units"]):
+                where.setdefault((library, name), []).append(path)
+        return [{"name": name, "kind": "entity" if name in self._definers else "unit", "files": paths, "used": paths[-1]}
+                for (_, name), paths in where.items() if len(paths) > 1]
 
     def drop_resolved(self, fragment: dict, names: set[str]) -> None:
         """Forget names another language defines."""
