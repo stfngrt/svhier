@@ -19,10 +19,11 @@ from typing import Any
 
 import pyGHDL.libghdl as lg
 from pyGHDL.libghdl import errorout_console, files_map, flags, libghdl, libraries, name_table
-from pyGHDL.libghdl.utils import list_iter, nodes_iter
+from pyGHDL.libghdl.utils import chain_iter, list_iter, nodes_iter
 from pyGHDL.libghdl.vhdl import nodes, sem_lib
 
 _MARKER = "@@svhier-order "
+_UNSET_MARKER = "@@svhier-unset "
 # Date_Valid'First in GHDL; analysis dates count up from here.
 _FIRST_DATE = 10
 # ctypes variables, which pyGHDL annotates as the type of their value.
@@ -206,6 +207,12 @@ def _strip_declarations() -> None:
         nodes.Set_Declaration_Chain(node, 0)
 
 
+def _unset_generics(entity: int) -> list[str]:
+    """Return the generics of *entity* that nothing gave a value, so only a parent can set them."""
+    return [_name(nodes.Get_Identifier(generic)) for generic in chain_iter(nodes.Get_Generic_Chain(entity))
+            if nodes.Get_Kind(generic) != nodes.Iir_Kind.Interface_Constant_Declaration or not nodes.Get_Default_Value(generic)]
+
+
 def _elaborate(request: dict) -> int:
     """Elaborate the top; print the file dependencies, then libghdl's hierarchy, to stdout."""
     top, generics, files = request["top"], request["generics"], request["files"]
@@ -222,6 +229,8 @@ def _elaborate(request: dict) -> int:
         return 3
     entity = _bind("vhdl__utils__get_entity_from_configuration", c_int32, c_int32)(config)
     _bind("vhdl__configuration__apply_generic_override", None, c_int32)(entity)
+    # Printed before anything can stop this process, for the frontend to tell why it failed.
+    print(_UNSET_MARKER + json.dumps(_unset_generics(entity)), flush=True)
     _bind("vhdl__configuration__check_entity_declaration_top", None, c_int32, c_bool)(entity, False)
     if _error_count():
         return 4

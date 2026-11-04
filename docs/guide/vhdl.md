@@ -122,7 +122,10 @@ error: top module 'core' could not be elaborated, so nothing below it is shown
 ```
 
 Without `--top`, each entity is elaborated on its own, so the tree still shows every
-entity that works.
+entity that works. An entity with generics that have no default may only work with
+values from a parent. If nothing instantiates it and it fails on its own, that isn't
+an error: it appears without children, with a note. Errors in its code are still
+errors, and `--top` on it reports the failure as usual.
 
 ## Known limits
 

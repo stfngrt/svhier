@@ -230,3 +230,64 @@ def test_only_errors_with_a_location_are_the_same_error_for_every_top():
     errors = ["ghdl: a: /f.vhd:1:2:error: bad", "ghdl: b: /f.vhd:1:2:error: bad", "ghdl: a: raised OOPS", "ghdl: b: raised OOPS"]
     kept = GhdlFrontend()._report_errors(errors, empty_fragment())  # pylint: disable=protected-access
     assert kept == ["ghdl: a: /f.vhd:1:2:error: bad", "ghdl: a: raised OOPS", "ghdl: b: raised OOPS"]
+
+
+_NEEDS_GENERICS = """\
+entity {name} is
+  generic (WIDTH : natural; NAME : string);
+end;
+architecture rtl of {name} is
+  constant bits : natural := WIDTH - 2;
+begin
+end;
+"""
+
+
+@needs_ghdl
+def test_without_top_an_entity_only_a_parent_can_set_up_is_no_error(tmp_path):
+    (tmp_path / "part.vhd").write_text(_NEEDS_GENERICS.format(name="part"))
+    (tmp_path / "other.vhd").write_text(_entity("other"))
+    proc = _wide_svhier(str(tmp_path), "--filelist", "-", "--tree", "-E")
+    assert proc.returncode == 0, proc.stderr
+    assert "part: no default for generics width, name" in proc.stderr
+    assert "part" in proc.stdout.splitlines()  # In the tree, with no children.
+    assert str(tmp_path / "part.vhd") in proc.stdout
+
+
+@needs_ghdl
+def test_entity_a_parent_sets_up_gets_no_note(tmp_path):
+    (tmp_path / "part.vhd").write_text(_NEEDS_GENERICS.format(name="part"))
+    (tmp_path / "top.vhd").write_text(
+        'entity top is end;\narchitecture rtl of top is begin\n  u_part: entity work.part generic map (WIDTH => 8, NAME => "x");\nend;\n')
+    proc = _wide_svhier(str(tmp_path), "-E")
+    assert proc.returncode == 0, proc.stderr
+    assert "u_part (part)" in proc.stdout
+    assert "no default for" not in proc.stderr
+
+
+@needs_ghdl
+def test_top_with_generics_it_cannot_do_without_is_still_an_error(tmp_path):
+    (tmp_path / "part.vhd").write_text(_NEEDS_GENERICS.format(name="part"))
+    proc = _wide_svhier(str(tmp_path), "--top", "part", "-E")
+    assert proc.returncode == 1
+    assert "has no default value" in proc.stderr
+    assert "could not be elaborated" in proc.stderr
+
+
+@needs_ghdl
+def test_without_top_an_analysis_error_stays_an_error_despite_missing_defaults(tmp_path):
+    (tmp_path / "part.vhd").write_text("library gone;\nuse gone.stuff.all;\n" + _NEEDS_GENERICS.format(name="part"))
+    proc = _wide_svhier(str(tmp_path), "-E")
+    assert proc.returncode == 1
+    assert 'unit "stuff" not found' in proc.stderr
+
+
+@needs_ghdl
+def test_entity_sv_sets_up_in_a_later_round_gets_no_note(tmp_path):
+    (tmp_path / "part.vhd").write_text(
+        "entity part is\n  generic (WIDTH : natural);\nend;\narchitecture rtl of part is\n  constant bits : natural := WIDTH - 2;\nbegin\nend;\n")
+    (tmp_path / "top.sv").write_text("module top; part #(.WIDTH(8)) u_part (); endmodule\n")
+    proc = _wide_svhier(str(tmp_path), "-E")
+    assert proc.returncode == 0, proc.stderr
+    assert "u_part (part)" in proc.stdout
+    assert "no default for" not in proc.stderr
