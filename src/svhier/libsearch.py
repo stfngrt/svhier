@@ -10,6 +10,7 @@ package that is otherwise missing are pulled into the compilation.  Missing
 are found under.
 """
 
+import glob
 import re
 from collections.abc import Callable
 from fnmatch import fnmatchcase
@@ -93,6 +94,9 @@ class LibraryIndex:
 
     def __init__(self, dirs: list[str], ignore: set[str] | None = None):
         ign = ignore or set()
+        self._roots = [Path(d) for d in dirs]
+        self._ignore = ign
+        self._named: dict[str, list[Path]] = {}
         self.defs: dict[str, list[Path]] = {}
         self.headers: list[Path] = []
         for d in dirs:
@@ -130,12 +134,22 @@ class LibraryIndex:
         candidates = sorted((p for n in spellings for p in self.defs[n]), key=lambda p: self._rank(spellings[0], p))
         return candidates[:1], max(len(candidates) - 1, 0)
 
+    def _files_named(self, name: str) -> list[Path]:
+        """Return the files called *name*, looking only once: searching takes a walk over ``-y``."""
+        if name not in self._named:
+            self._named[name] = [f for root in self._roots for f in sorted(root.rglob(glob.escape(name)))
+                                 if f.is_file() and not is_ignored(f, root, self._ignore)]
+        return self._named[name]
+
     def find_include_dir(self, include: str) -> Path | None:
-        """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if any header matches."""
+        """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if a file matches.
+
+        Includes aren't only headers: ``prim_assert.sv`` and ``consts.vi`` are common too.
+        """
         parts = Path(include).parts
         if not parts or Path(include).is_absolute() or ".." in parts:
             return None
-        matches = [h for h in self.headers if h.parts[-len(parts):] == parts and len(h.parts) > len(parts)]
+        matches = [h for h in self._files_named(parts[-1]) if h.parts[-len(parts):] == parts and len(h.parts) > len(parts)]
         if not matches:
             return None
         best = min(matches, key=lambda h: (len(h.parts), str(h)))

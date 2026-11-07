@@ -25,6 +25,7 @@ The table only appears when something is missing.
 | **blackbox module** | A module is instantiated but never defined. |
 | **interface** | An interface is used but never defined. |
 | **package** | A package is imported or referenced (`pkg::name`) but never defined. |
+| **unit** | A VHDL package, entity or library is used but never defined, as `library.unit` outside the work library. Only reported when that stopped elaboration. |
 | **include** | An `` `include `` file can't be found on the include path. |
 | **macro** | A `` `MACRO `` is used but never `` `define ``d. |
 

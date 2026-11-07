@@ -9,11 +9,16 @@ in a child process, a library of what ``-y`` holds, and a frontend that takes bo
 """
 
 import importlib.util
+import io
 import json
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
+import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,7 +26,10 @@ from svhier.frontends import Request, empty_fragment
 from svhier.libsearch import Library, LibraryFactory, LibrarySearch, glob_files
 
 _MARKER = "@@svhier-order "
+_UNSET_MARKER = "@@svhier-unset "
 _TIMEOUT_S = 120
+# How much later than a child's timeout the server must report it, or be taken as stuck.
+_SERVER_GRACE_S = 10
 _INSTALL_HINT = "install GHDL's pyGHDL wheel from https://github.com/ghdl/ghdl/releases"
 
 _ARCH = re.compile(r"^architecture (\w+) of (\w+)$")
@@ -38,6 +46,9 @@ _COMMENT = re.compile(r"--.*$", re.M)
 _PRIMARY_UNIT = re.compile(r"^\s*(?:entity|package|context|configuration\s+\w+\s+of)\s+(\w+)\s+is\b", re.I | re.M)
 _SECONDARY_UNIT = re.compile(r"^\s*(?:architecture\s+\w+\s+of|package\s+body)\s+(\w+)\s+is\b", re.I | re.M)
 _BUILTIN_LIBRARIES = {"std", "ieee"}
+_ERROR_TOP = re.compile(r"^ghdl: [^:]+: ")
+_ERROR_LOCATION = re.compile(r"^.+:\d+:\d+:error:")
+_UNIT_NOT_FOUND = re.compile(r'^(.+):\d+:\d+:error: unit "(\w+)" not found in library "(\w+)"')
 
 
 @dataclass
@@ -60,6 +71,8 @@ class Elaboration:
     file_deps: dict[str, list[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Generics with no value.  If it failed, those may be why: only a parent can set them.
+    unset: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -310,15 +323,137 @@ def tree_to_defs(root: _Node, files: dict[str, str]) -> list[ForeignDef]:
     return list(defs.values())
 
 
+def _read_output(stdout: str, by_abs: dict[str, str]) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """Split what the worker printed into file dependencies, unset generics and hierarchy lines."""
+    file_deps: dict[str, list[str]] = {}
+    unset: list[str] = []
+    body: list[str] = []
+    for line in stdout.splitlines():
+        if line.startswith(_MARKER):
+            raw = json.loads(line[len(_MARKER):])
+            file_deps = {by_abs[f]: [by_abs[n] for n in needs] for f, needs in raw.items()}
+        elif line.startswith(_UNSET_MARKER):
+            unset = json.loads(line[len(_UNSET_MARKER):])
+        else:
+            body.append(line)
+    return file_deps, unset, body
+
+
+class _ServerFailed(Exception):
+    """The serving worker can't answer, as opposed to the child running one request failing."""
+
+
+def _can_serve() -> bool:
+    """Report whether Python offers what a server needs here.
+
+    Windows has none of it, which also rules out ``pass_fds`` and ``start_new_session``, and
+    macOS has no ``memfd_create`` or ``sigtimedwait``.  Without them, each request gets a process.
+    """
+    needs = ((os, "fork"), (os, "memfd_create"), (os, "killpg"), (os, "setsid"), (select, "poll"),
+             (signal, "sigtimedwait"), (signal, "pthread_sigmask"))
+    return all(hasattr(module, name) for module, name in needs)
+
+
+def _stop_server(process: subprocess.Popen, descriptors: tuple[int, ...]) -> None:
+    for descriptor in descriptors:
+        os.close(descriptor)
+    try:  # Its group, for a child the program is leaving behind by stopping mid-request.
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+class _WorkerServer:
+    """A worker that has loaded one set of sources, and forks a child for each request.
+
+    Starting Python and libghdl and reading the sources takes most of the time of a run, and
+    without ``--top`` there is a run per entity.  A forked child starts from the state a new
+    process has after loading, so it gives the same answer, and a crash only ends the child.
+    """
+
+    def __init__(self, env: dict[str, str]) -> None:
+        request_read, self._requests = os.pipe()
+        self._replies, reply_write = os.pipe()
+        self.command = [sys.executable, "-m", "svhier_ghdl.worker", "--serve", str(request_read), str(reply_write)]
+        try:
+            # A session of its own keeps a terminal's signals from it, so it stops when told to.
+            # Stdin stays inherited, as with a process per run.
+            process = subprocess.Popen(  # pylint: disable=consider-using-with
+                self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                pass_fds=(request_read, reply_write), start_new_session=True)
+        except OSError:
+            os.close(self._requests)
+            os.close(self._replies)
+            raise
+        finally:
+            os.close(request_read)
+            os.close(reply_write)
+        self.pid = process.pid
+        self.close = weakref.finalize(self, _stop_server, process, (self._requests, self._replies))
+        self._poll = select.poll()
+        self._poll.register(self._replies, select.POLLIN)
+        self._buffer = bytearray()
+
+    def load(self, sources: dict, deadline: float) -> None:
+        """Have the server load *sources*, and wait until it has."""
+        self._send(sources)
+        self._read_line(deadline)
+
+    def _send(self, message: dict) -> None:
+        data = json.dumps(message).encode() + b"\n"
+        while data:
+            data = data[os.write(self._requests, data):]
+
+    def _read_more(self, deadline: float) -> None:
+        if not self._poll.poll(max(0.0, deadline - time.monotonic()) * 1000):
+            raise _ServerFailed
+        data = os.read(self._replies, 1 << 16)
+        if not data:
+            raise _ServerFailed
+        self._buffer += data
+
+    def _read_line(self, deadline: float) -> bytes:
+        while (end := self._buffer.find(b"\n")) < 0:
+            self._read_more(deadline)
+        line = bytes(self._buffer[:end])
+        del self._buffer[:end + 1]
+        return line
+
+    def _read_bytes(self, size: int, deadline: float) -> bytes:
+        while len(self._buffer) < size:
+            self._read_more(deadline)
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def request(self, request: dict, deadline: float) -> subprocess.CompletedProcess:
+        """Run one elaboration request, which the server stops at *deadline* if need be."""
+        self._send({"request": request, "timeout": max(0.0, deadline - time.monotonic())})
+        deadline += _SERVER_GRACE_S
+        header = json.loads(self._read_line(deadline))
+        stdout = self._read_bytes(header["stdout"], deadline)
+        stderr = self._read_bytes(header["stderr"], deadline)
+        if header["timed_out"]:
+            raise subprocess.TimeoutExpired(self.command, _TIMEOUT_S)
+        # Decoded as subprocess's text mode does.
+        return subprocess.CompletedProcess(self.command, header["returncode"],
+                                           io.TextIOWrapper(io.BytesIO(stdout)).read(), io.TextIOWrapper(io.BytesIO(stderr)).read())
+
+
 class GhdlWorkerTool:
     """Everything the frontend needs from pyGHDL, which :mod:`svhier_ghdl.worker` does for it."""
+
+    def __init__(self) -> None:
+        self._server: _WorkerServer | None = None
+        self._sources: dict | None = None
+        self._failed_sources: dict | None = None
 
     def unavailable_reason(self) -> str | None:
         """Report if pyGHDL is missing."""
         return None if importlib.util.find_spec("pyGHDL") else f"pyGHDL is not installed; {_INSTALL_HINT}"
 
-    def run(self, request: dict) -> subprocess.CompletedProcess:
-        """Run one worker request."""
+    def _environment(self) -> dict[str, str]:
         spec = importlib.util.find_spec("pyGHDL")
         if spec is None or spec.origin is None:
             raise ValueError(f"pyGHDL is not installed; {_INSTALL_HINT}")
@@ -326,8 +461,48 @@ class GhdlWorkerTool:
         # The wheel bundles libgnat, but the loader only finds it through this path.
         lib_dir = Path(spec.origin).parent / "lib"
         env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, [str(lib_dir), env.get("LD_LIBRARY_PATH", "")]))
+        return env
+
+    def run_once(self, request: dict) -> subprocess.CompletedProcess:
+        """Run one worker request in a process of its own."""
         return subprocess.run([sys.executable, "-m", "svhier_ghdl.worker", json.dumps(request)],
-                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=env, check=False)
+                              capture_output=True, text=True, timeout=_TIMEOUT_S, env=self._environment(), check=False)
+
+    def run(self, request: dict) -> subprocess.CompletedProcess:
+        """Run one worker request, in the server for its sources if it's an elaboration.
+
+        Where there can be no server, or whatever stops it, a process of its own gives the
+        answer the server would have given.
+        """
+        if request["op"] != "elaborate" or not _can_serve():
+            return self.run_once(request)
+        sources = {key: request[key] for key in ("std", "work", "files", "libraries")}
+        if sources != self._failed_sources:
+            try:
+                return self._serve(sources, request)
+            except (_ServerFailed, OSError):
+                self._failed_sources = sources
+                self.close()
+        return self.run_once(request)
+
+    def _serve(self, sources: dict, request: dict) -> subprocess.CompletedProcess:
+        deadline = time.monotonic() + _TIMEOUT_S
+        if self._server is None or sources != self._sources:
+            self.close()
+            self._server = _WorkerServer(self._environment())
+            self._server.load(sources, deadline)
+            self._sources = sources
+        return self._server.request(request, deadline)
+
+    def server_pid(self) -> int | None:
+        """Return the process serving elaborations, if there is one."""
+        return self._server.pid if self._server else None
+
+    def close(self) -> None:
+        """Stop the server, if there is one.  It also stops when the program exits."""
+        if self._server:
+            self._server.close()
+            self._server = None
 
 
 class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
@@ -351,6 +526,8 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
         self._definers: dict[str, list[str]] = {}
         self._libraries: dict[str, str] = {}
         self._notes: list[str] = []
+        # Only about the latest elaboration: a later round may reach what this one didn't.
+        self._alone_notes: list[str] = []
         self._cache: dict[tuple, Elaboration] = {}
         self._scan: dict[str, dict] = {}
 
@@ -373,6 +550,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
 
     def extra_inputs(self) -> list[str]:
         """Only files count."""
+        return []
+
+    def foreign_files(self) -> list[str]:
+        """The plugin's options name no files."""
         return []
 
     def _worker(self, request: dict) -> subprocess.CompletedProcess:
@@ -451,14 +632,17 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
             defs, file_deps, errors = self._elaborate_all(files, request)
             unbound = {i["mod_name"] for d in defs.values() for i in d.insts} - set(defs) - request.defined_elsewhere
             if not self._pull_needed(sorted(unbound), files):
-                return self._fragment(defs, file_deps, errors, auto=request.auto)
+                fragment = self._fragment(defs, file_deps, errors, auto=request.auto)
+                known = self.units(files)
+                fragment["failed_tops"] = [r.name for r in request.roots if r.requested and r.name.lower() in known and r.name.lower() not in defs]
+                return fragment
 
     def _elaborate_all(self, files: list[str], request: Request) -> tuple[dict[str, ForeignDef], dict[str, list[str]], list[str]]:
         """Run the worker for every root, and merge what the runs report."""
         defs: dict[str, ForeignDef] = {}
         file_deps: dict[str, list[str]] = {}
         errors: list[str] = []
-        soft: dict[str, list[str]] = {}
+        soft: dict[str, Elaboration] = {}
 
         def run(top: str, generics: dict[str, str], is_soft: bool) -> None:
             key = (top.lower(), tuple(sorted(generics.items())))
@@ -476,7 +660,7 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                 have_deps = file_deps.setdefault(fname, [])
                 have_deps.extend(n for n in needs if n not in have_deps)
             if is_soft:
-                soft[top.lower()] = result.errors
+                soft[top.lower()] = result
             else:
                 errors.extend(e for e in result.errors if e not in errors)
 
@@ -488,9 +672,16 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                     run(unit, {}, True)
         # An entity that fails alone may only need the generics its parent passes.
         reached = {i["mod_name"].lower() for d in defs.values() for i in d.insts}
-        for unit, unit_errors in soft.items():
-            if unit not in reached:
-                errors.extend(e for e in unit_errors if e not in errors)
+        self._alone_notes = []
+        for unit, result in soft.items():
+            if unit in reached or not result.errors:
+                continue
+            if result.unset:
+                unset = ", ".join(result.unset)
+                self._alone_notes.append(f"{unit}: no default for generics {unset}, so it can't be elaborated on its own and its children aren't shown")
+                defs.setdefault(unit, ForeignDef(unit, self.units(files).get(unit)))
+            else:
+                errors.extend(e for e in result.errors if e not in errors)
         return defs, file_deps, errors
 
     def _fragment(self, defs: dict[str, ForeignDef], file_deps: dict[str, list[str]], errors: list[str], *, auto: bool) -> dict:
@@ -520,12 +711,49 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                 if unit.file and name not in defs:
                     known = result["unresolved"].setdefault(name, [])
                     known.extend(u for u in uses if u not in known)
+        result["duplicates"] = self._duplicates()
+        errors = self._report_errors(errors, result)
         result["diagnostics"] = [{"severity": "error", "file": "", "message": e} for e in errors]
         result["has_errors"] = bool(errors)
-        result["notes"] = list(self._notes)
+        result["notes"] = self._notes + self._alone_notes + result["notes"]
         result["pulled"] = self.search.pulled
         result["needed"] = None if auto else [e["file_name"] for e in result["files"]]
         return result
+
+    def _report_errors(self, errors: list[str], result: dict) -> list[str]:
+        """Return *errors* without repeats, and add to *result* what they say is missing or to blame.
+
+        Each top reports the problems of the files it needs, so with no ``--top``, one bad file
+        would be listed once per entity using it.  Without a location, such as a crash, an
+        error is about its top.
+        """
+        names = {str(Path(f).resolve()): f for f in self._scan}
+        unique: dict[str, str] = {}
+        for error in errors:
+            text = _ERROR_TOP.sub("", error)
+            unique.setdefault(text if _ERROR_LOCATION.match(text) else error, error)
+        for text in unique:
+            match = _UNIT_NOT_FOUND.match(text)
+            if match:
+                path, unit, library = match.groups()
+                users = result["missing"]["units"].setdefault(unit if library == self.work.lower() else f"{library}.{unit}", [])
+                if names.get(path, path) not in users:
+                    users.append(names.get(path, path))
+        for dup in result["duplicates"]:
+            used = Path(dup["used"])
+            if any(text.startswith(f"{used.resolve()}:") for text in unique):
+                result["notes"].append(f"{dup['name']}: {used} has errors and other files define it too; -x {used.name} would use another one")
+        return list(unique.values())
+
+    def _duplicates(self) -> list[dict]:
+        """Report units defined by several files of one library.  GHDL uses what it loads last."""
+        where: dict[tuple[str, str], list[str]] = {}
+        for path, entry in self._scan.items():
+            library = self._libraries.get(path, self.work.lower())
+            for name in dict.fromkeys(entry["units"]):
+                where.setdefault((library, name), []).append(path)
+        return [{"name": name, "kind": "entity" if name in self._definers else "unit", "files": paths, "used": paths[-1]}
+                for (_, name), paths in where.items() if len(paths) > 1]
 
     def drop_resolved(self, fragment: dict, names: set[str]) -> None:
         """Forget names another language defines."""
@@ -552,17 +780,10 @@ class GhdlFrontend:  # pylint: disable=too-many-instance-attributes
                     notes.append(f"{top}: couldn't read generics, so SV modules below it use their defaults")
         except subprocess.TimeoutExpired:
             return Elaboration(errors=[f"ghdl: elaborating {top} timed out after {_TIMEOUT_S} s"])
-        file_deps: dict[str, list[str]] = {}
-        body: list[str] = []
-        for line in proc.stdout.splitlines():
-            if line.startswith(_MARKER):
-                raw = json.loads(line[len(_MARKER):])
-                file_deps = {by_abs[f]: [by_abs[n] for n in needs] for f, needs in raw.items()}
-            else:
-                body.append(line)
+        file_deps, unset, body = _read_output(proc.stdout, by_abs)
         if proc.returncode != 0:
             detail = [ln for ln in proc.stderr.splitlines() if ":error:" in ln or ln.startswith("error:") or "raised " in ln]
-            return Elaboration(errors=[f"ghdl: {top}: {d}" for d in detail] or [f"ghdl: {top}: worker exited with code {proc.returncode}"])
+            return Elaboration(errors=[f"ghdl: {top}: {d}" for d in detail] or [f"ghdl: {top}: worker exited with code {proc.returncode}"], unset=unset)
         # Of several files defining a name, the design used the one in its dependencies.
         located = {name: next((p for p in paths if p in file_deps), paths[0]) for name, paths in self._definers.items()}
         return Elaboration(defs=tree_to_defs(parse_tree("\n".join(body)), located), file_deps=file_deps, notes=notes)
