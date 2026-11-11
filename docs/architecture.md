@@ -52,6 +52,14 @@ and the copy slang actually uses (`used`).  The other copies are marked `shadowe
 in their file entry: they are not elaborated (no `insts`) and `compute_filelist()`
 resolves the name to the used copy.  The CLI prints a warning per duplicate.
 
+The CLI lets a file passed by name win: after a parse, `_overridden_files()`
+finds the scanned (`-r`) or library (`-y`) files whose every module, interface and
+package is also defined by an explicit file, and `_parse_with_libs()` drops them
+and parses again.  slang keeps the *last* copy of a module but the *first* copy of
+a package, so compile order can't express "this file wins"; dropping files can.
+Files that define anything else are kept so nothing goes missing, and files from
+command files are never dropped.
+
 ```{eval-rst}
 .. autofunction:: svhier.parser.compute_filelist
 ```

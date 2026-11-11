@@ -6,6 +6,7 @@
 import argparse
 import re
 import sys
+from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
 
@@ -365,7 +366,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         metavar="PATH",
-        help=".sv/.v files or directories containing .sv/.v files.",
+        help=".sv/.v files or directories containing .sv/.v files. A file named directly wins over other "
+             "files that define the same modules, interfaces or packages: those are dropped.",
     )
     parser.add_argument(
         "-f",
@@ -489,33 +491,95 @@ def _add_pulled(
         pulled.append((include, d, 0))
 
 
+def _defined(entry: dict) -> list[tuple[str, str]]:
+    """Return ``(kind, name)`` for every module, interface and package a file entry defines."""
+    return ([("module", d["mod_name"]) for d in entry["defs"]]
+            + [("interface", n) for n in entry["ifaces"]]
+            + [("package", n) for n in entry["pkgs"]])
+
+
+def _overridden_files(hierarchy: dict, sv_files: list[str], explicit: set[Path]) -> dict[str, list[tuple[str, str]]]:
+    """Return the files in *sv_files* whose every definition is also defined by an *explicit* file.
+
+    The result maps each such file to the ``(kind, name)`` pairs it loses.  Files that
+    also define something no explicit file defines are kept, so nothing goes missing.
+    Files that came from a command file can't be dropped and are never returned.
+    """
+    by_path = {Path(f).resolve(): f for f in sv_files}
+    entries = [(Path(e["file_name"]).resolve(), e) for e in hierarchy["files"]]
+    wins = {item for path, e in entries if path in explicit for item in _defined(e)}
+    out: dict[str, list[tuple[str, str]]] = {}
+    for path, entry in entries:
+        items = _defined(entry)
+        if path in by_path and path not in explicit and items and set(items) <= wins:
+            out[by_path[path]] = items
+    return out
+
+
+@dataclass
+class _Resolved:
+    """Outcome of :func:`_parse_with_libs`."""
+
+    hierarchy: dict
+    pulled: list[tuple[str, Path, int]] = field(default_factory=list)  # (name, file, other candidates)
+    overridden: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # dropped file -> (kind, name)s
+
+
 def _parse_with_libs(
     sv_files: list[str], inc_dirs: list[str], index: LibraryIndex | None, options: dict,
-) -> tuple[dict, list[tuple[str, Path, int]]]:
-    """Parse, then keep pulling missing definitions from *index* until nothing new resolves.
+    explicit: set[Path] | None = None,
+) -> _Resolved:
+    """Parse, then drop overridden files and pull in missing definitions until nothing changes.
 
-    *options* are passed to :func:`parse_files` as keyword arguments.  *sv_files* and
-    *inc_dirs* are extended in place.  Returns the hierarchy of the final parse (so
-    diagnostics, missing names and the exit code reflect the resolved design) and
-    ``(name, file, other candidates)`` for every library file pulled in.
+    Files whose definitions are all also defined by a file in *explicit* (resolved
+    paths passed by name on the command line) are dropped, so the explicit copy wins.
+    Missing definitions are pulled from *index*.  *options* are passed to
+    :func:`parse_files` as keyword arguments.  *sv_files* and *inc_dirs* are changed
+    in place.  The returned hierarchy is from the final parse, so diagnostics, missing
+    names and the exit code reflect the resolved design.
     Raises ``ValueError`` if slang rejects the inputs.
     """
-    pulled: list[tuple[str, Path, int]] = []
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   console=_err, transient=True) as progress:
         task = progress.add_task("Running slang elaboration…", total=None)
-        hierarchy = parse_files(sv_files, inc_dirs, **options)
+        res = _Resolved(parse_files(sv_files, inc_dirs, **options))
         for rnd in range(1, _MAX_LIB_ROUNDS + 1):
-            if index is None:
-                break
-            loaded = [f["file_name"] for f in hierarchy["files"]]
-            files, incs = resolve_missing(hierarchy["missing"], index, loaded, inc_dirs)
-            if not files and not incs:
-                break
-            _add_pulled(files, incs, sv_files, inc_dirs, pulled)
-            progress.update(task, description=f"Resolving from library dirs (round {rnd})…")
-            hierarchy = parse_files(sv_files, inc_dirs, **options)
-    return hierarchy, pulled
+            dropped = _overridden_files(res.hierarchy, sv_files, explicit) if explicit else {}
+            if dropped:
+                res.overridden.update(dropped)
+                sv_files[:] = [f for f in sv_files if f not in dropped]
+                progress.update(task, description="Dropping copies overridden by explicit files…")
+            else:
+                if index is None:
+                    break
+                loaded = [f["file_name"] for f in res.hierarchy["files"]]
+                files, incs = resolve_missing(res.hierarchy["missing"], index, loaded + list(res.overridden), inc_dirs)
+                if not files and not incs:
+                    break
+                _add_pulled(files, incs, sv_files, inc_dirs, res.pulled)
+                progress.update(task, description=f"Resolving from library dirs (round {rnd})…")
+            res.hierarchy = parse_files(sv_files, inc_dirs, **options)
+    return res
+
+
+def _print_overridden(hierarchy: dict, overridden: dict[str, list[tuple[str, str]]]) -> None:
+    """Print which names explicit files took over, and the copies that were dropped for them."""
+    if not overridden:
+        return
+    winner = {item: e["file_name"] for e in hierarchy["files"] for item in _defined(e)}
+    dropped: dict[tuple[str, str], list[str]] = {}
+    for f, items in overridden.items():
+        for item in items:
+            dropped.setdefault(item, []).append(f)
+    table = Table(title="Overridden by explicit files", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Kind", style="yellow")
+    table.add_column("Used", style="green", overflow="fold")
+    table.add_column("Dropped", style="dim", overflow="fold")
+    for (kind, name), files in dropped.items():
+        shown = Path(files[0]).name + (f" (+{len(files) - 1} more)" if len(files) > 1 else "")
+        table.add_row(name, kind, winner.get((kind, name), ""), shown)
+    _err.print(table)
 
 
 def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
@@ -558,18 +622,22 @@ def main():
 
     index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
     options = {"defines": args.defines, "tops": args.tops, "command_files": args.command_files}
+    loaded = {Path(f).resolve() for f in sv_files}
+    explicit = {Path(p).resolve() for p in args.paths if Path(p).is_file()} & loaded
     try:
-        hierarchy, pulled = _parse_with_libs(sv_files, inc_dirs, index, options)
+        res = _parse_with_libs(sv_files, inc_dirs, index, options, explicit)
     except ValueError as exc:
         _err.print(f"[red]error:[/red] {exc}")
         sys.exit(1)
+    hierarchy = res.hierarchy
 
     _print_diagnostics(hierarchy, errors=args.errors, warnings=args.warnings)
 
     if args.summary:
         _print_summary(hierarchy)
 
-    _print_pulled(pulled)
+    _print_pulled(res.pulled)
+    _print_overridden(hierarchy, res.overridden)
     _print_duplicates(hierarchy)
     _print_missing(hierarchy)
 
