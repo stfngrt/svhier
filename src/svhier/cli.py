@@ -510,8 +510,8 @@ def _print_overridden(hierarchy: dict) -> None:
     used = {item: e["file_name"] for e in hierarchy["files"] for item in defined_names(e)}
     dropped: dict[tuple[str, str], list[str]] = {}
     for fname, items in overridden.items():
-        for item in items:
-            dropped.setdefault(tuple(item), []).append(fname)
+        for kind, name in items:
+            dropped.setdefault((kind, name), []).append(fname)
     table = Table(title="Overridden by explicit files", show_header=True, header_style="bold cyan")
     table.add_column("Name", style="bold")
     table.add_column("Kind", style="yellow")
