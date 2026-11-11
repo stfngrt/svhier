@@ -10,8 +10,12 @@ package that is otherwise missing are pulled into the compilation.  Missing
 are found under.
 """
 
+import glob
 import re
+from collections.abc import Callable
+from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import Generic, Protocol, TypeVar
 
 _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:automatic|static)\s+)?(\w+)", re.M)
 
@@ -19,8 +23,70 @@ _DEF_RE = re.compile(r"^\s*(?:module|macromodule|interface|package)\s+(?:(?:auto
 _DEF_KINDS = ("modules", "interfaces", "packages")
 
 
-def _is_ignored(p: Path, ignore: set[str]) -> bool:
-    return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
+def is_ignored(p: Path, root: Path, ignore: set[str]) -> bool:
+    """Return whether a component of *p* below *root* matches one of the lowercase patterns in *ignore*.
+
+    A pattern matches a whole file or directory name, either literally or as a glob
+    (``*_tb.sv``).  *root* and the directories above it never match, so where a design is
+    checked out does not change which of its files are skipped.  Matching is case-insensitive.
+    """
+    return any(fnmatchcase(part.lower(), pattern) for part in p.relative_to(root).parts for pattern in ignore)
+
+
+def glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
+    """Return the files in directory *p* matching the patterns *exts*, leaving out ignored ones."""
+    prefix = "**/" if recursive else ""
+    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not is_ignored(f, p, ignore)]
+
+
+class Library(Protocol):
+    """What a language plugin knows about the files under ``-y``."""
+
+    def __bool__(self) -> bool:
+        """Return whether the directories hold anything for this language."""
+
+    def find(self, name: str, scope: str = "") -> tuple[list[Path], int]:
+        """Return the files for *name* in any case, and how many other files also define it.
+
+        *scope* is the library a language refers to it through, if it has such a thing.
+        """
+
+
+#: Builds a :class:`Library` from the ``-y`` directories and the lowercase names to ignore.
+LibraryFactory = Callable[[list[str], set[str]], Library]
+
+
+L = TypeVar("L", bound=Library)
+
+
+class LibrarySearch(Generic[L]):
+    """Pulls files from a :class:`Library` into a compilation, and records what it pulled."""
+
+    def __init__(self, library: L | None = None) -> None:
+        self.library = library
+        self.pulled: list[tuple[str, Path, int]] = []
+
+    def __bool__(self) -> bool:
+        return bool(self.library)
+
+    def has(self, name: str) -> bool:
+        """Return whether the library defines *name*."""
+        return bool(self.library and self.library.find(name)[0])
+
+    def pull(self, name: str, files: list[str], scope: str = "") -> bool:
+        """Add the files defining *name* to *files*; return whether that added any."""
+        found, others = self.library.find(name, scope) if self.library else ([], 0)
+        have = {Path(f).resolve() for f in files}
+        new = [p for p in found if p.resolve() not in have]
+        if not new:
+            return False
+        files.extend(str(p) for p in new)
+        self.record(name, found[0], others)
+        return True
+
+    def record(self, name: str, path: Path, others: int = 0) -> None:
+        """Note that *path* was pulled in for *name*."""
+        self.pulled.append((name, path, others))
 
 
 class LibraryIndex:
@@ -28,13 +94,16 @@ class LibraryIndex:
 
     def __init__(self, dirs: list[str], ignore: set[str] | None = None):
         ign = ignore or set()
+        self._roots = [Path(d) for d in dirs]
+        self._ignore = ign
+        self._named: dict[str, list[Path]] = {}
         self.defs: dict[str, list[Path]] = {}
         self.headers: list[Path] = []
         for d in dirs:
             root = Path(d)
             for ext in ("*.sv", "*.v"):
                 for f in sorted(root.glob(f"**/{ext}")):
-                    if _is_ignored(f, ign):
+                    if is_ignored(f, root, ign):
                         continue
                     try:
                         text = f.read_text(encoding="utf-8", errors="replace")
@@ -43,7 +112,7 @@ class LibraryIndex:
                     for name in dict.fromkeys(_DEF_RE.findall(text)):
                         self.defs.setdefault(name, []).append(f)
             for ext in ("*.svh", "*.vh"):
-                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not _is_ignored(f, ign))
+                self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not is_ignored(f, root, ign))
 
     @staticmethod
     def _rank(name: str, path: Path) -> tuple:
@@ -55,12 +124,32 @@ class LibraryIndex:
         """Return the files defining *name*, best candidate first."""
         return sorted(self.defs.get(name, []), key=lambda p: self._rank(name, p))
 
+    def __bool__(self) -> bool:
+        return bool(self.defs or self.headers)
+
+    def find(self, name: str, scope: str = "") -> tuple[list[Path], int]:  # pylint: disable=unused-argument
+        """Implement :class:`Library`, for names from case-insensitive languages.  SV has no scope."""
+        lowered = name.lower()
+        spellings = [n for n in self.defs if n.lower() == lowered]
+        candidates = sorted((p for n in spellings for p in self.defs[n]), key=lambda p: self._rank(spellings[0], p))
+        return candidates[:1], max(len(candidates) - 1, 0)
+
+    def _files_named(self, name: str) -> list[Path]:
+        """Return the files called *name*, looking only once: searching takes a walk over ``-y``."""
+        if name not in self._named:
+            self._named[name] = [f for root in self._roots for f in sorted(root.rglob(glob.escape(name)))
+                                 if f.is_file() and not is_ignored(f, root, self._ignore)]
+        return self._named[name]
+
     def find_include_dir(self, include: str) -> Path | None:
-        """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if any header matches."""
+        """Return the directory *include* (e.g. ``"sub/regs.svh"``) resolves from, if a file matches.
+
+        Includes aren't only headers: ``prim_assert.sv`` and ``consts.vi`` are common too.
+        """
         parts = Path(include).parts
         if not parts or Path(include).is_absolute() or ".." in parts:
             return None
-        matches = [h for h in self.headers if h.parts[-len(parts):] == parts and len(h.parts) > len(parts)]
+        matches = [h for h in self._files_named(parts[-1]) if h.parts[-len(parts):] == parts and len(h.parts) > len(parts)]
         if not matches:
             return None
         best = min(matches, key=lambda h: (len(h.parts), str(h)))

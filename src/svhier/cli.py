@@ -4,40 +4,44 @@
 """Command-line interface for svhier: parse SV hierarchies and emit YAML."""
 
 import argparse
-import re
+import os
 import sys
-from dataclasses import dataclass, field
+from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
+from typing import NamedTuple
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
-from rich.tree import Tree
 from ruamel.yaml import YAML
 
-from svhier.libsearch import LibraryIndex, resolve_missing
-from svhier.parser import compute_filelist, parse_files
+from svhier.filelist import compute_filelist
+from svhier.frontends import KNOWN_SUFFIXES, Frontend, defined_names, discover_frontends, stitch
+from svhier.libsearch import glob_files, is_ignored
 
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
 _err = Console(stderr=True)
 
 # Per-file keys returned by parse_files that are bookkeeping only, not YAML output.
-_INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs", "shadowed"}
+_INTERNAL_FILE_KEYS = {"pkgs", "ifaces", "refs", "shadowed", "depends_on"}
+# Likewise per definition: the children per parameter setting, which only the tree uses.
+_INTERNAL_DEF_KEYS = {"variants", "top_variant"}
 
 
 def _prepare_for_yaml(hierarchy: dict) -> dict:
     """Return a copy of *hierarchy* with internal-only keys removed.
 
     Strips the ``pkgs``, ``ifaces``, ``refs`` and ``shadowed`` keys from each file entry (bookkeeping only) and
-    omits ``pkg_imports`` from module defs when the list is empty.
+    the ``variants`` and ``top_variant`` keys from module defs, and omits ``pkg_imports`` from module defs when
+    the list is empty.
     """
     files = []
     for entry in hierarchy["files"]:
         defs = []
         for d in entry["defs"]:
-            def_out = {k: v for k, v in d.items() if not (k == "pkg_imports" and not v)}
+            def_out = {k: v for k, v in d.items() if k not in _INTERNAL_DEF_KEYS and not (k == "pkg_imports" and not v)}
             defs.append(def_out)
         file_out = {k: v for k, v in entry.items() if k not in _INTERNAL_FILE_KEYS}
         file_out["defs"] = defs
@@ -45,29 +49,23 @@ def _prepare_for_yaml(hierarchy: dict) -> dict:
     return {"files": files}
 
 
-def _is_ignored(p: Path, ignore: set[str]) -> bool:
-    return bool(ignore) and any(name in part.lower() for part in p.parts for name in ignore)
+def collect_source_files(paths: list[str], recursive: bool, suffixes: tuple[str, ...], ignore: set[str] | None = None) -> list[str]:
+    """Expand a mix of files and directories into a deduplicated file list.
 
-
-def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
-    """Expand a mix of ``.sv``/``.v`` files and directories into a deduplicated file list.
-
-    Directories are searched for ``*.sv`` and ``*.v`` files; when *recursive* is
-    ``True`` the search descends into subdirectories (``**/``).  Duplicate paths
-    (by resolved canonical path) are silently dropped.  Paths that are neither a
-    file nor a directory emit a warning to stderr and are skipped.
+    Files are kept whatever their suffix.  Directories are searched for files with one of
+    *suffixes*; when *recursive* is ``True`` the search descends into subdirectories.
+    Duplicate paths (by resolved canonical path) are silently dropped.  Paths that are
+    neither a file nor a directory emit a warning to stderr and are skipped.
     """
     ign = ignore or set()
     result: list[Path] = []
     for raw in paths:
         p = Path(raw)
         if p.is_file():
-            if not _is_ignored(p, ign):
+            if not is_ignored(p, p.parent, ign):
                 result.append(p)
         elif p.is_dir():
-            prefix = "**/" if recursive else ""
-            for ext in ("*.sv", "*.v"):
-                result.extend(f for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ign))
+            result.extend(glob_files(p, recursive, tuple(f"*{suffix}" for suffix in suffixes), ign))
         else:
             _err.print(f"[yellow]warning:[/yellow] {raw!r} is not a file or directory, skipping")
     seen: set[Path] = set()
@@ -78,79 +76,6 @@ def collect_sv_files(paths: list[str], recursive: bool, ignore: set[str] | None 
             seen.add(resolved)
             unique.append(str(p))
     return unique
-
-
-_INCLUDE_RE = re.compile(r'`include\s+["<]([^">]+)[">]')
-
-
-def _glob_files(p: Path, recursive: bool, exts: tuple[str, ...], ignore: set[str]) -> list[Path]:
-    prefix = "**/" if recursive else ""
-    return [f for ext in exts for f in sorted(p.glob(f"{prefix}{ext}")) if not _is_ignored(f, ignore)]
-
-
-def _include_base_dirs(sources: list[Path], headers: list[Path]) -> list[Path]:
-    """Return the base dirs needed by `` `include "sub/dir/file.svh"`` directives.
-
-    For every include path with a directory component, each known header whose path
-    ends with that include path contributes the directory it must be resolved from,
-    e.g. ``vendor/include/`` for ``vendor/include/vendor/regs.svh``.
-    """
-    by_name: dict[str, list[Path]] = {}
-    for hdr in headers:
-        by_name.setdefault(hdr.name, []).append(hdr)
-
-    bases: list[Path] = []
-    for src in sources:
-        try:
-            text = src.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for inc in _INCLUDE_RE.findall(text):
-            parts = Path(inc).parts
-            if len(parts) < 2 or Path(inc).is_absolute() or ".." in parts:
-                continue
-            for hdr in by_name.get(parts[-1], []):
-                if hdr.parts[-len(parts):] == parts and len(hdr.parts) > len(parts):
-                    bases.append(hdr.parents[len(parts) - 1])
-    return bases
-
-
-def collect_inc_dirs(paths: list[str], recursive: bool, ignore: set[str] | None = None) -> list[str]:
-    """Return include directories for the ``.svh``/``.vh`` header files under *paths*.
-
-    The result is passed to slang as `` `include`` search paths and written as
-    ``+incdir+<dir>`` lines at the top of the generated filelist, which is the
-    format expected by VCS, Questa, and Xcelium.
-
-    Every directory that contains a header is returned.  In addition, when a source
-    or header uses `` `include "sub/dir/file.svh"`` and a matching header exists,
-    the directory that include path is relative to is returned too.
-
-    For directory inputs the search respects the *recursive* flag.
-    For explicit file inputs the parent directory is checked for headers.
-    Directories are returned in discovery order, deduplicated.
-    """
-    ign = ignore or set()
-    headers: list[Path] = []
-    sources: list[Path] = []
-
-    for raw in paths:
-        p = Path(raw)
-        if p.is_dir():
-            headers.extend(_glob_files(p, recursive, ("*.svh", "*.vh"), ign))
-            sources.extend(_glob_files(p, recursive, ("*.sv", "*.v"), ign))
-        elif p.is_file() and not _is_ignored(p, ign):
-            sources.append(p)
-            headers.extend(_glob_files(p.parent, False, ("*.svh", "*.vh"), ign))
-
-    seen: set[Path] = set()
-    result: list[str] = []
-    for d in [h.parent for h in headers] + _include_base_dirs(sources + headers, headers):
-        resolved = d.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            result.append(str(d))
-    return result
 
 
 def _print_summary(hierarchy: dict) -> None:
@@ -179,7 +104,7 @@ def _print_summary(hierarchy: dict) -> None:
 
 
 def _print_diagnostics(hierarchy: dict, *, errors: bool = False, warnings: bool = False) -> None:
-    """Report pyslang diagnostics on stderr.
+    """Report the plugins' diagnostics on stderr.
 
     By default only a one-line count is printed.  With *errors* every error is
     listed; with *warnings* every error and warning is listed.
@@ -190,7 +115,7 @@ def _print_diagnostics(hierarchy: dict, *, errors: bool = False, warnings: bool 
     if not errors and not warnings:
         if n_err or n_warn:
             parts = [f"{n} {name}{'s' if n != 1 else ''}" for n, name in ((n_err, "error"), (n_warn, "warning")) if n]
-            _err.print(f"[dim]slang reported {', '.join(parts)} (use -E to list errors, -W to also list warnings)[/dim]")
+            _err.print(f"[dim]reported {', '.join(parts)} (use -E to list errors, -W to also list warnings)[/dim]")
         return
     for d in diags:
         if d["severity"] == "error":
@@ -207,13 +132,21 @@ _MISSING_LABELS = {
     "modules": "blackbox module",
     "interfaces": "interface",
     "packages": "package",
+    "units": "unit",
     "includes": "include",
     "macros": "macro",
 }
 
 
+def _first_and_more(files: list[str]) -> str:
+    """Return the base name of the first of *files*, followed by how many others there are."""
+    if not files:
+        return ""
+    return Path(files[0]).name + (f" (+{len(files) - 1} more)" if len(files) > 1 else "")
+
+
 def _print_missing(hierarchy: dict) -> None:
-    """Print a table of everything slang could not find to stderr.
+    """Print a table of everything that could not be found to stderr.
 
     Unknown modules are reported as blackboxes; packages, interfaces, include files
     and macros that could not be found follow.  Nothing is printed when the design
@@ -228,10 +161,7 @@ def _print_missing(hierarchy: dict) -> None:
     table.add_column("Referenced in", style="dim", overflow="fold")
     for kind, label in _MISSING_LABELS.items():
         for name, files in missing.get(kind, {}).items():
-            where = Path(files[0]).name if files else ""
-            if len(files) > 1:
-                where += f" (+{len(files) - 1} more)"
-            table.add_row(label, name, where)
+            table.add_row(label, name, _first_and_more(files))
     _err.print(table)
 
 
@@ -247,10 +177,7 @@ def _print_duplicates(hierarchy: dict) -> None:
     table.add_column("Ignored", style="dim", overflow="fold")
     for dup in duplicates:
         ignored = [f for f in dup["files"] if f != dup["used"]]
-        shown = Path(ignored[0]).name if ignored else ""
-        if len(ignored) > 1:
-            shown += f" (+{len(ignored) - 1} more)"
-        table.add_row(dup["name"], dup["kind"], dup["used"], shown)
+        table.add_row(dup["name"], dup["kind"], dup["used"], _first_and_more(ignored))
     _err.print(table)
 
 
@@ -258,58 +185,173 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
-def build_tree(hierarchy: dict, tops: list[str] | None = None) -> list[Tree]:
-    """Return one Rich ``Tree`` per top-level module of *hierarchy*.
+class TreeLine(NamedTuple):
+    """One line of the instance tree."""
 
-    When *tops* is omitted, the roots are all modules that no other module
-    instantiates.  Instances of modules without a definition are marked as
-    ``(blackbox)``; recursive instantiation is cut off and marked ``(cycle)``.
+    guide: str  # What to draw left of the name; empty for a root.
+    name: str  # The top's name, or the instance path relative to the parent.
+    module: str | None = None  # None for a root.
+    marker: str | None = None  # "blackbox" or "cycle".
+
+
+class _Level(NamedTuple):
+    """A module being expanded, as the walk through the tree goes through its children."""
+
+    key: tuple[str, object]  # (module, setting); the setting is None for the merged children.
+    children: Iterator[tuple[int, dict]]
+    last: int
+    indent: str
+
+
+class TreeGuides(NamedTuple):
+    """What to draw for a child and its last sibling, and below each of them."""
+
+    tee: str = "├── "
+    elbow: str = "└── "
+    pipe: str = "│   "
+    gap: str = "    "
+
+
+_ASCII_GUIDES = TreeGuides("+-- ", "`-- ", "|   ")
+
+
+def _select_children(unit: dict, variant: object) -> tuple[object, list[dict]]:
+    """Return which setting of the definition *unit* to show, and its children.
+
+    An instance that doesn't say which setting it uses can only be exact if there is just
+    one.  Otherwise, or for a plugin with no ``variants``, it gets the merged ``insts``, and
+    the setting returned is ``None``.
+    """
+    variants = unit.get("variants", {})
+    if variant is None and len(variants) == 1:
+        variant = next(iter(variants))
+    return (variant, variants[variant]) if variant in variants else (None, unit["insts"])
+
+
+def _iter_subtree(defs: dict[str, dict], top: str, guides: TreeGuides) -> Iterator[TreeLine]:
+    """Yield the lines below *top*, walking with a stack so that depth doesn't matter."""
+
+    def level(name: str, variant: object, indent: str) -> _Level:
+        variant, children = _select_children(defs[name], variant)
+        return _Level((name, variant), iter(enumerate(children)), len(children) - 1, indent)
+
+    stack = [level(top, defs[top].get("top_variant"), "")]
+    expanding = {stack[0].key}
+    while stack:
+        current = stack[-1]
+        for pos, inst in current.children:
+            child = inst["mod_name"]
+            is_last = pos == current.last
+            guide = current.indent + (guides.elbow if is_last else guides.tee)
+            if child not in defs:
+                yield TreeLine(guide, inst["inst_name"], child, "blackbox")
+                continue
+            below = level(child, inst.get("variant"), current.indent + (guides.gap if is_last else guides.pipe))
+            if below.key in expanding:
+                yield TreeLine(guide, inst["inst_name"], child, "cycle")
+                continue
+            yield TreeLine(guide, inst["inst_name"], child)
+            expanding.add(below.key)
+            stack.append(below)
+            break
+        else:
+            expanding.remove(current.key)
+            stack.pop()
+
+
+def iter_tree(hierarchy: dict, tops: list[str] | None = None, guides: TreeGuides = TreeGuides()) -> Iterator[TreeLine]:
+    """Yield the instance tree of *hierarchy* line by line, one tree per top-level module.
+
+    When *tops* is omitted, the roots are all modules that no other module instantiates.
+    Each instance shows the children of its own parameter setting (see
+    :func:`_select_children` for when that isn't known).  Instances of modules without a
+    definition are marked ``blackbox``; an instance of what it's already inside of, with
+    the same setting, is cut off and marked ``cycle``.
+
+    It costs one step per instance in the tree and builds nothing up front, so a large
+    design starts printing at once.
     """
     defs = {d["mod_name"]: d for f in hierarchy["files"] for d in f["defs"]}
     if tops is None:
         instantiated = {i["mod_name"] for d in defs.values() for i in d["insts"]}
         tops = [name for name in defs if name not in instantiated]
-
-    def add_children(node: Tree, mod_name: str, path: tuple[str, ...]) -> None:
-        for inst in defs[mod_name]["insts"]:
-            child = inst["mod_name"]
-            label = f"{inst['inst_name']} [dim]({child})[/dim]"
-            if child not in defs:
-                node.add(f"{label} [yellow](blackbox)[/yellow]")
-            elif child in path:
-                node.add(f"{label} [red](cycle)[/red]")
-            else:
-                add_children(node.add(label), child, path + (child,))
-
-    trees = []
     for top in tops:
-        if top not in defs:
+        if top in defs:
+            yield TreeLine("", top)
+            yield from _iter_subtree(defs, top, guides)
+
+
+class TreeStyle(NamedTuple):
+    """How to draw the tree: the guides, and the ANSI codes around each part of a line."""
+
+    guides: TreeGuides = TreeGuides()
+    root: str = ""
+    module: str = ""
+    blackbox: str = ""
+    cycle: str = ""
+    end: str = ""
+
+
+def tree_style() -> TreeStyle:
+    """Return the style for stdout.
+
+    Rich decides what the output can show, so ``NO_COLOR``, ``FORCE_COLOR``, ``TERM=dumb``,
+    pipes and encodings other than UTF-8 work like in the tables on stderr.
+    """
+    console = Console()
+    guides = _ASCII_GUIDES if console.options.ascii_only else TreeGuides()
+    if console.color_system in (None, "windows"):  # "windows" draws through the console API, not with codes.
+        return TreeStyle(guides)
+    colours = ("", "") if console.no_color else ("\x1b[33m", "\x1b[31m")
+    return TreeStyle(guides, "\x1b[1m", "\x1b[2m", *colours, "\x1b[0m")
+
+
+def render_tree_line(line: TreeLine, style: TreeStyle = TreeStyle()) -> str:
+    """Return *line* as text in *style*: ``guides inst (module) (marker)``, without a line end."""
+    end = style.end
+    if line.module is None:
+        return f"{style.root}{line.name}{end}"
+    text = f"{line.guide}{line.name} {style.module}({line.module}){end}"
+    if line.marker:
+        code = style.blackbox if line.marker == "blackbox" else style.cycle
+        text += f" {code}({line.marker}){end}" if code else f" ({line.marker})"
+    return text
+
+
+def _warn_unknown_tops(hierarchy: dict, tops: list[str]) -> None:
+    """Report each of the requested *tops* that shows no hierarchy: it failed, or nothing defines it."""
+    defined = {d["mod_name"] for f in hierarchy["files"] for d in f["defs"]}
+    failed = {t.lower() for t in hierarchy.get("failed_tops", [])}
+    for top in tops:
+        if top.lower() in failed:
+            _err.print(f"[red]error:[/red] top module {top!r} could not be elaborated, so nothing below it is shown")
+        elif top not in defined:
             _err.print(f"[yellow]warning:[/yellow] top module {top!r} not found")
-            continue
-        tree = Tree(f"[bold]{top}[/bold]")
-        add_children(tree, top, (top,))
-        trees.append(tree)
-    return trees
 
 
 def _print_tree(hierarchy: dict, tops: list[str] | None) -> None:
-    """Print the instance tree(s) to stdout.
+    """Print the instance tree(s) to stdout as they are walked, so a large tree shows up at once.
 
-    In a terminal, long lines wrap to the terminal width.  When piped, the width is
-    unbounded so no line is wrapped or cut off.
+    Rich's ``Tree`` takes minutes on hundreds of thousands of nodes, so this writes plain
+    lines.  They are never wrapped or cut off here; a terminal wraps long ones itself.  A
+    reader that goes away, such as ``head``, ends the program like it does for Rich: with
+    exit code 1 and no traceback.
     """
-    out = Console(highlight=False)
-    if not out.is_terminal:
-        out = Console(highlight=False, width=100_000)
-    for tree in build_tree(hierarchy, tops):
-        out.print(tree)
+    style = tree_style()
+    try:
+        for line in iter_tree(hierarchy, tops, style.guides):
+            sys.stdout.write(render_tree_line(line, style) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Python flushes stdout on exit too, which would complain about the same closed pipe.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
 
 
 def _make_yaml() -> YAML:
     """Return a configured ruamel.yaml instance."""
     yaml = YAML()
     yaml.default_flow_style = False
-    yaml.best_sequence_indent = 2
     return yaml
 
 
@@ -318,7 +360,11 @@ def _write_to(content: str, dest: str, label: str) -> None:
     if dest == "-":
         sys.stdout.write(content)
     else:
-        Path(dest).write_text(content, encoding="utf-8")
+        try:
+            Path(dest).write_text(content, encoding="utf-8")
+        except OSError as exc:
+            _err.print(f"[red]error:[/red] cannot write {label} to [bold]{dest}[/bold]: {exc.strerror}")
+            sys.exit(1)
         _err.print(f"[green]✓[/green] {label} written to [bold]{dest}[/bold]")
 
 
@@ -346,17 +392,13 @@ def _write_filelist(ordered: list[str], inc_dirs: list[str], dest: str, defines:
     _write_to("\n".join(lines), dest, f"filelist ({len(ordered)} files)")
 
 
-class _CommandFileAction(argparse.Action):  # pylint: disable=too-few-public-methods
-    """Collect ``-f``/``-F`` options as ``(flag, path)`` pairs, in command-line order."""
+def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentParser:
+    """Return the argument parser for the ``svhier`` CLI, with options from *frontends*.
 
-    def __call__(self, parser, namespace, values, option_string=None):
-        items = list(getattr(namespace, self.dest) or [])
-        items.append((option_string, values))
-        setattr(namespace, self.dest, items)
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    """Return the argument parser for the ``svhier`` CLI."""
+    Without *frontends*, uses the installed ones, so the docs show the bundled plugin's options.
+    """
+    if frontends is None:
+        frontends = discover_frontends()
     parser = argparse.ArgumentParser(
         prog="svhier",
         description="Show the module hierarchy of SystemVerilog sources, report what is missing, "
@@ -366,35 +408,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="*",
         metavar="PATH",
-        help=".sv/.v files or directories containing .sv/.v files. A file named directly wins over other "
+        help="Source files, or directories containing them. A file named directly wins over other "
              "files that define the same modules, interfaces or packages: those are dropped.",
-    )
-    parser.add_argument(
-        "-f",
-        "-F",
-        action=_CommandFileAction,
-        metavar="FILE",
-        dest="command_files",
-        default=[],
-        help="Read sources and options from a command file (filelist). Supports +incdir+, +define+, "
-             "nested -f/-F and ${VAR} environment variables. With -F, paths inside FILE are relative to FILE. "
-             "Repeatable.",
-    )
-    parser.add_argument(
-        "-I", "--include-dir",
-        action="append",
-        metavar="DIR",
-        default=[],
-        dest="include_dirs",
-        help="Add a directory to search for include files. Repeatable.",
-    )
-    parser.add_argument(
-        "-D", "--define",
-        action="append",
-        metavar="NAME[=VALUE]",
-        default=[],
-        dest="defines",
-        help="Define a preprocessor macro. Repeatable.",
     )
     parser.add_argument(
         "-r", "--recursive",
@@ -444,21 +459,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "-E", "--errors",
         action="store_true",
         default=False,
-        help="Print slang error diagnostics to stderr (by default only a count is shown).",
+        help="Print error diagnostics to stderr (by default only a count is shown).",
     )
     parser.add_argument(
         "-W", "--warnings",
         action="store_true",
         default=False,
-        help="Print slang error and warning diagnostics to stderr.",
+        help="Print error and warning diagnostics to stderr.",
     )
     parser.add_argument(
         "-x", "--ignore",
         action="append",
-        metavar="NAME",
+        metavar="PATTERN",
         default=None,
         dest="ignore",
-        help="Ignore files or directories whose name matches NAME. Repeatable.",
+        help="Skip files and directories whose whole name matches PATTERN, a name or a quoted glob "
+             "(case-insensitive). Only names below the given paths count. Applies to -y too. Repeatable.",
     )
     parser.add_argument(
         "-y", "--libdir",
@@ -466,120 +482,12 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         default=None,
         dest="libdirs",
-        help="Library directory, searched recursively. Only files defining otherwise missing "
-             "modules, interfaces or packages (and dirs of missing includes) are pulled in. Repeatable.",
+        help="Library directory, searched recursively by every language plugin. Only files defining "
+             "what is otherwise missing (and dirs of missing includes) are pulled in. Repeatable.",
     )
+    for frontend in frontends:
+        frontend.add_arguments(parser)
     return parser
-
-
-# Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
-_MAX_LIB_ROUNDS = 20
-
-
-def _add_pulled(
-    files: dict[str, tuple[Path, int]], incs: dict[str, Path],
-    sv_files: list[str], inc_dirs: list[str], pulled: list[tuple[str, Path, int]],
-) -> None:
-    """Extend *sv_files* / *inc_dirs* with one round of resolved library files and record them in *pulled*."""
-    for name, (path, others) in files.items():
-        if str(path) not in sv_files:
-            sv_files.append(str(path))
-        pulled.append((name, path, others))
-    for include, d in incs.items():
-        if str(d) not in inc_dirs:
-            inc_dirs.append(str(d))
-        pulled.append((include, d, 0))
-
-
-def _defined(entry: dict) -> list[tuple[str, str]]:
-    """Return ``(kind, name)`` for every module, interface and package a file entry defines."""
-    return ([("module", d["mod_name"]) for d in entry["defs"]]
-            + [("interface", n) for n in entry["ifaces"]]
-            + [("package", n) for n in entry["pkgs"]])
-
-
-def _overridden_files(hierarchy: dict, sv_files: list[str], explicit: set[Path]) -> dict[str, list[tuple[str, str]]]:
-    """Return the files in *sv_files* whose every definition is also defined by an *explicit* file.
-
-    The result maps each such file to the ``(kind, name)`` pairs it loses.  Files that
-    also define something no explicit file defines are kept, so nothing goes missing.
-    Files that came from a command file can't be dropped and are never returned.
-    """
-    by_path = {Path(f).resolve(): f for f in sv_files}
-    entries = [(Path(e["file_name"]).resolve(), e) for e in hierarchy["files"]]
-    wins = {item for path, e in entries if path in explicit for item in _defined(e)}
-    out: dict[str, list[tuple[str, str]]] = {}
-    for path, entry in entries:
-        items = _defined(entry)
-        if path in by_path and path not in explicit and items and set(items) <= wins:
-            out[by_path[path]] = items
-    return out
-
-
-@dataclass
-class _Resolved:
-    """Outcome of :func:`_parse_with_libs`."""
-
-    hierarchy: dict
-    pulled: list[tuple[str, Path, int]] = field(default_factory=list)  # (name, file, other candidates)
-    overridden: dict[str, list[tuple[str, str]]] = field(default_factory=dict)  # dropped file -> (kind, name)s
-
-
-def _parse_with_libs(
-    sv_files: list[str], inc_dirs: list[str], index: LibraryIndex | None, options: dict,
-    explicit: set[Path] | None = None,
-) -> _Resolved:
-    """Parse, then drop overridden files and pull in missing definitions until nothing changes.
-
-    Files whose definitions are all also defined by a file in *explicit* (resolved
-    paths passed by name on the command line) are dropped, so the explicit copy wins.
-    Missing definitions are pulled from *index*.  *options* are passed to
-    :func:`parse_files` as keyword arguments.  *sv_files* and *inc_dirs* are changed
-    in place.  The returned hierarchy is from the final parse, so diagnostics, missing
-    names and the exit code reflect the resolved design.
-    Raises ``ValueError`` if slang rejects the inputs.
-    """
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  console=_err, transient=True) as progress:
-        task = progress.add_task("Running slang elaboration…", total=None)
-        res = _Resolved(parse_files(sv_files, inc_dirs, **options))
-        for rnd in range(1, _MAX_LIB_ROUNDS + 1):
-            dropped = _overridden_files(res.hierarchy, sv_files, explicit) if explicit else {}
-            if dropped:
-                res.overridden.update(dropped)
-                sv_files[:] = [f for f in sv_files if f not in dropped]
-                progress.update(task, description="Dropping copies overridden by explicit files…")
-            else:
-                if index is None:
-                    break
-                loaded = [f["file_name"] for f in res.hierarchy["files"]]
-                files, incs = resolve_missing(res.hierarchy["missing"], index, loaded + list(res.overridden), inc_dirs)
-                if not files and not incs:
-                    break
-                _add_pulled(files, incs, sv_files, inc_dirs, res.pulled)
-                progress.update(task, description=f"Resolving from library dirs (round {rnd})…")
-            res.hierarchy = parse_files(sv_files, inc_dirs, **options)
-    return res
-
-
-def _print_overridden(hierarchy: dict, overridden: dict[str, list[tuple[str, str]]]) -> None:
-    """Print which names explicit files took over, and the copies that were dropped for them."""
-    if not overridden:
-        return
-    winner = {item: e["file_name"] for e in hierarchy["files"] for item in _defined(e)}
-    dropped: dict[tuple[str, str], list[str]] = {}
-    for f, items in overridden.items():
-        for item in items:
-            dropped.setdefault(item, []).append(f)
-    table = Table(title="Overridden by explicit files", show_header=True, header_style="bold cyan")
-    table.add_column("Name", style="bold")
-    table.add_column("Kind", style="yellow")
-    table.add_column("Used", style="green", overflow="fold")
-    table.add_column("Dropped", style="dim", overflow="fold")
-    for (kind, name), files in dropped.items():
-        shown = Path(files[0]).name + (f" (+{len(files) - 1} more)" if len(files) > 1 else "")
-        table.add_row(name, kind, winner.get((kind, name), ""), shown)
-    _err.print(table)
 
 
 def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
@@ -594,65 +502,132 @@ def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
     _err.print(table)
 
 
-def main():
-    """Entry point: parse arguments, run slang elaboration, emit tree, YAML and filelist.
+def _print_overridden(hierarchy: dict) -> None:
+    """Print which names files named on the command line took over, and the copies dropped for them."""
+    overridden: dict[str, list[tuple[str, str]]] = hierarchy.get("overridden", {})
+    if not overridden:
+        return
+    used = {item: e["file_name"] for e in hierarchy["files"] for item in defined_names(e)}
+    dropped: dict[tuple[str, str], list[str]] = {}
+    for fname, items in overridden.items():
+        for item in items:
+            dropped.setdefault(tuple(item), []).append(fname)
+    table = Table(title="Overridden by explicit files", show_header=True, header_style="bold cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Kind", style="yellow")
+    table.add_column("Used", style="green", overflow="fold")
+    table.add_column("Dropped", style="dim", overflow="fold")
+    for (kind, name), files in dropped.items():
+        table.add_row(name, kind, used.get((kind, name), ""), _first_and_more(files))
+    _err.print(table)
 
-    All Rich diagnostics (spinner, tables, warnings) go to stderr so stdout stays
-    clean for piped data.  Exits with code 1 if pyslang reports any error-level
-    diagnostics.
-    """
-    parser = _build_parser()
-    args = parser.parse_intermixed_args()
-    if not args.paths and not args.command_files:
-        parser.error("give at least one PATH or -f/-F command file")
 
-    ignore = {n.lower() for n in args.ignore} if args.ignore else set()
-    sv_files = collect_sv_files(args.paths, args.recursive, ignore)
-    inc_dirs = _dedupe(args.include_dirs + collect_inc_dirs(args.paths, args.recursive, ignore))
-    if not sv_files and not args.command_files:
-        _err.print("[red]error:[/red] no .sv/.v files found")
-        sys.exit(1)
+def _usable_frontends(frontends: list[Frontend]) -> list[Frontend]:
+    """Return the frontends that can run; warn about the others."""
+    usable = []
+    for frontend in frontends:
+        reason = frontend.unavailable_reason()
+        if reason:
+            _err.print(f"[yellow]warning:[/yellow] plugin {frontend.name!r} is disabled: {reason}")
+        else:
+            usable.append(frontend)
+    return usable
 
-    _err.print(Panel(
-        f"Parsing [bold cyan]{len(sv_files)}[/bold cyan] file(s)"
-        + (f" and [bold cyan]{len(args.command_files)}[/bold cyan] command file(s)" if args.command_files else "") + "…",
-        border_style="dim",
-        padding=(0, 1),
-    ))
 
-    index = LibraryIndex(args.libdirs, ignore) if args.libdirs else None
-    options = {"defines": args.defines, "tops": args.tops, "command_files": args.command_files}
-    loaded = {Path(f).resolve() for f in sv_files}
-    explicit = {Path(p).resolve() for p in args.paths if Path(p).is_file()} & loaded
-    try:
-        res = _parse_with_libs(sv_files, inc_dirs, index, options, explicit)
-    except ValueError as exc:
-        _err.print(f"[red]error:[/red] {exc}")
-        sys.exit(1)
-    hierarchy = res.hierarchy
+def _route_files(frontends: list[Frontend], files: list[str]) -> list[tuple[Frontend, list[str]]]:
+    """Return ``(frontend, files)`` for each usable frontend with inputs; warn about files nothing can read."""
+    usable = _usable_frontends(frontends)
+    routed: dict[int, list[str]] = {id(f): [] for f in usable}
+    fallback = next((f for f in usable if f.catch_all), None)
+    for fname in files:
+        suffix = Path(fname).suffix.lower()
+        owner = next((f for f in usable if suffix in f.suffixes), None)
+        if owner is None and suffix in KNOWN_SUFFIXES:
+            _err.print(f"[yellow]warning:[/yellow] skipping {fname}: install and enable {KNOWN_SUFFIXES[suffix]} to read it")
+        elif (owner or fallback) is not None:
+            routed[id(owner or fallback)].append(fname)
+    if not any(routed[id(f)] or f.extra_inputs() for f in usable):
+        return []
+    # A frontend with only -y still joins in, in case another language instantiates what it finds.
+    return [(f, routed[id(f)]) for f in usable if routed[id(f)] or f.extra_inputs() or f.has_library()]
 
+
+def _report(hierarchy: dict, args) -> None:
+    """Print the tables and notes."""
     _print_diagnostics(hierarchy, errors=args.errors, warnings=args.warnings)
 
     if args.summary:
         _print_summary(hierarchy)
 
-    _print_pulled(res.pulled)
-    _print_overridden(hierarchy, res.overridden)
+    _print_pulled(hierarchy.get("pulled", []))
+    _print_overridden(hierarchy)
     _print_duplicates(hierarchy)
     _print_missing(hierarchy)
+    for note in hierarchy.get("frontend_notes", []):
+        _err.print(f"[yellow]note:[/yellow] {note}")
+    _warn_unknown_tops(hierarchy, hierarchy["tops"] or args.tops)
 
-    show_tree = args.tree
-    if show_tree is None:
-        show_tree = "-" not in (args.yaml, args.filelist)
-    if show_tree:
-        _print_tree(hierarchy, args.tops or None)
 
+def _write_outputs(hierarchy: dict, args) -> None:
+    """Write the requested YAML and filelist, then print the tree.
+
+    The tree comes last so that a large tree, or stopping it, can't cost the files.
+    """
     if args.yaml is not None:
         _write_yaml(hierarchy, args.yaml)
 
     if args.filelist is not None:
         ordered = compute_filelist(hierarchy)
-        _write_filelist(ordered, _dedupe(inc_dirs + hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
+        _write_filelist(ordered, _dedupe(hierarchy["inc_dirs"]), args.filelist, hierarchy["defines"])
+
+    show_tree = args.tree
+    if show_tree is None:
+        show_tree = "-" not in (args.yaml, args.filelist)
+    if show_tree:
+        _print_tree(hierarchy, hierarchy["tops"] or args.tops or None)
+
+
+def main():
+    """Entry point: parse arguments, elaborate through the plugins, emit tree, YAML and filelist.
+
+    All Rich diagnostics (spinner, tables, warnings) go to stderr so stdout stays
+    clean for piped data.  Exits with code 1 if a plugin reports any error-level
+    diagnostics.
+    """
+    frontends = discover_frontends(lambda name, exc: _err.print(f"[yellow]warning:[/yellow] plugin {name!r} failed to load: {exc}"))
+    parser = _build_parser(frontends)
+    args = parser.parse_intermixed_args()
+    for frontend in frontends:
+        frontend.configure(args)
+    foreign = [path for frontend in frontends for path in frontend.foreign_files()]
+    if not args.paths and not foreign and not any(f.extra_inputs() for f in frontends):
+        parser.error("give at least one PATH or an input option such as -f (see --help)")
+
+    ignore = {n.lower() for n in args.ignore} if args.ignore else set()
+    suffixes = tuple(suffix for frontend in frontends for suffix in frontend.suffixes)
+    inputs = _route_files(frontends, collect_source_files(args.paths + foreign, args.recursive, suffixes, ignore))
+    if not inputs:
+        _err.print("[red]error:[/red] no source files found")
+        sys.exit(1)
+
+    extras = "".join(f" and [bold cyan]{extra}[/bold cyan]" for f, _ in inputs for extra in f.extra_inputs())
+    _err.print(Panel(
+        f"Parsing [bold cyan]{sum(len(files) for _, files in inputs)}[/bold cyan] file(s){extras}…",
+        border_style="dim",
+        padding=(0, 1),
+    ))
+
+    try:
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      console=_err, transient=True) as progress:
+            progress.add_task("Elaborating…", total=None)
+            hierarchy = stitch(inputs, list(args.tops or []))
+    except ValueError as exc:
+        _err.print(f"[red]error:[/red] {exc}")
+        sys.exit(1)
+
+    _report(hierarchy, args)
+    _write_outputs(hierarchy, args)
 
     if hierarchy["has_errors"]:
         sys.exit(1)

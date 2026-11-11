@@ -12,8 +12,8 @@ cd cva6
 ## 1. Look at the tree
 
 Point svhier at the RTL and tell it which module is the top. `-r` searches
-directories recursively. `-x` skips any path containing that name, here the
-testbenches.
+directories recursively. `-x` skips files and directories with that name
+(globs work too), here the testbench directories.
 
 ```bash
 svhier -r core -x test -x tb --top cva6
@@ -102,10 +102,6 @@ Pick yours by naming it on the command line. The other 18 copies are dropped
 ```bash
 svhier core/include/cv64a6_imafdc_sv39_config_pkg.sv -r core -y common -y vendor -x test -x tb --top cva6
 ```
-
-With the 64-bit config, `btb` shows up as **Not found**. That's `-x tb` at
-work: it matches any path component that *contains* `tb`, which includes
-`core/frontend/btb.sv`.
 
 :::{tip}
 CVA6 has a project filelist that picks one target. Pass it with `-f` to get a

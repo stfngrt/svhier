@@ -33,12 +33,23 @@ contains `.svh`/`.vh` headers is added to the include path automatically.
 A file named directly wins over other files that define the same modules,
 interfaces or packages. See {ref}`explicit-wins`.
 
-`-x NAME` skips any file or directory with a path component that contains
-`NAME` (case-insensitive). It can be repeated, and applies to library
-directories too:
+With the [VHDL plugin](vhdl.md), `.vhd` and `.vhdl` files count too.
+
+`-x PATTERN` skips any file or directory below the paths you pass whose whole
+name matches `PATTERN` (case-insensitive). `PATTERN` is a name or a glob:
+
+| Option | Skips | Keeps |
+|--------|-------|-------|
+| `-x tb` | `rtl/tb/` and everything in it | `rtl/btb.sv`, `rtl/fifo_tb.sv` |
+| `-x fifo_tb.sv` | `rtl/fifo_tb.sv` | `rtl/fifo.sv` |
+| `-x '*_tb.sv'` | `rtl/fifo_tb.sv`, `rtl/sub/ram_tb.sv` | `rtl/btb.sv` |
+
+Quote globs so the shell doesn't expand them. Directories above or named by a
+path you pass never match, and a file you pass directly is only checked by its
+own name. `-x` can be repeated, and applies to library directories too:
 
 ```bash
-svhier -r rtl/ -x test -x tb -x xilinx
+svhier -r rtl/ -x test -x tb -x '*_tb.sv' -x xilinx
 ```
 
 (command-files)=
@@ -58,6 +69,10 @@ svhier -f $CVA6_REPO_DIR/core/Flist.cva6 --top cva6 --filelist cva6.f
 
 With `-F FILE`, paths inside FILE are resolved relative to FILE. With `-f`,
 they're resolved relative to the working directory.
+
+`.vhd` and `.vhdl` entries go to the [VHDL plugin](vhdl.md) instead of slang, so
+a filelist can list both languages, or only VHDL. Without the plugin, they're
+skipped with a warning.
 
 :::{tip}
 A project filelist usually picks one variant of each config package or

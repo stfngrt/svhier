@@ -15,8 +15,8 @@ svhier -r rtl/ -y vendor/ -y third_party/
 2. Every `-y` directory is indexed **recursively** for module, interface and
    package definitions, and for `.svh`/`.vh` headers.
 3. For each missing module, interface or package, the defining file is added
-   to the compilation. For each missing `` `include ``, the directory it lives
-   under is added as an include dir.
+   to the compilation. For each missing `` `include ``, the directory holding a
+   file of that name is added as an include dir, whatever the file's suffix.
 4. svhier re-parses and repeats until nothing new resolves, so dependencies of
    dependencies are found too.
 
@@ -57,6 +57,25 @@ svhier -r rtl/ -y vendor/ -x xilinx
 ```
 
 :::{note}
-`-x` applies to library directories too. Any path with a component that
-contains the given name (case-insensitive) is skipped.
+`-x` applies to library directories too. Any file or directory below the
+library directory whose whole name matches the given name or glob
+(case-insensitive) is skipped.
 :::
+
+## Mixed designs
+
+With the [VHDL plugin](vhdl.md), `-y` searches for `.vhd` and `.vhdl` files
+too, and either language can find what the other needs. Only what the design
+needs comes in:
+
+- **An instance with no definition in any source** pulls in the file defining it,
+  whichever language that file is in. Names match in any case, since VHDL's are
+  case-insensitive.
+- **`use lib.pkg.all` and `entity lib.unit`** pull in the units they name, because
+  VHDL can't compile without them.
+- **Architectures and package bodies in their own files** come along if they're
+  in the same directory as the entity or package.
+- **Sources always win.** If a source file in either language defines a name,
+  `-y` isn't searched for it.
+
+With `--top`, modules and entities outside the top's tree don't pull anything in.

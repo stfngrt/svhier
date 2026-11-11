@@ -25,6 +25,7 @@ The table only appears when something is missing.
 | **blackbox module** | A module is instantiated but never defined. |
 | **interface** | An interface is used but never defined. |
 | **package** | A package is imported or referenced (`pkg::name`) but never defined. |
+| **unit** | A VHDL package, entity or library is used but never defined, as `library.unit` outside the work library. Only reported when that stopped elaboration. |
 | **include** | An `` `include `` file can't be found on the include path. |
 | **macro** | A `` `MACRO `` is used but never `` `define ``d. |
 
@@ -100,7 +101,8 @@ that are both passed by name don't override each other.
 - **Pass the missing files or directories** as extra paths.
 - **Let svhier find them** with [library directories](libdirs.md) (`-y`).
 - **Exclude what you don't need.** If only testbenches want a missing
-  module, skip them with `-x tb`.
+  module, skip them by directory or file name, as in `-x tb` or
+  `-x '*_tb.sv'`.
 - **For duplicates, name the copy you want** as a file argument (see
   {ref}`explicit-wins`), or use the project's filelist (`-f`), which
   usually picks one variant per name. See {ref}`command-files`.

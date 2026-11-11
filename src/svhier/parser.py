@@ -11,32 +11,38 @@ Elaboration works in two phases:
 2. **Elaboration phase** — ``compilation.getRoot().topInstances`` seeds a depth-first walk
    (:func:`_walk_instances`) that visits every unique (definition, parameter values) pair
    once.  Definitions are keyed by ``(name, file)``, so duplicate module names in
-   different files stay apart.  Child lists are merged per definition, so a module whose
-   generate branches depend on its parameters lists the children of every setting.
+   different files stay apart.  ``insts`` merges the children per definition, so a module
+   whose generate branches depend on its parameters lists the children of every setting.
+   ``variants`` keeps them per setting, which is what the instance tree is built from.
 
 Modules that are defined but never instantiated are unreachable via ``topInstances``
 and appear in the output with an empty ``insts`` list.
 """
 
+import re
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from typing import Any, cast
 
-import networkx as nx
 from pyslang import DiagnosticEngine, Diags, SourceManager, TextDiagnosticClient
 from pyslang.ast import (
     Compilation,
     DefinitionKind,
     DefinitionSymbol,
+    ExplicitImportSymbol,
     InstanceBodySymbol,
     InstanceSymbol,
     SymbolKind,
+    WildcardImportSymbol,
 )
 from pyslang.driver import Driver
-from pyslang.syntax import SyntaxKind, SyntaxTree
+from pyslang.syntax import ModuleDeclarationSyntax, SyntaxKind, SyntaxTree
 
-_IMPORT_KINDS = (SymbolKind.WildcardImport, SymbolKind.ExplicitImport)
+from svhier.filelist import compute_filelist  # noqa: F401  pylint: disable=unused-import
+
 # Scopes that can hold module instances without being a module themselves.
 _CONTAINER_KINDS = (SymbolKind.GenerateBlock, SymbolKind.GenerateBlockArray, SymbolKind.InstanceArray)
 _COMMAND_FILE_FLAGS = ("-f", "-F")
@@ -51,26 +57,41 @@ _MISSING_CODES = {
     Diags.CouldNotOpenIncludeFile: "includes",
     Diags.UnknownDirective: "macros",
 }
+#: The categories of ``missing`` in a :func:`parse_files` result.
 MISSING_KINDS = ("modules", "interfaces", "packages", "includes", "macros")
 
-# (name, canonical file) — identifies one definition even when the name is reused.
+#: (name, canonical file) — identifies one definition even when the name is reused.
 DefKey = tuple[str, str]
+#: The parameter values of an instance as strings — identifies one setting of a definition.
+ParamSig = tuple[str, ...]
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
+def _resolve(path: str) -> str:
+    """Return *path* made absolute with symlinks resolved.
+
+    Cached, because one run asks for the same few hundred files hundreds of thousands of
+    times and ``Path.resolve`` costs a ``lstat`` per path component.  :func:`parse_files`
+    clears the cache when it starts, so files that moved between calls are seen.
+    """
+    return str(Path(path).resolve())
+
+
 def _canon(sm: SourceManager, loc) -> str:
     """Return the resolved path of the file that *loc* (possibly inside a macro) belongs to."""
-    return str(Path(sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer)).resolve())
+    return _resolve(sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer))
 
 
 def _definitions_by_file(compilation: Compilation, sm: SourceManager, kind) -> dict[str, list[DefinitionSymbol]]:
     """Return canonical file -> ``DefinitionSymbol`` s of *kind* defined there (``getDefinitions`` order)."""
     by_file: dict[str, list[DefinitionSymbol]] = {}
     for defn in compilation.getDefinitions():
-        if defn.definitionKind == kind:
+        # This also returns primitives and config blocks, which have no definition kind.
+        if isinstance(defn, DefinitionSymbol) and defn.definitionKind == kind:
             by_file.setdefault(_canon(sm, defn.location), []).append(defn)
     return by_file
 
@@ -117,7 +138,7 @@ def _collect_imports(body: InstanceBodySymbol) -> list[str]:
     """Return deduplicated package names imported by an instance body."""
     imports: list[str] = []
     for child in body:
-        if child.kind in _IMPORT_KINDS:
+        if isinstance(child, (WildcardImportSymbol, ExplicitImportSymbol)):
             pkg = child.packageName
             if pkg and pkg not in imports:
                 imports.append(pkg)
@@ -148,7 +169,7 @@ def _iter_module_instances(scope, *, blackboxes: bool = False) -> Iterator:
             yield from _iter_module_instances(child, blackboxes=blackboxes)
 
 
-def _param_signature(body: InstanceBodySymbol) -> tuple[str, ...]:
+def _param_signature(body: InstanceBodySymbol) -> ParamSig:
     """Return the parameter values of *body* as strings, used to spot repeated settings."""
     sig = []
     for param in body.parameters:
@@ -164,36 +185,91 @@ class _Walk:
     """Result of walking the elaborated tree, keyed by :data:`DefKey`."""
 
     sm: SourceManager
-    insts: dict[DefKey, list[InstanceSymbol]] = field(default_factory=dict)
+    # The instance visited for each setting, with its children and their settings.  Blackboxes have none.
+    insts: dict[DefKey, dict[ParamSig, InstanceSymbol]] = field(default_factory=dict)
+    children: dict[tuple[DefKey, ParamSig], list[tuple[Any, ParamSig | None]]] = field(default_factory=dict)
+    top_variants: dict[DefKey, ParamSig] = field(default_factory=dict)
     imports: dict[DefKey, list[str]] = field(default_factory=dict)
+    blackbox_params: dict[str, list[dict]] = field(default_factory=dict)
+    _files: dict[tuple[int, int], str] = field(default_factory=dict)  # (buffer id, offset) -> canonical file
 
     def key(self, defn: DefinitionSymbol) -> DefKey:
-        """Return the :data:`DefKey` of *defn*."""
-        return (defn.name, _canon(self.sm, defn.location))
+        """Return the :data:`DefKey` of *defn*.  Every instance asks, but few locations differ."""
+        loc = defn.location
+        where = (loc.buffer.id, loc.offset)
+        canonical = self._files.get(where)
+        if canonical is None:
+            canonical = self._files[where] = _canon(self.sm, loc)
+        return (defn.name, canonical)
+
+
+_NAMED_INT_PARAM = re.compile(r"\.(\w+)\s*\(\s*(\d+)\s*\)")
+
+
+def _blackbox_params(inst) -> dict:
+    """Return the parameters of a blackbox instance that are readable without elaboration.
+
+    slang doesn't evaluate parameters of unknown modules, so only the syntax is available.
+    Returns ``{"generics": {name: value}, "unresolved": [text]}``.
+    """
+    syntax = inst.syntax.parent.parameters if inst.syntax is not None and hasattr(inst.syntax.parent, "parameters") else None
+    use: dict = {"generics": {}, "unresolved": []}
+    if syntax is None:
+        return use
+    text = str(syntax).strip()[2:-1]  # strip "#(" and ")"
+    for part in re.split(r",(?![^()]*\))", text):
+        match = _NAMED_INT_PARAM.fullmatch(part.strip())
+        if match:
+            use["generics"][match.group(1)] = match.group(2)
+        elif part.strip():
+            use["unresolved"].append(part.strip())
+    return use
+
+
+def _parameter_names(defn: DefinitionSymbol) -> list[str]:
+    """Return the parameters of *defn* that can be overridden.  Works without elaborating it."""
+    syntax = cast(ModuleDeclarationSyntax, defn.syntax)
+    declarations = list(syntax.header.parameters.declarations) if syntax.header.parameters is not None else []
+    declarations += [m.parameter for m in syntax.members if hasattr(m, "parameter")]
+    names = []
+    for declaration in declarations:
+        if hasattr(declaration, "declarators") and str(declaration.keyword).strip() != "localparam":
+            names += [str(d.name).strip() for d in declaration.declarators if hasattr(d, "name")]
+    return names
 
 
 def _walk_instances(tops, sm: SourceManager) -> _Walk:
     """Depth-first walk of the elaborated instance tree below *tops*.
 
     Every unique (definition, parameter values) pair is visited once; its instance is
-    appended to ``walk.insts[key]`` and its imports merged into ``walk.imports[key]``.
-    Instances with parameters already seen are skipped, since they elaborate the same
-    way.  Iterative, so deep hierarchies cannot hit Python's recursion limit.
+    stored in ``walk.insts[key][sig]``, its children in ``walk.children[key, sig]``, and its
+    imports merged into ``walk.imports[key]``.  Instances with parameters already seen are
+    skipped, since they elaborate the same way.  Iterative, so deep hierarchies cannot hit
+    Python's recursion limit.
     """
     walk = _Walk(sm)
-    seen: set[tuple[DefKey, tuple[str, ...]]] = set()
-    stack: list[InstanceSymbol] = list(reversed(list(tops)))
+    stack: list[tuple[InstanceSymbol, ParamSig]] = [(top, _param_signature(top.body)) for top in reversed(list(tops))]
+    for top, sig in stack:
+        walk.top_variants.setdefault(walk.key(top.definition), sig)
     while stack:
-        inst = stack.pop()
+        inst, sig = stack.pop()
         key = walk.key(inst.definition)
-        sig = (key, _param_signature(inst.body))
-        if sig in seen:
+        if (key, sig) in walk.children:
             continue
-        seen.add(sig)
-        walk.insts.setdefault(key, []).append(inst)
+        walk.insts.setdefault(key, {})[sig] = inst
         imports = walk.imports.setdefault(key, [])
         imports.extend(p for p in _collect_imports(inst.body) if p not in imports)
-        stack.extend(reversed(list(_iter_module_instances(inst.body))))
+        children = walk.children[key, sig] = []
+        for child in _iter_module_instances(inst.body, blackboxes=True):
+            if child.kind == SymbolKind.UninstantiatedDef:
+                children.append((child, None))
+                uses = walk.blackbox_params.setdefault(child.definitionName, [])
+                use = _blackbox_params(child)
+                if use not in uses:
+                    uses.append(use)
+            else:
+                children.append((child, _param_signature(child.body)))
+        stack.extend((child, child_sig) for child, child_sig in reversed(children) if child_sig is not None)
     return walk
 
 
@@ -248,30 +324,39 @@ def _collect_diagnostics(
     return diag_list, engine.numErrors > 0
 
 
+def _relative_name(child, parent_path: str) -> str:
+    """Return the path of the instance *child* relative to the instance at *parent_path*."""
+    path = child.hierarchicalPath
+    return path[len(parent_path) + 1:] if path.startswith(parent_path + ".") else child.name
+
+
 def _build_def_entry(defn: DefinitionSymbol, walk: _Walk) -> dict:
     """Build the output dict for a single module definition.
 
     ``inst_name`` is the child's hierarchical path relative to the parent module,
     so instances inside generate blocks or instance arrays get names like
-    ``g_loop[0].u_core`` or ``u_arr[1]``.  Children of every walked parameter
-    setting are merged, first seen first, without repeats.
+    ``g_loop[0].u_core`` or ``u_arr[1]``.  ``insts`` merges the children of every walked
+    parameter setting, first seen first, without repeats.  ``variants`` has them per
+    setting, each child naming the setting it uses in turn.
     """
     key = walk.key(defn)
     insts: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for parent in walk.insts.get(key, []):
-        prefix = parent.hierarchicalPath + "."
-        for child in _iter_module_instances(parent.body, blackboxes=True):
-            path = child.hierarchicalPath
-            inst_name = path[len(prefix):] if path.startswith(prefix) else child.name
-            if child.kind == SymbolKind.UninstantiatedDef:
-                mod_name = child.definitionName
-            else:
-                mod_name = child.definition.name
+    variants: dict[ParamSig, list[dict]] = {}
+    for sig, parent in walk.insts.get(key, {}).items():
+        parent_path = parent.hierarchicalPath
+        children = variants[sig] = []
+        for child, child_sig in walk.children[key, sig]:
+            inst_name = _relative_name(child, parent_path)
+            mod_name = child.definition.name if child_sig is not None else child.definitionName
+            children.append({"mod_name": mod_name, "inst_name": inst_name, "variant": child_sig})
             if (mod_name, inst_name) not in seen:
                 seen.add((mod_name, inst_name))
                 insts.append({"mod_name": mod_name, "inst_name": inst_name})
-    return {"mod_name": defn.name, "pkg_imports": walk.imports.get(key, []), "insts": insts}
+    entry = {"mod_name": defn.name, "pkg_imports": walk.imports.get(key, []), "insts": insts, "variants": variants}
+    if key in walk.top_variants:
+        entry["top_variant"] = walk.top_variants[key]
+    return entry
 
 
 def _quote(arg: str) -> str:
@@ -288,15 +373,21 @@ class _Inputs:
     defines: list[str]
     tops: list[str]
     command_files: list[tuple[str, str]]
+    params: dict[str, str] = field(default_factory=dict)
+    exclude_exts: list[str] = field(default_factory=list)
 
     def args(self) -> list[str]:
         """Return the slang command line (without the program name)."""
+        # slang only applies an exclusion to the files named after it.
+        args = [arg for ext in self.exclude_exts for arg in ("--exclude-ext", ext)]
         # Defaults matching a plain ``Compilation``: a fixed default timescale, and a
         # top module with interface ports (a sub-design parsed alone) is not an error.
-        args = ["--timescale", "1ns/1ns", "--allow-toplevel-iface-ports", *self.files]
+        args += ["--timescale", "1ns/1ns", "--allow-toplevel-iface-ports", *self.files]
         for flag, values in (("-I", self.inc_dirs), ("-D", self.defines), ("--top", self.tops)):
             for value in values:
                 args += [flag, value]
+        for name, value in self.params.items():
+            args += ["-G", f"{name}={value}"]
         for flag, path in self.command_files:
             if flag not in _COMMAND_FILE_FLAGS:
                 raise ValueError(f"command file flag must be -f or -F, got {flag!r}")
@@ -319,17 +410,34 @@ def _run_driver(inputs: _Inputs, extra: list[str] | None = None) -> tuple[Driver
     return driver, driver.createCompilation(), load_errors
 
 
+def command_files_have_sources(command_files: list[tuple[str, str]], exclude_exts: list[str]) -> bool:
+    """Return whether slang would read any source from *command_files*, apart from *exclude_exts*.
+
+    A command line slang rejects counts as having sources, so that it gets to report why.
+    """
+    driver = Driver()
+    driver.addStandardArgs()
+    args = _Inputs([], [], [], [], command_files, exclude_exts=exclude_exts).args()
+    return not driver.parseCommandLine(" ".join(_quote(a) for a in ["svhier", *args])) or driver.sourceLoader.hasFiles
+
+
 def _trimmed_files(driver: Driver, depfile: Path) -> set[str]:
     """Return the canonical source files the requested tops need.
 
     The driver must have been given ``--top``, ``--depfile-trim`` and ``--Mmodule <depfile>``.
     slang's trimming follows module, interface, package and class references, so it is the
     authority on which files a top needs.
+
+    Writing the depfile warns directly on stderr about every name without a source file,
+    including names only used in untaken generate branches.  Real gaps are in ``missing``
+    and a bad ``--top`` is an elaboration error, so those warnings are switched off here.
+    Warnings about the command line itself were already printed by then.
     """
+    driver.diagEngine.setWarningOptions(["no-command-line"])
     driver.optionallyWriteDepFiles()
     if not depfile.exists():
         return set()
-    return {str(Path(line.strip()).resolve()) for line in depfile.read_text().splitlines() if line.strip()}
+    return {_resolve(line.strip()) for line in depfile.read_text().splitlines() if line.strip()}
 
 
 def _include_dirs(trees: list[SyntaxTree], sm: SourceManager) -> list[str]:
@@ -370,7 +478,8 @@ def _build_tables(compilation: Compilation, sm: SourceManager) -> _Tables:
     for table, kind in ((modules, "module"), (ifaces, "interface")):
         for defs in table.values():
             for defn in defs:
-                found = compilation.tryGetDefinition(defn.name, root).definition
+                # The binding converts a root symbol to the Scope it asks for; the stubs don't say so.
+                found = compilation.tryGetDefinition(defn.name, root).definition  # type: ignore[arg-type]
                 if found is not None:
                     used[(kind, defn.name)] = _canon(sm, found.location)
     for names in pkgs.values():
@@ -413,12 +522,12 @@ def _collect_input_files(driver: Driver, file_paths: list[str]) -> list[tuple[st
     command file are named by the absolute path slang loaded.
     """
     sm = driver.sourceManager
-    explicit = {str(Path(p).resolve()): p for p in file_paths}
+    explicit = {_resolve(p): p for p in file_paths}
     out = []
     for tree in driver.syntaxTrees:
         loc = tree.root.getLastToken().location  # EOF token: always in the file itself
         full = sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer)
-        canonical = str(Path(full).resolve())
+        canonical = _resolve(full)
         out.append((explicit.get(canonical, str(full)), canonical, tree))
     return out
 
@@ -444,6 +553,16 @@ def _build_file_entries(walk: _Walk, tables: _Tables, files: list[tuple[str, str
     return entries
 
 
+def _strip_frontend_info(result: dict) -> None:
+    """Remove from *result* what is only for :mod:`svhier.slang_frontend`."""
+    for key in ("blackbox_params", "invalid_tops", "parameter_names", "elaborated_tops"):
+        del result[key]
+    for entry in result["files"]:
+        for unit in entry["defs"]:
+            del unit["variants"]
+            unit.pop("top_variant", None)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -455,6 +574,11 @@ def parse_files(  # pylint: disable=too-many-arguments
     defines: list[str] | None = None,
     tops: list[str] | None = None,
     command_files: list[tuple[str, str]] | None = None,
+    params: dict[str, str] | None = None,
+    exclude_exts: list[str] | None = None,
+    frontend_info: bool = False,
+    pull: Callable[[dict], bool] | None = None,
+    max_pulls: int = 0,
 ) -> dict:
     """Parse SystemVerilog sources and return the module/instance hierarchy.
 
@@ -464,11 +588,21 @@ def parse_files(  # pylint: disable=too-many-arguments
     * *inc_dirs* — `` `include`` search directories (``-I``).
     * *defines* — macro definitions, ``NAME`` or ``NAME=VALUE`` (``-D``).
     * *tops* — top module names (``--top``).  When given, only these are elaborated
-      and :func:`compute_filelist` keeps only the files they need.
+      and :func:`~svhier.filelist.compute_filelist` keeps only the files they need.
     * *command_files* — ``("-f", path)`` or ``("-F", path)`` pairs.  Command files may
       use ``+incdir+``, ``+define+``, nested ``-f``/``-F`` and ``${VAR}`` environment
       variables.  ``-F`` resolves paths relative to the command file, ``-f`` relative to
       the working directory.
+    * *params* — parameter values for the top modules, ``{name: SystemVerilog expression}``.
+      Names are case-sensitive; slang ignores names a top doesn't have.
+    * *pull* — called after loading, up to *max_pulls* times, with ``{"files": [...],
+      "missing": ...}``: each loaded file with its ``file_name``, ``defs`` (only ``mod_name``),
+      ``ifaces`` and ``pkgs``, and the ``missing`` of the result.  When it returns true it has
+      changed *file_paths* or *inc_dirs*, which are read again, and the sources are reloaded.
+      Only the last load is walked and returned in full, so a caller that searches library
+      directories doesn't pay for the hierarchy of every round.
+    * *exclude_exts* — suffixes without the dot; slang skips files with these, wherever
+      they're named.
 
     See the module docstring for the elaboration model.  Raises ``ValueError`` if slang
     rejects the inputs (for example a missing command file).
@@ -487,11 +621,13 @@ def parse_files(  # pylint: disable=too-many-arguments
           where slang uses the other copy (internal).
         * ``refs`` — sorted package / interface names defined in *other* input
           files that this file references, by import, ``pkg::name``, interface
-          port or interface instance (internal; used by :func:`compute_filelist`).
+          port or interface instance (internal; used by :func:`~svhier.filelist.compute_filelist`).
         * ``defs`` — list of module definitions, each with ``mod_name``,
           ``pkg_imports`` (omitted from YAML when empty), and ``insts``
           (list of ``{"mod_name": str, "inst_name": str}``).  A shadowed copy of a
-          module is not elaborated and has no ``insts``.
+          module is not elaborated and has no ``insts``.  With *frontend_info*, also
+          ``variants`` and, for tops, ``top_variant``: the children per parameter
+          setting, for the instance tree (see :func:`_build_def_entry`).
 
     ``duplicates``
         One ``{"name", "kind", "files", "used"}`` dict per module, interface or package
@@ -525,98 +661,106 @@ def parse_files(  # pylint: disable=too-many-arguments
         for each kind in :data:`MISSING_KINDS` (see :func:`_collect_missing`).
         Instances of missing modules (blackboxes) are still listed in ``insts``.
     """
-    inputs = _Inputs(list(file_paths), list(inc_dirs or []), list(defines or []),
-                     list(tops or []), list(command_files or []))
+    _resolve.cache_clear()
+    include_dirs = inc_dirs if inc_dirs is not None else []  # Read again after each pull.
+
+    def current() -> _Inputs:
+        return _Inputs(list(file_paths), list(include_dirs), list(defines or []),
+                       list(tops or []), list(command_files or []), dict(params or {}), list(exclude_exts or []))
+
     with tempfile.TemporaryDirectory() as tmp:
-        return _elaborate(inputs, Path(tmp) / "modules.d")
+        result = _elaborate(current, Path(tmp) / "modules.d", pull, max_pulls)
+    if not frontend_info:
+        _strip_frontend_info(result)
+    return result
 
 
-def _elaborate(inputs: _Inputs, depfile: Path) -> dict:
-    """Run slang on *inputs* and build the :func:`parse_files` result.
+@dataclass
+class _Loaded:
+    """One load of the sources: slang's state, and what the rounds that settle on it have computed."""
 
-    *depfile* is a scratch path for slang's trimmed module list (used with tops only).
+    inputs: _Inputs
+    driver: Driver
+    compilation: Compilation
+    load_errors: list[str]
+    files: list[tuple[str, str, SyntaxTree]]
+    walk: _Walk
+    missing: dict[str, dict[str, list[str]]] | None = None
+
+    @property
+    def sm(self) -> SourceManager:
+        """The driver's source manager."""
+        return self.driver.sourceManager
+
+    @property
+    def pairs(self) -> list[tuple[str, str]]:
+        """``(file_name, canonical)`` per loaded file."""
+        return [(f, c) for f, c, _ in self.files]
+
+    def round_summary(self) -> dict:
+        """Return what *pull* is given: each file with the names it defines, and what is missing."""
+        modules = _definitions_by_file(self.compilation, self.sm, DefinitionKind.Module)
+        ifaces = _definitions_by_file(self.compilation, self.sm, DefinitionKind.Interface)
+        pkgs = _packages_by_file(self.compilation, self.sm)
+        files = [{"file_name": f,
+                  "defs": [{"mod_name": d.name} for d in modules.get(c, [])],
+                  "ifaces": [d.name for d in ifaces.get(c, [])],
+                  "pkgs": pkgs.get(c, [])} for f, c in self.pairs]
+        return {"files": files, "missing": self.collect_missing()}
+
+    def collect_missing(self) -> dict[str, dict[str, list[str]]]:
+        """Return the ``missing`` of the result, collected once."""
+        if self.missing is None:
+            self.missing = _collect_missing(self.compilation, self.sm, {c: f for f, c in self.pairs})
+        return self.missing
+
+
+def _load(inputs: _Inputs, depfile: Path) -> _Loaded:
+    """Load *inputs* and walk the instances, which is all that deciding on another round needs.
+
+    The walk elaborates parts of the design that the diagnostics alone don't reach, and some
+    of the missing names only show up there.
     """
     extra = ["--Mmodule", str(depfile), "--depfile-trim"] if inputs.tops else []
     driver, compilation, load_errors = _run_driver(inputs, extra)
-    sm = driver.sourceManager
-    files = _collect_input_files(driver, inputs.files)
-    tables = _build_tables(compilation, sm)
-    walk = _walk_instances(compilation.getRoot().topInstances, sm)
-    needed = _trimmed_files(driver, depfile) if inputs.tops else None
-    diags, has_errors = _collect_diagnostics(compilation, sm)
-    pairs = [(f, c) for f, c, _ in files]
-    return {
-        "files": _build_file_entries(walk, tables, files),
-        "duplicates": _find_duplicates(tables, pairs),
-        "tops": inputs.tops,
-        "needed": None if needed is None else [f for f, c in pairs if c in needed],
-        "defines": list(driver.createOptionBag().preprocessorOptions.predefines),
-        "inc_dirs": _include_dirs(driver.syntaxTrees, sm),
-        "diagnostics": [{"severity": "error", "file": "", "message": e} for e in load_errors] + diags,
-        "has_errors": has_errors or bool(load_errors),
-        "missing": _collect_missing(compilation, sm, dict((c, f) for f, c in pairs)),
-    }
+    walk = _walk_instances(compilation.getRoot().topInstances, driver.sourceManager)
+    return _Loaded(inputs, driver, compilation, load_errors, _collect_input_files(driver, inputs.files), walk)
 
 
-def _file_deps(entry: dict, mod_to_file: dict[str, str], pkg_to_file: dict[str, str]) -> set[str]:
-    """Return the other input files that the file *entry* depends on."""
-    names = [(mod_to_file, i["mod_name"]) for d in entry["defs"] for i in d.get("insts", [])]
-    names += [(pkg_to_file, p) for d in entry["defs"] for p in d.get("pkg_imports", [])]
-    names += [(pkg_to_file, r) for r in entry.get("refs", [])]
-    deps = {lookup[name] for lookup, name in names if name in lookup}
-    deps.discard(entry["file_name"])
-    return deps
+def _elaborate(inputs_now: Callable[[], _Inputs], depfile: Path, pull: Callable[[dict], bool] | None = None, max_pulls: int = 0) -> dict:
+    """Run slang on the inputs and build the :func:`parse_files` result.
 
-
-def compute_filelist(result: dict) -> list[str]:
-    """Return file paths in topological dependency order (dependencies first).
-
-    Builds a ``networkx.DiGraph`` where an edge ``A → B`` means file A must be
-    compiled before file B.  Edges come from three sources:
-
-    * **Module instantiation** — a file that instantiates a module depends on the
-      file that defines it.
-    * **Package imports** — a file that imports a package depends on the file that
-      defines it.
-    * **Package / interface references** — a file whose ``refs`` name a package or
-      interface (``pkg::x`` without an import, packages using other packages,
-      interface ports and instances) depends on the file that defines it.
-
-    A name defined in several files (see ``duplicates``) maps to the copy slang uses.
-    When ``needed`` is set (``tops`` were given), files the tops do not need are left out.
-
-    ``nx.topological_sort`` produces the compilation order.  If the graph contains
-    a cycle the original input order is returned unchanged.
-
-    *result* is the dict returned by :func:`parse_files`.
+    *depfile* is a scratch path for slang's trimmed module list (used with tops only).
+    After each of the first *max_pulls* loads, *pull* is asked whether to load again.
+    Only the last load is built into a result, since the others are only asked what is missing.
     """
-    files = result["files"]
+    loaded = _load(inputs_now(), depfile)
+    for _ in range(max_pulls):
+        if pull is None or not pull(loaded.round_summary()):
+            break
+        del loaded  # A design takes gigabytes, so the last load goes before the next starts.
+        loaded = _load(inputs_now(), depfile)
+    return _result(loaded, depfile)
 
-    mod_to_file: dict[str, str] = {}
-    pkg_to_file: dict[str, str] = {}
-    needed = result.get("needed")
-    if needed is not None:
-        keep = set(needed)
-        files = [entry for entry in files if entry["file_name"] in keep]
-    for entry in files:
-        fname = entry["file_name"]
-        shadowed = set(entry.get("shadowed", []))
-        for pkg in [*entry.get("pkgs", []), *entry.get("ifaces", [])]:
-            if pkg not in shadowed:
-                pkg_to_file[pkg] = fname
-        for d in entry["defs"]:
-            if d["mod_name"] not in shadowed:
-                mod_to_file[d["mod_name"]] = fname
 
-    deps = {entry["file_name"]: _file_deps(entry, mod_to_file, pkg_to_file) for entry in files}
-
-    g: nx.DiGraph = nx.DiGraph()
-    g.add_nodes_from(deps.keys())
-    for f, fdeps in deps.items():
-        for d in fdeps:
-            g.add_edge(d, f)
-
-    try:
-        return list(nx.topological_sort(g))
-    except nx.NetworkXUnfeasible:
-        return [entry["file_name"] for entry in files]
+def _result(loaded: _Loaded, depfile: Path) -> dict:
+    """Build the :func:`parse_files` result for *loaded*."""
+    compilation, sm, walk, pairs = loaded.compilation, loaded.sm, loaded.walk, loaded.pairs
+    tables = _build_tables(compilation, sm)
+    needed = _trimmed_files(loaded.driver, depfile) if loaded.inputs.tops else None
+    diags, has_errors = _collect_diagnostics(compilation, sm)
+    return {
+        "files": _build_file_entries(walk, tables, loaded.files),
+        "duplicates": _find_duplicates(tables, pairs),
+        "tops": loaded.inputs.tops,
+        "needed": None if needed is None else [f for f, c in pairs if c in needed],
+        "defines": list(loaded.driver.createOptionBag().preprocessorOptions.predefines),
+        "inc_dirs": _include_dirs(loaded.driver.syntaxTrees, sm),
+        "diagnostics": [{"severity": "error", "file": "", "message": e} for e in loaded.load_errors] + diags,
+        "has_errors": has_errors or bool(loaded.load_errors),
+        "missing": loaded.collect_missing(),
+        "blackbox_params": walk.blackbox_params,
+        "invalid_tops": [str(d.args[0]) for d in compilation.getAllDiagnostics() if d.code == Diags.InvalidTopModule and d.args],
+        "parameter_names": {d.name: _parameter_names(d) for defs in tables.modules.values() for d in defs},
+        "elaborated_tops": [t.name for t in compilation.getRoot().topInstances],
+    }

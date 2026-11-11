@@ -1,30 +1,34 @@
-"""Tests for CLI helpers: collect_sv_files, collect_inc_dirs, _write_filelist."""
+"""Tests for CLI helpers: collect_source_files, collect_inc_dirs, _write_filelist."""
 
 from pathlib import Path
 
-from svhier.cli import collect_inc_dirs, collect_sv_files, _write_filelist, main
+import pytest
 
+from svhier.cli import collect_source_files, _write_filelist, main
+from svhier.slang_frontend import SlangFrontend, collect_inc_dirs
+
+SV_SUFFIXES = (".sv", ".v")
 VERILOG_DIR = Path(__file__).parent.parent / "verilog"
 INCLUDE_DIR = VERILOG_DIR / "include"
 
 
 # ---------------------------------------------------------------------------
-# collect_sv_files
+# collect_source_files
 # ---------------------------------------------------------------------------
 
-def test_collect_sv_files_single_file():
+def test_collect_source_files_single_file():
     path = str(VERILOG_DIR / "simple.sv")
-    assert collect_sv_files([path], recursive=False) == [path]
+    assert collect_source_files([path], recursive=False, suffixes=SV_SUFFIXES) == [path]
 
 
-def test_collect_sv_files_picks_up_v_files():
+def test_collect_source_files_picks_up_v_files():
     path = str(VERILOG_DIR / "legacy.v")
-    result = collect_sv_files([path], recursive=False)
+    result = collect_source_files([path], recursive=False, suffixes=SV_SUFFIXES)
     assert path in result
 
 
-def test_collect_sv_files_directory_non_recursive():
-    result = collect_sv_files([str(VERILOG_DIR)], recursive=False)
+def test_collect_source_files_directory_non_recursive():
+    result = collect_source_files([str(VERILOG_DIR)], recursive=False, suffixes=SV_SUFFIXES)
     names = [Path(f).name for f in result]
     assert "simple.sv" in names
     assert "legacy.v" in names
@@ -32,15 +36,15 @@ def test_collect_sv_files_directory_non_recursive():
     assert "tb_top.sv" not in names
 
 
-def test_collect_sv_files_directory_recursive():
-    result = collect_sv_files([str(VERILOG_DIR)], recursive=True)
+def test_collect_source_files_directory_recursive():
+    result = collect_source_files([str(VERILOG_DIR)], recursive=True, suffixes=SV_SUFFIXES)
     names = [Path(f).name for f in result]
     assert "tb_top.sv" in names
 
 
-def test_collect_sv_files_deduplicates():
+def test_collect_source_files_deduplicates():
     path = str(VERILOG_DIR / "simple.sv")
-    result = collect_sv_files([path, path], recursive=False)
+    result = collect_source_files([path, path], recursive=False, suffixes=SV_SUFFIXES)
     assert result.count(path) == 1
 
 
@@ -329,6 +333,170 @@ def test_duplicates_table(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Defined more than once" in err
     assert "cfg" in err and "b.sv" in err
+
+
+# ---------------------------------------------------------------------------
+# -x / --ignore
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(name="ignore_tree")
+def fixture_ignore_tree(tmp_path):
+    """A design below a parent directory whose name contains ``tb`` and ``test``."""
+    root = tmp_path / "test_tb_project" / "rtl"
+    for rel in ("btb.sv", "latest.sv", "skip_me.sv", "tb/bench.sv", "TEST/stim.sv", "sub/tb/deep.sv", "sub/keep.sv"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    for rel in ("tb/bench.svh", "inc/regs.svh", "inc_tb/other.svh"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    return root
+
+
+def _names(paths):
+    return sorted(Path(p).name for p in paths)
+
+
+def _collect(paths, recursive, ignore):
+    return collect_source_files(paths, recursive, (".sv", ".v"), ignore)
+
+
+def test_ignore_matches_whole_names_only(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"tb"})
+    assert _names(result) == ["btb.sv", "keep.sv", "latest.sv", "skip_me.sv", "stim.sv"]
+
+
+def test_ignore_is_case_insensitive(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"test"})
+    assert "stim.sv" not in _names(result)
+    assert "latest.sv" in _names(result)
+
+
+def test_ignore_matches_file_name_with_extension(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"skip_me.sv"})
+    assert "skip_me.sv" not in _names(result)
+    assert _collect([str(ignore_tree / "skip_me.sv")], recursive=False, ignore={"skip_me.sv"}) == []
+
+
+def test_ignore_skips_parents_of_the_given_path(ignore_tree):
+    """Only components below the given path count."""
+    parents = {ignore_tree.parent.name, ignore_tree.parent.parent.name}
+    result = _collect([str(ignore_tree)], recursive=True, ignore=parents)
+    assert len(result) == 7
+
+
+def test_ignore_does_not_apply_to_the_given_directory_itself(ignore_tree):
+    result = _collect([str(ignore_tree / "tb")], recursive=True, ignore={"tb"})
+    assert _names(result) == ["bench.sv"]
+
+
+def test_ignore_explicit_file_checks_only_its_own_name(ignore_tree):
+    path = str(ignore_tree / "tb" / "bench.sv")
+    assert _collect([path], recursive=False, ignore={"tb"}) == [path]
+
+
+def test_ignore_applies_to_include_dirs(ignore_tree):
+    result = collect_inc_dirs([str(ignore_tree)], recursive=True, ignore={"tb"})
+    assert sorted(Path(d).name for d in result) == ["inc", "inc_tb"]
+
+
+def test_ignore_accepts_glob_patterns(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"*_me.sv", "t?"})
+    assert _names(result) == ["btb.sv", "keep.sv", "latest.sv", "stim.sv"]
+
+
+def test_ignore_glob_only_looks_below_the_given_path(ignore_tree):
+    result = _collect([str(ignore_tree)], recursive=True, ignore={"test_*"})
+    assert len(result) == 7
+
+
+def test_main_ignore_pattern_is_case_insensitive(ignore_tree, monkeypatch, capsys):
+    (ignore_tree / "FIFO_TB.SV").write_text("", encoding="utf-8")
+    (ignore_tree / "top_tb.sv").write_text("module top_tb; endmodule\n", encoding="utf-8")
+    (ignore_tree / "keep_top.sv").write_text("module keep_top; endmodule\n", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["svhier", str(ignore_tree), "-x", "*_TB.sv", "--filelist"])
+    main()
+    out = capsys.readouterr().out
+    assert "keep_top.sv" in out
+    assert "top_tb.sv" not in out
+
+
+# ---------------------------------------------------------------------------
+# Output files that cannot be written
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--yaml", "--filelist"])
+def test_main_reports_unwritable_output_cleanly(flag, tmp_path, monkeypatch, capsys):
+    dest = tmp_path / "no_such_dir" / "out"
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), flag, str(dest)])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    err = " ".join(capsys.readouterr().err.split())
+    assert "error:" in err
+    assert "cannot write" in err
+
+
+def test_main_warns_about_unknown_top_without_tree(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["svhier", str(VERILOG_DIR / "test.sv"), "--top", "nosuch", "--no-tree"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    assert "top module 'nosuch' not found" in capsys.readouterr().err
+
+
+def _no_plugins(monkeypatch) -> None:
+    """Run as if only the bundled slang plugin were installed."""
+    monkeypatch.setattr("svhier.cli.discover_frontends", lambda on_error=None: [SlangFrontend()])
+
+
+def test_command_file_vhdl_without_a_vhdl_plugin(monkeypatch, tmp_path, capsys):
+    _no_plugins(monkeypatch)
+    (tmp_path / "top.sv").write_text("module top; endmodule\n")
+    (tmp_path / "leaf.vhd").write_text("entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("leaf.vhd\ntop.sv\n")
+    monkeypatch.setenv("COLUMNS", "500")
+    monkeypatch.setattr("sys.argv", ["svhier", "-F", str(tmp_path / "list.f"), "--top", "top"])
+    main()
+    out = capsys.readouterr()
+    assert "install and enable svhier-ghdl" in out.err
+    assert "top" in out.out
+
+
+def test_command_file_with_only_vhdl_without_a_vhdl_plugin(monkeypatch, tmp_path, capsys):
+    _no_plugins(monkeypatch)
+    (tmp_path / "leaf.vhd").write_text("entity leaf is end;\n")
+    (tmp_path / "list.f").write_text("leaf.vhd\n")
+    monkeypatch.setenv("COLUMNS", "500")
+    monkeypatch.setattr("sys.argv", ["svhier", "-F", str(tmp_path / "list.f")])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "install and enable svhier-ghdl" in err
+    assert "no source files found" in err
+
+
+def test_collect_inc_dirs_finds_included_sources(tmp_path):
+    """Only as far as something includes them: other source directories stay out."""
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n`include "consts.vi"\n`include "gone.sv"\n')
+    (tmp_path / "lib/defs.sv").write_text("`define A\n")
+    (tmp_path / "lib/consts.vi").write_text("`define B\n")
+    (tmp_path / "other/unrelated.sv").write_text("module unrelated; endmodule\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == [str(tmp_path / "lib")]
+
+
+def test_collect_inc_dirs_leaves_out_what_resolves_next_to_the_includer(tmp_path):
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "other").mkdir()
+    (tmp_path / "rtl/top.sv").write_text('`include "defs.sv"\n')
+    (tmp_path / "rtl/defs.sv").write_text("`define A\n")
+    (tmp_path / "other/defs.sv").write_text("`define A\n")
+    assert collect_inc_dirs([str(tmp_path)], recursive=True) == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "svhier-ghdl"
+version = "0.0.1"
+description = "Elaborate VHDL for svhier with GHDL through pyGHDL"
+requires-python = ">=3.11"
+# pyGHDL is deliberately not a dependency: GHDL is installed separately and found at runtime.
+dependencies = ["svhier"]
+
+[project.entry-points."svhier.frontends"]
+ghdl = "svhier_ghdl:GhdlFrontend"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/svhier_ghdl"]

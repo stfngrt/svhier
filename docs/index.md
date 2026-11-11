@@ -114,6 +114,7 @@ guide/missing
 guide/libdirs
 guide/outputs
 guide/diagnostics
+guide/vhdl
 ```
 
 ```{toctree}
@@ -122,4 +123,14 @@ guide/diagnostics
 
 cli
 architecture
+```
+
+```{toctree}
+:hidden:
+:caption: Developer documentation
+
+dev/index
+dev/result-format
+dev/plugins
+dev/api/index
 ```

@@ -17,7 +17,7 @@ from pyslang.driver import Driver
 
 from svhier.parser import compute_filelist, parse_files
 
-CVA6_DIR = os.environ.get("SVHIER_CVA6_DIR")
+CVA6_DIR = os.environ.get("SVHIER_CVA6_DIR", "")
 
 pytestmark = pytest.mark.skipif(not CVA6_DIR, reason="set SVHIER_CVA6_DIR to a cva6 checkout")
 

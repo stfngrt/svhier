@@ -1,12 +1,12 @@
 # Diagnostics and exit codes
 
-## slang's errors and warnings
+## Errors and warnings
 
 By default svhier prints a single count line instead of every compiler
 message:
 
 ```text
-slang reported 110 errors, 989 warnings (use -E to list errors, -W to also list warnings)
+reported 110 errors, 989 warnings (use -E to list errors, -W to also list warnings)
 ```
 
 The reason: on a partial file set, almost all errors are follow-on errors
@@ -41,7 +41,7 @@ instances per file.
 | Code | Meaning |
 |------|---------|
 | `0` | Elaboration completed without errors |
-| `1` | slang reported at least one error, or no source files were found |
+| `1` | A plugin reported at least one error, or no source files were found |
 | `2` | Invalid command-line arguments |
 
 All outputs are still written when the exit code is `1`.

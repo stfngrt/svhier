@@ -7,6 +7,10 @@
    :prog: svhier
 ```
 
-Options and paths can be given in any order. Data (tree, `--yaml -`,
-`--filelist -`) goes to **stdout**; the spinner, tables and diagnostics go to
+Options and paths can be given in any order. Data (`--yaml -`, `--filelist -`,
+then the tree) goes to **stdout**; the spinner, tables and diagnostics go to
 **stderr**.
+
+Language plugins add their own options: `-f`, `-I` and `-D` come from the
+bundled slang plugin, and [the VHDL plugin](guide/vhdl.md) adds `--vhdl-std` and
+`--vhdl-work`. `svhier --help` lists what's installed.

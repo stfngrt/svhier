@@ -27,5 +27,72 @@ jobs:
       - name: Lint
         run: uv run pylint src/svhier/
 
+      - name: Type check
+        run: uv run mypy src/svhier tests
+
       - name: Test
         run: uv run pytest tests/ -v
+
+  # The plugin binds GHDL internals by symbol name, so this runs against whatever GHDL
+  # released last. A new GHDL release that changes those internals fails here.
+  ghdl:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev
+          uv pip install --no-deps -e plugins/svhier-ghdl
+
+      - name: Install pyGHDL from the latest GHDL release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          tag="cp${PYTHON_VERSION/./}"
+          gh release download --repo ghdl/ghdl --dir "$RUNNER_TEMP/ghdl" \
+            --pattern "pyghdl-*-$tag-$tag-linux_x86_64.whl"
+          uv pip install "$RUNNER_TEMP"/ghdl/*.whl
+
+      # The same version as pyGHDL, because the image tag comes from the same release.
+      - name: Set up GHDL from its Docker image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(gh release view --repo ghdl/ghdl --json tagName --jq .tagName)"
+          image="ghdl/ghdl:${version#v}-mcode-ubuntu-24.04"
+          docker pull "$image"
+          echo "GHDL_IMAGE=$image" >> "$GITHUB_ENV"
+          # Tests use the workspace and pytest's directories in /tmp, under the same paths.
+          cat > "$RUNNER_TEMP/ghdl-docker" <<'WRAPPER'
+          #!/bin/sh
+          exec docker run --rm -u "$(id -u):$(id -g)" -v /tmp:/tmp \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" "$GHDL_IMAGE" ghdl "$@"
+          WRAPPER
+          chmod +x "$RUNNER_TEMP/ghdl-docker"
+          echo "SVHIER_GHDL_BIN=$RUNNER_TEMP/ghdl-docker" >> "$GITHUB_ENV"
+
+      # The plugin tests skip themselves without these, so make a missing install fail.
+      - name: Check pyGHDL and GHDL are installed
+        run: |
+          uv pip show pyghdl
+          "$SVHIER_GHDL_BIN" --version
+
+      - name: Lint
+        run: uv run --no-sync pylint plugins/svhier-ghdl/src/svhier_ghdl/
+
+      - name: Type check
+        run: uv run --no-sync mypy plugins/svhier-ghdl/src/svhier_ghdl plugins/svhier-ghdl/tests
+
+      - name: Test
+        run: uv run --no-sync pytest tests/ plugins/svhier-ghdl/tests/ -v

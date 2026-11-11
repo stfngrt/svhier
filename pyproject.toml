@@ -20,11 +20,16 @@ dependencies = [
 [project.scripts]
 svhier = "svhier.cli:main"
 
+[project.entry-points."svhier.frontends"]
+slang = "svhier.slang_frontend:SlangFrontend"
+
 [project.optional-dependencies]
 dev = [
+    "mypy>=1.20.0",
     "pytest",
     "pytest-cov",
-    "pytest-mypy"
+    "pytest-mypy",
+    "types-networkx>=3.6.1.20261031",
 ]
 docs = [
     "sphinx",
@@ -39,6 +44,10 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/svhier"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "plugins/svhier-ghdl/src"
 
 [tool.pylint.main]
 # pyslang is a compiled extension; let pylint load it to see its members.

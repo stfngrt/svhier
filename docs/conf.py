@@ -2,7 +2,8 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+_ROOT = Path(__file__).parent.parent
+sys.path[:0] = [str(_ROOT / "src"), str(_ROOT / "plugins" / "svhier-ghdl" / "src")]
 
 # Python 3.14 argparse emits ANSI escape codes by default; suppress them so
 # sphinx-argparse renders clean text instead of raw escape sequences.
@@ -14,6 +15,7 @@ extensions = [
     "myst_parser",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
+    "sphinx.ext.viewcode",
     "sphinxarg.ext",
     "sphinx_design",
 ]
@@ -40,6 +42,7 @@ master_doc = "index"
 exclude_patterns = ["_build"]
 html_theme = "furo"
 
-autodoc_mock_imports = ["pyslang", "networkx", "rich", "ruamel"]
+autodoc_mock_imports = ["pyslang", "pyGHDL", "networkx", "rich", "ruamel"]
 autosummary_generate = False
 autodoc_member_order = "bysource"
+autodoc_preserve_defaults = True
