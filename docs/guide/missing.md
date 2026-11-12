@@ -67,6 +67,29 @@ more than once** table:
 Many compiler errors in a design with duplicates come from the "wrong"
 copy being used. Fix this table first, then judge the errors.
 
+(explicit-wins)=
+### Picking a copy
+
+Name the file you want directly on the command line. A file passed by name
+wins: other files found with `-r` or `-y` that define the same names are
+dropped from the compilation, wherever the file appears on the command line:
+
+```bash
+svhier core/include/cv64a6_imafdc_sv39_config_pkg.sv -r core -y common -y vendor --top cva6
+```
+
+A note on stderr says what was dropped:
+
+```text
+note: core/include/cv64a6_imafdc_sv39_config_pkg.sv overrides 18 other file(s) defining cva6_config_pkg
+```
+
+A file is only dropped when *everything* it defines is also defined by the
+named file, so nothing else goes missing. A file that also defines other
+names is kept, and its duplicate stays in the **Defined more than once**
+table. Files listed in a `-f`/`-F` command file are never dropped. Two files
+that are both passed by name don't override each other.
+
 ## Fixing it
 
 - **Pass the missing files or directories** as extra paths.
@@ -74,5 +97,6 @@ copy being used. Fix this table first, then judge the errors.
 - **Exclude what you don't need.** If only testbenches want a missing
   module, skip them by directory or file name, as in `-x tb` or
   `-x '*_tb.sv'`.
-- **For duplicates, use the project's filelist** (`-f`). It usually picks one
-  variant per name. See {ref}`command-files`.
+- **For duplicates, name the copy you want** as a file argument (see
+  {ref}`explicit-wins`), or use the project's filelist (`-f`), which
+  usually picks one variant per name. See {ref}`command-files`.

@@ -497,3 +497,83 @@ def test_collect_inc_dirs_leaves_out_what_resolves_next_to_the_includer(tmp_path
     (tmp_path / "rtl/defs.sv").write_text("`define A\n")
     (tmp_path / "other/defs.sv").write_text("`define A\n")
     assert collect_inc_dirs([str(tmp_path)], recursive=True) == []
+
+
+# ---------------------------------------------------------------------------
+# Explicit files win over duplicate definitions (#7)
+# ---------------------------------------------------------------------------
+
+def _override_tree(tmp_path):
+    """A directory with three variants of package cfg and a module using it."""
+    rtl = tmp_path / "rtl"
+    (rtl / "cfgs").mkdir(parents=True)
+    for name, width in (("a", 4), ("b", 8), ("c", 16)):
+        (rtl / "cfgs" / f"cfg_{name}.sv").write_text(f"package cfg; localparam int W = {width}; endpackage\n")
+    (rtl / "top.sv").write_text("module top; logic [cfg::W-1:0] x; endmodule\n")
+    return rtl
+
+
+def _run(monkeypatch, capsys, argv):
+    monkeypatch.setattr("sys.argv", ["svhier", *argv])
+    code = 0
+    try:
+        main()
+    except SystemExit as exc:
+        code = exc.code
+    return code, capsys.readouterr()
+
+
+def test_explicit_file_drops_other_copies(tmp_path, monkeypatch, capsys):
+    rtl = _override_tree(tmp_path)
+    chosen = str(rtl / "cfgs" / "cfg_b.sv")
+    code, cap = _run(monkeypatch, capsys, [chosen, "-r", str(rtl), "--no-tree", "--filelist"])
+    assert code == 0
+    srcs = [Path(ln).name for ln in cap.out.splitlines() if ln.endswith(".sv")]
+    assert srcs == ["cfg_b.sv", "top.sv"]
+    assert "Defined more than once" not in cap.err
+    assert "cfg_b.sv overrides 2 other file(s) defining cfg" in " ".join(cap.err.split())
+
+
+def test_explicit_file_wins_regardless_of_position(tmp_path, monkeypatch, capsys):
+    rtl = _override_tree(tmp_path)
+    code, cap = _run(monkeypatch, capsys, ["-r", str(rtl), str(rtl / "cfgs" / "cfg_c.sv"), "--no-tree", "--filelist"])
+    assert code == 0
+    assert [Path(ln).name for ln in cap.out.splitlines() if ln.endswith(".sv")] == ["cfg_c.sv", "top.sv"]
+
+
+def test_explicit_module_copy_wins(tmp_path, monkeypatch, capsys):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "cell_beh.sv").write_text("module leaf_beh; endmodule\nmodule mycell; leaf_beh u(); endmodule\n")
+    tech = tmp_path / "cell_tech.sv"
+    tech.write_text("module leaf_tech; endmodule\nmodule mycell; leaf_tech u(); endmodule\n")
+    (tmp_path / "lib" / "top.sv").write_text("module top; mycell u_cell(); endmodule\n")
+    # leaf_tech lives next to the explicit cell, so cell_beh.sv only defines overridden
+    # names if leaf_beh is defined explicitly too; here it isn't, so cell_beh.sv is kept.
+    code, cap = _run(monkeypatch, capsys, [str(tech), "-r", str(tmp_path / "lib")])
+    assert "Defined more than once" in cap.err
+    assert "overrides" not in cap.err
+    # With the behavioural leaf in its own file, the whole cell_beh.sv is overridden.
+    (tmp_path / "lib" / "cell_beh.sv").write_text("module mycell; leaf_beh u(); endmodule\n")
+    (tmp_path / "lib" / "leaf_beh.sv").write_text("module leaf_beh; endmodule\n")
+    code, cap = _run(monkeypatch, capsys, [str(tech), "-r", str(tmp_path / "lib")])
+    assert code == 0
+    assert "u (leaf_tech)" in cap.out and "leaf_beh)" not in cap.out
+    assert "Defined more than once" not in cap.err
+
+
+def test_two_explicit_copies_stay_duplicates(tmp_path, monkeypatch, capsys):
+    rtl = _override_tree(tmp_path)
+    a, b = str(rtl / "cfgs" / "cfg_a.sv"), str(rtl / "cfgs" / "cfg_b.sv")
+    _, cap = _run(monkeypatch, capsys, [a, b, str(rtl / "top.sv"), "--no-tree"])
+    assert "Defined more than once" in cap.err
+    assert "overrides" not in cap.err
+
+
+def test_overridden_file_not_pulled_back_from_libdir(tmp_path, monkeypatch, capsys):
+    rtl = _override_tree(tmp_path)
+    chosen = str(rtl / "cfgs" / "cfg_a.sv")
+    code, cap = _run(monkeypatch, capsys, [chosen, "-r", str(rtl), "-y", str(rtl), "--no-tree", "--filelist"])
+    assert code == 0
+    assert [Path(ln).name for ln in cap.out.splitlines() if ln.endswith(".sv")] == ["cfg_a.sv", "top.sv"]
+    assert "Pulled in from -y" not in cap.err
+    assert "overrides 2 other file(s)" in " ".join(cap.err.split())

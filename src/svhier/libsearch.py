@@ -89,6 +89,14 @@ class LibrarySearch(Generic[L]):
         self.pulled.append((name, path, others))
 
 
+def defined_in(path: Path) -> set[str]:
+    """Return the module, interface and package names *path* defines, from a regex over its text."""
+    try:
+        return set(_DEF_RE.findall(path.read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return set()
+
+
 class LibraryIndex:
     """Index of the definitions and headers found under a set of library directories."""
 
@@ -105,11 +113,7 @@ class LibraryIndex:
                 for f in sorted(root.glob(f"**/{ext}")):
                     if is_ignored(f, root, ign):
                         continue
-                    try:
-                        text = f.read_text(encoding="utf-8", errors="replace")
-                    except OSError:
-                        continue
-                    for name in dict.fromkeys(_DEF_RE.findall(text)):
+                    for name in sorted(defined_in(f)):
                         self.defs.setdefault(name, []).append(f)
             for ext in ("*.svh", "*.vh"):
                 self.headers.extend(f for f in sorted(root.glob(f"**/{ext}")) if not is_ignored(f, root, ign))

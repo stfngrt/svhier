@@ -64,6 +64,17 @@ table lists `cva6_config_pkg` (one variant per target in `core/include/`), `risc
 the hpdcache SRAM wrappers and `gated_clk_cell`. About 97 slang errors remain, almost all caused by
 those duplicates, not by missing files.
 
+Route 2 with an explicit config package (an explicitly named file wins over duplicates):
+
+```bash
+uv --project <path-to-svhier-checkout> run svhier core/include/cv64a6_imafdc_sv39_config_pkg.sv \
+    -r core -y common -y vendor -x test -x tb --top cva6
+```
+
+Expected: a note that the named file overrides 18 other files defining `cva6_config_pkg`,
+`cva6_config_pkg` gone from "Defined more than once", no "Not found" table, no
+`(blackbox)` in the tree, and about 20 slang errors.
+
 ## GHDL plugin
 
 `plugins/svhier-ghdl` is a separate package, and its tests skip themselves without

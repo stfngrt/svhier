@@ -185,6 +185,13 @@ reports what is missing and which files are loaded. Everything else waits until 
 pulls nothing new: the definitions, the file entries with their references, the duplicates,
 the diagnostics and the trimmed file list. So the diagnostics describe the final load only.
 
+A file named on the command line wins over duplicates ({ref}`explicit-wins`). Before the
+first parse, `SlangFrontend._drop_overridden` reads each named file with the regex `-y`
+indexes with, and drops the other source files that only define names it defines too.
+slang keeps the *last* copy of a module but the *first* copy of a package, so no compile
+order could make the named file win; dropping files does. The dropped names are defined, so
+`-y` never brings the files back.
+
 The walk visits each unique pair of definition and parameter values once, and records the
 children of that pair, each with the parameter values it uses in turn. That table is what
 the instance tree follows, so a design's tree costs one step per real instance however

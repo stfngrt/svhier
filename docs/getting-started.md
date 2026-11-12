@@ -96,6 +96,12 @@ svhier pulled in the missing files over a few rounds. `sram_cache` needed
 
 A **Defined more than once** table also appears. CVA6 ships one
 `cva6_config_pkg` per target, and a real build compiles exactly one of them.
+Pick yours by naming it on the command line. The other 18 copies are dropped
+(see {ref}`explicit-wins`):
+
+```bash
+svhier core/include/cv64a6_imafdc_sv39_config_pkg.sv -r core -y common -y vendor -x test -x tb --top cva6
+```
 
 :::{tip}
 CVA6 has a project filelist that picks one target. Pass it with `-f` to get a

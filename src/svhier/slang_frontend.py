@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from svhier.frontends import KNOWN_SUFFIXES, Request, Root, empty_fragment
-from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
+from svhier.libsearch import LibraryIndex, LibrarySearch, defined_in, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
 _MAX_LIB_ROUNDS = 20
@@ -244,6 +244,9 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         self._exclude_exts: list[str] = []
         self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
+        # Source files named on the command line; None once the copies they override are dropped.
+        self._explicit: set[Path] | None = None
+        self._override_notes: list[str] = []
         # {lowercase module name: (module name, its parameter names)}
         self._modules: dict[str, tuple[str, list[str]]] = {}
 
@@ -284,6 +287,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         found = collect_inc_dirs(args.paths, args.recursive, ignore)
         self.inc_dirs = list(dict.fromkeys(args.include_dirs + found))
         self.command_files = args.command_files
+        self._explicit = {Path(p).resolve() for p in args.paths if Path(p).is_file()}
         self._read_foreign_entries()
         self.search = LibrarySearch(self._library_factory(args.libdirs, ignore) if args.libdirs else None)
 
@@ -340,12 +344,32 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
 
         *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
+        self._drop_overridden(files)
         options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files,
                                    "exclude_exts": self._exclude_exts, "frontend_info": True}
         if library and self.search.library is not None:  # Not "if not": see _pull_missing.
             # Only the last round is returned in full, so earlier ones just report what is missing.
             options |= {"pull": lambda loaded: self._pull_missing(loaded, files), "max_pulls": _MAX_LIB_ROUNDS}
         return self.tool.parse(files, self.inc_dirs, **options)
+
+    def _drop_overridden(self, files: list[str]) -> None:
+        """Once: drop the files that only define what a file named on the command line defines.
+
+        So the named copy of a config package or cell is the one used, whatever its position:
+        slang keeps the last copy of a module but the first of a package.
+        """
+        if not self._explicit:
+            self._explicit = None
+            return
+        named = {Path(f).resolve(): f for f in files if Path(f).resolve() in self._explicit}
+        self._explicit = None
+        for path, fname in named.items():
+            wins = defined_in(path)
+            dropped = {f: names for f in files if Path(f).resolve() not in named and (names := defined_in(Path(f))) and names <= wins}
+            files[:] = [f for f in files if f not in dropped]
+            if dropped:
+                overridden = ", ".join(sorted(set().union(*dropped.values())))
+                self._override_notes.append(f"{fname} overrides {len(dropped)} other file(s) defining {overridden}")
 
     def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
         """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define.
@@ -481,7 +505,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         for name in result["missing"]["modules"]:
             result["unresolved"].setdefault(name, [])
         result["rejected_roots"] = sorted(rejected)
-        result["notes"] = notes
+        result["notes"] = self._override_notes + notes
         result["pulled"] = self.search.pulled
         result["inc_dirs"] = list(dict.fromkeys(self.inc_dirs + result["inc_dirs"]))
         result.pop("invalid_tops")
