@@ -126,13 +126,6 @@ def empty_fragment() -> dict:
     }
 
 
-def defined_names(entry: dict) -> list[tuple[str, str]]:
-    """Return ``(kind, name)`` for every module, interface and package a file entry defines."""
-    return ([("module", d["mod_name"]) for d in entry.get("defs", [])]
-            + [("interface", n) for n in entry.get("ifaces", [])]
-            + [("package", n) for n in entry.get("pkgs", [])])
-
-
 def _add_unique(target: list, items) -> None:
     target.extend(item for item in items if item not in target)
 
@@ -218,7 +211,6 @@ class _Stitcher:  # pylint: disable=too-few-public-methods
                 for name, users in fragment["missing"].get(kind, {}).items():
                     _add_unique(merged["missing"][kind].setdefault(name, []), users)
             merged.setdefault("pulled", []).extend(fragment.get("pulled", []))
-            merged.setdefault("overridden", {}).update(fragment.get("overridden", {}))
             merged["failed_tops"].extend(fragment.get("failed_tops", []))
             if self.tops:
                 merged["needed"] = (merged["needed"] or []) + list(fragment["needed"] or [])

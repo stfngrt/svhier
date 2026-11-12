@@ -595,12 +595,11 @@ def parse_files(  # pylint: disable=too-many-arguments
       the working directory.
     * *params* — parameter values for the top modules, ``{name: SystemVerilog expression}``.
       Names are case-sensitive; slang ignores names a top doesn't have.
-    * *pull* — called after loading, up to *max_pulls* times, with ``{"files": [...],
-      "missing": ...}``: each loaded file with its ``file_name``, ``defs`` (only ``mod_name``),
-      ``ifaces`` and ``pkgs``, and the ``missing`` of the result.  When it returns true it has
-      changed *file_paths* or *inc_dirs*, which are read again, and the sources are reloaded.
-      Only the last load is walked and returned in full, so a caller that searches library
-      directories doesn't pay for the hierarchy of every round.
+    * *pull* — called after loading, up to *max_pulls* times, with ``{"files": [{"file_name"}],
+      "missing": ...}`` (what is loaded, and the ``missing`` of the result).  When it returns
+      true it has added to *file_paths* or *inc_dirs*, which are read again, and the sources
+      are reloaded.  Only the last load is walked and returned in full, so a caller that
+      searches library directories doesn't pay for the hierarchy of every round.
     * *exclude_exts* — suffixes without the dot; slang skips files with these, wherever
       they're named.
 
@@ -697,17 +696,6 @@ class _Loaded:
         """``(file_name, canonical)`` per loaded file."""
         return [(f, c) for f, c, _ in self.files]
 
-    def round_summary(self) -> dict:
-        """Return what *pull* is given: each file with the names it defines, and what is missing."""
-        modules = _definitions_by_file(self.compilation, self.sm, DefinitionKind.Module)
-        ifaces = _definitions_by_file(self.compilation, self.sm, DefinitionKind.Interface)
-        pkgs = _packages_by_file(self.compilation, self.sm)
-        files = [{"file_name": f,
-                  "defs": [{"mod_name": d.name} for d in modules.get(c, [])],
-                  "ifaces": [d.name for d in ifaces.get(c, [])],
-                  "pkgs": pkgs.get(c, [])} for f, c in self.pairs]
-        return {"files": files, "missing": self.collect_missing()}
-
     def collect_missing(self) -> dict[str, dict[str, list[str]]]:
         """Return the ``missing`` of the result, collected once."""
         if self.missing is None:
@@ -736,7 +724,7 @@ def _elaborate(inputs_now: Callable[[], _Inputs], depfile: Path, pull: Callable[
     """
     loaded = _load(inputs_now(), depfile)
     for _ in range(max_pulls):
-        if pull is None or not pull(loaded.round_summary()):
+        if pull is None or not pull({"files": [{"file_name": f} for f, _ in loaded.pairs], "missing": loaded.collect_missing()}):
             break
         del loaded  # A design takes gigabytes, so the last load goes before the next starts.
         loaded = _load(inputs_now(), depfile)

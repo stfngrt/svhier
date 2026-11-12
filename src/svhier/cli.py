@@ -18,7 +18,7 @@ from rich.table import Table
 from ruamel.yaml import YAML
 
 from svhier.filelist import compute_filelist
-from svhier.frontends import KNOWN_SUFFIXES, Frontend, defined_names, discover_frontends, stitch
+from svhier.frontends import KNOWN_SUFFIXES, Frontend, discover_frontends, stitch
 from svhier.libsearch import glob_files, is_ignored
 
 # Rich consoles: stderr for all diagnostics so stdout stays clean for data
@@ -408,8 +408,7 @@ def _build_parser(frontends: list[Frontend] | None = None) -> argparse.ArgumentP
         "paths",
         nargs="*",
         metavar="PATH",
-        help="Source files, or directories containing them. A file named directly wins over other "
-             "files that define the same modules, interfaces or packages: those are dropped.",
+        help="Source files, or directories containing them.",
     )
     parser.add_argument(
         "-r", "--recursive",
@@ -502,26 +501,6 @@ def _print_pulled(pulled: list[tuple[str, Path, int]]) -> None:
     _err.print(table)
 
 
-def _print_overridden(hierarchy: dict) -> None:
-    """Print which names files named on the command line took over, and the copies dropped for them."""
-    overridden: dict[str, list[tuple[str, str]]] = hierarchy.get("overridden", {})
-    if not overridden:
-        return
-    used = {item: e["file_name"] for e in hierarchy["files"] for item in defined_names(e)}
-    dropped: dict[tuple[str, str], list[str]] = {}
-    for fname, items in overridden.items():
-        for kind, name in items:
-            dropped.setdefault((kind, name), []).append(fname)
-    table = Table(title="Overridden by explicit files", show_header=True, header_style="bold cyan")
-    table.add_column("Name", style="bold")
-    table.add_column("Kind", style="yellow")
-    table.add_column("Used", style="green", overflow="fold")
-    table.add_column("Dropped", style="dim", overflow="fold")
-    for (kind, name), files in dropped.items():
-        table.add_row(name, kind, used.get((kind, name), ""), _first_and_more(files))
-    _err.print(table)
-
-
 def _usable_frontends(frontends: list[Frontend]) -> list[Frontend]:
     """Return the frontends that can run; warn about the others."""
     usable = []
@@ -560,7 +539,6 @@ def _report(hierarchy: dict, args) -> None:
         _print_summary(hierarchy)
 
     _print_pulled(hierarchy.get("pulled", []))
-    _print_overridden(hierarchy)
     _print_duplicates(hierarchy)
     _print_missing(hierarchy)
     for note in hierarchy.get("frontend_notes", []):

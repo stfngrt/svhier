@@ -71,7 +71,7 @@ uv --project <path-to-svhier-checkout> run svhier core/include/cv64a6_imafdc_sv3
     -r core -y common -y vendor -x test -x tb --top cva6
 ```
 
-Expected: an "Overridden by explicit files" table with `cva6_config_pkg` (18 dropped),
+Expected: a note that the named file overrides 18 other files defining `cva6_config_pkg`,
 `cva6_config_pkg` gone from "Defined more than once", no "Not found" table, no
 `(blackbox)` in the tree, and about 20 slang errors.
 

@@ -27,7 +27,6 @@ an empty one.
 | `notes` | Plugin | Remarks for the user |
 | `failed_tops` | Plugin | Optional. Requested roots it defines but couldn't elaborate, so they aren't reported as not found |
 | `pulled` | Plugin | `(name, path, other candidates)` for each file taken from `-y` |
-| `overridden` | Plugin | Optional. `{dropped file: [(kind, name)]}` for source files dropped because a file named on the command line defines everything they do |
 | `frontend_notes` | Stitching | All notes, printed at the end |
 
 ## File entries

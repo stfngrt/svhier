@@ -17,8 +17,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from svhier.frontends import KNOWN_SUFFIXES, Request, Root, defined_names, empty_fragment
-from svhier.libsearch import LibraryIndex, LibrarySearch, glob_files, is_ignored, resolve_missing
+from svhier.frontends import KNOWN_SUFFIXES, Request, Root, empty_fragment
+from svhier.libsearch import LibraryIndex, LibrarySearch, defined_in, glob_files, is_ignored, resolve_missing
 
 # Upper bound on parse/resolve rounds for -y; each round pulls in one more layer of dependencies.
 _MAX_LIB_ROUNDS = 20
@@ -244,9 +244,9 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         self._exclude_exts: list[str] = []
         self._defined_elsewhere: set[str] = set()
         self._units: dict[str, str] | None = None
-        # Resolved source files named on the command line, and the files dropped for them.
-        self._explicit: set[Path] = set()
-        self.overridden: dict[str, list[tuple[str, str]]] = {}
+        # Source files named on the command line; None once the copies they override are dropped.
+        self._explicit: set[Path] | None = None
+        self._override_notes: list[str] = []
         # {lowercase module name: (module name, its parameter names)}
         self._modules: dict[str, tuple[str, list[str]]] = {}
 
@@ -340,42 +340,36 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         return True
 
     def _parse(self, files: list[str], tops: list[str], params: dict[str, str] | None = None, *, library: bool = True) -> dict:
-        """Parse, then drop overridden copies and pull missing definitions from ``-y`` until nothing changes.
+        """Parse, then pull missing definitions from ``-y`` until nothing new resolves.
 
-        *files* and the include dirs change in place.  Without *library*, ``-y`` isn't searched.
+        *files* and the include dirs grow in place.  Without *library*, ``-y`` isn't searched.
         """
+        self._drop_overridden(files)
         options: dict[str, Any] = {"defines": self.defines, "tops": tops, "params": params, "command_files": self.command_files,
                                    "exclude_exts": self._exclude_exts, "frontend_info": True}
-        search = library and self.search.library is not None  # Not "if not": see _pull_missing.
-        if search or self._explicit:
+        if library and self.search.library is not None:  # Not "if not": see _pull_missing.
             # Only the last round is returned in full, so earlier ones just report what is missing.
-            options |= {"pull": lambda loaded: self._drop_overridden(loaded, files) or (search and self._pull_missing(loaded, files)),
-                        "max_pulls": _MAX_LIB_ROUNDS}
+            options |= {"pull": lambda loaded: self._pull_missing(loaded, files), "max_pulls": _MAX_LIB_ROUNDS}
         return self.tool.parse(files, self.inc_dirs, **options)
 
-    def _drop_overridden(self, hierarchy: dict, files: list[str]) -> bool:
-        """Drop the files whose every definition a file named on the command line also defines.
+    def _drop_overridden(self, files: list[str]) -> None:
+        """Once: drop the files that only define what a file named on the command line defines.
 
-        That makes the named file's copy the one used: slang keeps the last copy of a module but
-        the first of a package, so no order would.  A file that defines anything else is kept, so
-        nothing goes missing, and files from command files can't be dropped.  Returns whether
-        *files* changed.
+        So the named copy of a config package or cell is the one used, whatever its position:
+        slang keeps the last copy of a module but the first of a package.
         """
         if not self._explicit:
-            return False
-        by_path = {Path(f).resolve(): f for f in files}
-        entries = [(Path(e["file_name"]).resolve(), e) for e in hierarchy["files"]]
-        wins = {item for path, e in entries if path in self._explicit for item in defined_names(e)}
-        dropped = False
-        for path, entry in entries:
-            items = defined_names(entry)
-            if path in by_path and path not in self._explicit and items and set(items) <= wins:
-                self.overridden[by_path[path]] = items
-                files.remove(by_path[path])
-                dropped = True
-        if dropped:
-            self._units = None
-        return dropped
+            self._explicit = None
+            return
+        named = {Path(f).resolve(): f for f in files if Path(f).resolve() in self._explicit}
+        self._explicit = None
+        for path, fname in named.items():
+            wins = defined_in(path)
+            dropped = {f: names for f in files if Path(f).resolve() not in named and (names := defined_in(Path(f))) and names <= wins}
+            files[:] = [f for f in files if f not in dropped]
+            if dropped:
+                overridden = ", ".join(sorted(set().union(*dropped.values())))
+                self._override_notes.append(f"{fname} overrides {len(dropped)} other file(s) defining {overridden}")
 
     def _pull_missing(self, hierarchy: dict, files: list[str]) -> bool:
         """Add what ``-y`` has for what *hierarchy* misses, except what sources in another language define.
@@ -387,8 +381,7 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
             return False
         missing = hierarchy["missing"]
         wanted = {**missing, "modules": {n: u for n, u in missing["modules"].items() if n.lower() not in self._defined_elsewhere}}
-        # A dropped copy counts as loaded, so -y doesn't bring it back.
-        loaded = [f["file_name"] for f in hierarchy["files"]] + list(self.overridden)
+        loaded = [f["file_name"] for f in hierarchy["files"]]
         found, incs = resolve_missing(wanted, library, loaded, self.inc_dirs)
         for name, (path, others) in found.items():
             if str(path) not in files:
@@ -512,9 +505,8 @@ class SlangFrontend:  # pylint: disable=too-many-instance-attributes
         for name in result["missing"]["modules"]:
             result["unresolved"].setdefault(name, [])
         result["rejected_roots"] = sorted(rejected)
-        result["notes"] = notes
+        result["notes"] = self._override_notes + notes
         result["pulled"] = self.search.pulled
-        result["overridden"] = dict(self.overridden)
         result["inc_dirs"] = list(dict.fromkeys(self.inc_dirs + result["inc_dirs"]))
         result.pop("invalid_tops")
         return result

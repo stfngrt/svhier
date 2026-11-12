@@ -185,14 +185,12 @@ reports what is missing and which files are loaded. Everything else waits until 
 pulls nothing new: the definitions, the file entries with their references, the duplicates,
 the diagnostics and the trimmed file list. So the diagnostics describe the final load only.
 
-Each round also learns what every loaded file defines, which lets a file named on the
-command line win over duplicates ({ref}`explicit-wins`). Before it searches `-y`, a round
-drops the source files whose every module, interface and package a named file also defines
-(`SlangFrontend._drop_overridden`), and loads again. slang keeps the *last* copy of a module
-but the *first* copy of a package, so no compile order could make the named file win;
-dropping files does. A file that defines anything else is kept so nothing goes missing, files
-from command files are never dropped, and `-y` treats a dropped file as loaded so it doesn't
-bring it back.
+A file named on the command line wins over duplicates ({ref}`explicit-wins`). Before the
+first parse, `SlangFrontend._drop_overridden` reads each named file with the regex `-y`
+indexes with, and drops the other source files that only define names it defines too.
+slang keeps the *last* copy of a module but the *first* copy of a package, so no compile
+order could make the named file win; dropping files does. The dropped names are defined, so
+`-y` never brings the files back.
 
 The walk visits each unique pair of definition and parameter values once, and records the
 children of that pair, each with the parameter values it uses in turn. That table is what
@@ -240,7 +238,6 @@ language:
 | "Not found" table | `missing` | {func}`~svhier.cli._print_missing` |
 | "Defined more than once" table | `duplicates` | {func}`~svhier.cli._print_duplicates` |
 | "Pulled in from -y" table | `pulled` | {func}`~svhier.cli._print_pulled` |
-| "Overridden by explicit files" table | `overridden` | {func}`~svhier.cli._print_overridden` |
 | YAML | `files`, without internal keys | {func}`~svhier.cli._prepare_for_yaml` |
 | Filelist | a graph of file dependencies, plus `inc_dirs` and `defines` | {func}`~svhier.filelist.compute_filelist` |
 

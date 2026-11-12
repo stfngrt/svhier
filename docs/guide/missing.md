@@ -78,20 +78,14 @@ dropped from the compilation, wherever the file appears on the command line:
 svhier core/include/cv64a6_imafdc_sv39_config_pkg.sv -r core -y common -y vendor --top cva6
 ```
 
-The dropped copies move from **Defined more than once** to an **Overridden
-by explicit files** table:
+A note on stderr says what was dropped:
 
 ```text
-                       Overridden by explicit files
-┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Name            ┃ Kind    ┃ Used                                          ┃ Dropped                           ┃
-┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ cva6_config_pkg │ package │ core/include/cv64a6_imafdc_sv39_config_pkg.sv │ cv32a60x_config_pkg.sv (+17 more) │
-└─────────────────┴─────────┴───────────────────────────────────────────────┴───────────────────────────────────┘
+note: core/include/cv64a6_imafdc_sv39_config_pkg.sv overrides 18 other file(s) defining cva6_config_pkg
 ```
 
-A file is only dropped when *everything* it defines is also defined by an
-explicit file, so nothing else goes missing. A file that also defines other
+A file is only dropped when *everything* it defines is also defined by the
+named file, so nothing else goes missing. A file that also defines other
 names is kept, and its duplicate stays in the **Defined more than once**
 table. Files listed in a `-f`/`-F` command file are never dropped. Two files
 that are both passed by name don't override each other.

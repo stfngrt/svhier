@@ -531,8 +531,7 @@ def test_explicit_file_drops_other_copies(tmp_path, monkeypatch, capsys):
     srcs = [Path(ln).name for ln in cap.out.splitlines() if ln.endswith(".sv")]
     assert srcs == ["cfg_b.sv", "top.sv"]
     assert "Defined more than once" not in cap.err
-    assert "Overridden by explicit files" in cap.err
-    assert "cfg_a.sv (+1 more)" in cap.err
+    assert "cfg_b.sv overrides 2 other file(s) defining cfg" in " ".join(cap.err.split())
 
 
 def test_explicit_file_wins_regardless_of_position(tmp_path, monkeypatch, capsys):
@@ -552,7 +551,7 @@ def test_explicit_module_copy_wins(tmp_path, monkeypatch, capsys):
     # names if leaf_beh is defined explicitly too; here it isn't, so cell_beh.sv is kept.
     code, cap = _run(monkeypatch, capsys, [str(tech), "-r", str(tmp_path / "lib")])
     assert "Defined more than once" in cap.err
-    assert "Overridden by explicit files" not in cap.err
+    assert "overrides" not in cap.err
     # With the behavioural leaf in its own file, the whole cell_beh.sv is overridden.
     (tmp_path / "lib" / "cell_beh.sv").write_text("module mycell; leaf_beh u(); endmodule\n")
     (tmp_path / "lib" / "leaf_beh.sv").write_text("module leaf_beh; endmodule\n")
@@ -567,7 +566,7 @@ def test_two_explicit_copies_stay_duplicates(tmp_path, monkeypatch, capsys):
     a, b = str(rtl / "cfgs" / "cfg_a.sv"), str(rtl / "cfgs" / "cfg_b.sv")
     _, cap = _run(monkeypatch, capsys, [a, b, str(rtl / "top.sv"), "--no-tree"])
     assert "Defined more than once" in cap.err
-    assert "Overridden by explicit files" not in cap.err
+    assert "overrides" not in cap.err
 
 
 def test_overridden_file_not_pulled_back_from_libdir(tmp_path, monkeypatch, capsys):
@@ -577,3 +576,4 @@ def test_overridden_file_not_pulled_back_from_libdir(tmp_path, monkeypatch, caps
     assert code == 0
     assert [Path(ln).name for ln in cap.out.splitlines() if ln.endswith(".sv")] == ["cfg_a.sv", "top.sv"]
     assert "Pulled in from -y" not in cap.err
+    assert "overrides 2 other file(s)" in " ".join(cap.err.split())

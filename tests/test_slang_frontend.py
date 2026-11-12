@@ -278,7 +278,7 @@ def test_parse_files_asks_to_pull_only_so_often(tmp_path):
 
     result = parse_files([str(path)], tops=["a"], pull=pull, max_pulls=3)
     assert len(asked) == 3
-    assert asked[0]["files"] == [{"file_name": str(path), "defs": [{"mod_name": "a"}], "ifaces": [], "pkgs": []}] and list(asked[0]["missing"]["modules"]) == ["b"]
+    assert asked[0]["files"] == [{"file_name": str(path)}] and list(asked[0]["missing"]["modules"]) == ["b"]
     assert _insts(result, "a") == ["u"]
     assert parse_files([str(path)], pull=pull)["missing"]["modules"] == {"b": [str(path)]}
     assert len(asked) == 3  # Without max_pulls nobody is asked.
